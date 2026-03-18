@@ -14,6 +14,12 @@ class CckitError(Exception):
         self.detail = detail
         super().__init__(message)
 
+    def __str__(self) -> str:
+        msg = super().__str__()
+        if self.detail:
+            return f"{msg}\n{self.detail}"
+        return msg
+
 
 # -- Agent ------------------------------------------------------------------
 
