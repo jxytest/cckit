@@ -12,7 +12,7 @@ Run:
 
 import asyncio
 
-from cckit import Agent, Runner, RunContext, WorkspaceConfig
+from cckit import Agent, Runner, RunContext, GitConfig, WorkspaceConfig
 from cckit.git import operations as git_ops
 from cckit.git.gitlab_client import GitLabClient
 from cckit.tools.platform import get_platform_mcp_server
@@ -56,6 +56,7 @@ async def on_modify_complete(ctx, result):
 
     try:
         branch = f"code-modify/{ctx.task_id}"
+        git_env = ctx._resolved_git().build_git_env() or None
         await git_ops.create_branch(branch, cwd=ctx.workspace_dir)
         await git_ops.add_all(cwd=ctx.workspace_dir)
         await git_ops.commit(
@@ -66,7 +67,7 @@ async def on_modify_complete(ctx, result):
             "origin",
             branch,
             cwd=ctx.workspace_dir,
-            extra_env=ctx.env or None,
+            extra_env=git_env,
         )
 
         client = GitLabClient(url=gitlab_url, token=gitlab_token)
@@ -114,8 +115,12 @@ async def main():
 
     ctx = RunContext(
         prompt="Apply the following code modification.",
-        workspace=WorkspaceConfig(enabled=True, git_clone=True),
-        git_repo_url="https://gitlab.com/team/project.git",
+        workspace=WorkspaceConfig(enabled=True),
+        git=GitConfig(
+            repo_url="https://gitlab.com/team/project.git",
+            token="glpat-xxxx",  # securely isolated from Agent subprocess
+            clone=True,
+        ),
         params={
             "modification_request": "Change the base image tag to python:3.12",
             "target_path": "Dockerfile",

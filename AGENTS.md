@@ -33,7 +33,7 @@ cckit/                              # pip install cckit
 ├── __init__.py                    # 公共 API: Agent, Runner, RunContext 等
 ├── agent.py                       # Agent 类（核心）
 ├── runner.py                      # Runner 类（执行引擎）
-├── types.py                       # ModelConfig, LiteLlm, RunContext, AgentResult, AgentEvent, StreamResult...
+├── types.py                       # ModelConfig, LiteLlm, GitConfig, RunContext, AgentResult, AgentEvent, StreamResult...
 ├── exceptions.py                  # CckitError 异常层次
 ├── _models.py                     # CustomModel 基类（内部）
 ├── _cli.py                        # Claude CLI 检测
@@ -72,7 +72,7 @@ tests/
 
 ```
 Agent = "我是谁" → name, instruction, tools, sub_agents, skills, model
-RunContext = "怎么跑" → workspace, git_clone, prompt, params, env
+RunContext = "怎么跑" → workspace, git(GitConfig), prompt, params, env
 Runner = "执行引擎" → 中间件、并发控制、SDK 桥接
 ```
 
@@ -122,8 +122,12 @@ from cckit import RunContext, WorkspaceConfig
 # 带 git clone
 ctx = RunContext(
     prompt="Fix the broken locator",
-    workspace=WorkspaceConfig(enabled=True, git_clone=True),
-    git_repo_url="https://gitlab.com/team/repo.git",
+    workspace=WorkspaceConfig(enabled=True),
+    git=GitConfig(
+        repo_url="https://gitlab.com/team/repo.git",
+        token="glpat-xxx",
+        clone=True,
+    ),
     params={"test_file": "tests/test_login.py"},
 )
 
@@ -171,7 +175,7 @@ result = await runner.run(fix_agent, ctx)
 Runner.run_stream(agent, ctx) → StreamResult:
   ├── _validate_context()
   │   ├── 检查 agent.required_params
-  │   ├── git_clone=True 但无 git_repo_url → 报错
+  │   ├── git.clone=True 但无 git.repo_url → 报错
   │   └── skills 非空但 workspace.enabled=False → 报错
   ├── agent.before_execute(ctx)
   ├── Workspace:

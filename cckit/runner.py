@@ -214,6 +214,8 @@ class Runner:
                 )
 
             # --- workspace ---
+            git_cfg = ctx._resolved_git()
+
             if ctx.workspace.enabled:
                 if ctx.resume_session_id and ctx.workspace_dir:
                     # Resume: reuse existing workspace
@@ -223,13 +225,15 @@ class Runner:
                     holder.workspace_dir = await self._workspace.create(ctx.task_id)
                     ctx.workspace_dir = holder.workspace_dir
 
-                    if ctx.workspace.git_clone and ctx.git_repo_url:
+                    if git_cfg.clone and git_cfg.repo_url:
+                        git_env = git_cfg.build_git_env() or None
                         async with self._clone_semaphore:
                             await git_ops.clone(
-                                ctx.git_repo_url,
+                                git_cfg.repo_url,
                                 holder.workspace_dir,
-                                branch=ctx.git_branch,
-                                extra_env=ctx.env or None,
+                                branch=git_cfg.branch,
+                                depth=git_cfg.depth,
+                                extra_env=git_env,
                             )
 
                     # --- provision skills ---
@@ -366,8 +370,9 @@ class Runner:
                 missing.append(param)
 
         # Check structural requirements
-        if ctx.workspace.git_clone and not ctx.git_repo_url and not ctx.resume_session_id:
-            missing.append("git_repo_url")
+        git_cfg = ctx._resolved_git()
+        if git_cfg.clone and not git_cfg.repo_url and not ctx.resume_session_id:
+            missing.append("git.repo_url")
 
         # Skills require a workspace
         if agent.skills and not ctx.workspace.enabled:
@@ -459,12 +464,14 @@ class Runner:
         # -- sandbox --
         sandbox_dict = self._sandbox_builder.build(workspace_dir)
 
-        # -- environment --
+        # -- environment (Agent subprocess only — NO git credentials) --
         env: dict[str, str] = {}
         if model.api_key:
             env["ANTHROPIC_API_KEY"] = model.api_key
         if model.base_url:
             env["ANTHROPIC_BASE_URL"] = model.base_url
+        # ctx.env is for the Agent subprocess (API keys, feature flags, etc.)
+        # Git credentials live in ctx.git / GitConfig and are NEVER injected here.
         env.update(ctx.env)
 
         # -- configurable SDK params --

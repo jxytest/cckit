@@ -26,6 +26,7 @@ from cckit import (  # noqa: F401 — test_imports verifies all public API symbo
     AgentResult,
     CckitError,
     ConcurrencyMiddleware,
+    GitConfig,
     GitLabAPIError,
     GitOperationError,
     LiteLlm,
@@ -156,11 +157,15 @@ def test_types():
     ctx = RunContext(
         prompt="Test",
         params={"key": "value"},
-        workspace=WorkspaceConfig(enabled=True, git_clone=True),
-        git_repo_url="https://example.com/repo.git",
+        workspace=WorkspaceConfig(enabled=True),
+        git=GitConfig(
+            repo_url="https://example.com/repo.git",
+            clone=True,
+        ),
     )
     assert ctx.prompt == "Test"
-    assert ctx.workspace.git_clone is True
+    assert ctx.git.clone is True
+    assert ctx.git.repo_url == "https://example.com/repo.git"
     assert len(ctx.task_id) == 12
 
     result = AgentResult(
@@ -399,3 +404,99 @@ def test_git_module_exports():
     for name in ["run_git", "clone", "create_branch", "add_all",
                   "commit", "push", "status", "diff"]:
         assert hasattr(git, name), f"cckit.git missing export: {name}"
+
+
+# ---------------------------------------------------------------------------
+# GitConfig tests
+# ---------------------------------------------------------------------------
+
+
+def test_git_config_basic():
+    """GitConfig construction and defaults."""
+    cfg = GitConfig(repo_url="https://gitlab.com/team/project.git", clone=True)
+    assert cfg.repo_url == "https://gitlab.com/team/project.git"
+    assert cfg.clone is True
+    assert cfg.depth == 1
+    assert cfg.branch == ""
+    assert cfg.token == ""
+    assert cfg.auth_env == {}
+
+
+def test_git_config_build_git_env_with_token():
+    """build_git_env() produces GIT_ASKPASS + GIT_PASSWORD from token."""
+    cfg = GitConfig(
+        repo_url="https://gitlab.com/team/project.git",
+        token="glpat-secret",
+    )
+    env = cfg.build_git_env()
+    assert env["GIT_PASSWORD"] == "glpat-secret"
+    assert "GIT_ASKPASS" in env
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_git_config_build_git_env_empty():
+    """build_git_env() returns empty dict when no credentials."""
+    cfg = GitConfig(repo_url="https://gitlab.com/team/project.git")
+    assert cfg.build_git_env() == {}
+
+
+def test_git_config_auth_env_overrides_token():
+    """auth_env can override/supplement token-derived values."""
+    cfg = GitConfig(
+        repo_url="https://gitlab.com/team/project.git",
+        token="glpat-secret",
+        auth_env={"GIT_ASKPASS": "/custom/askpass.sh"},
+    )
+    env = cfg.build_git_env()
+    # auth_env takes precedence over token-derived GIT_ASKPASS
+    assert env["GIT_ASKPASS"] == "/custom/askpass.sh"
+    # but token-derived GIT_PASSWORD is still present
+    assert env["GIT_PASSWORD"] == "glpat-secret"
+
+
+def test_run_context_credential_isolation():
+    """ctx.env and git credentials are completely separate namespaces."""
+    ctx = RunContext(
+        prompt="Test",
+        env={"ANTHROPIC_API_KEY": "sk-safe", "MY_FLAG": "true"},
+        git=GitConfig(
+            repo_url="https://gitlab.com/team/project.git",
+            token="glpat-secret-should-not-leak",
+            clone=True,
+        ),
+    )
+    # ctx.env has no git credentials
+    assert "GIT_PASSWORD" not in ctx.env
+    assert "glpat-secret-should-not-leak" not in ctx.env.values()
+
+    # git env has no agent env
+    git_env = ctx.git.build_git_env()
+    assert "ANTHROPIC_API_KEY" not in git_env
+    assert "MY_FLAG" not in git_env
+    assert git_env["GIT_PASSWORD"] == "glpat-secret-should-not-leak"
+
+
+def test_run_context_backward_compat():
+    """Deprecated git_repo_url/git_branch still work via _resolved_git()."""
+    ctx = RunContext(
+        prompt="Test",
+        git_repo_url="https://example.com/old-style.git",
+        git_branch="develop",
+    )
+    resolved = ctx._resolved_git()
+    assert resolved.repo_url == "https://example.com/old-style.git"
+    assert resolved.branch == "develop"
+    assert resolved.clone is True  # auto-upgraded when git_repo_url is set
+
+
+def test_run_context_new_git_takes_precedence():
+    """New git field takes precedence over deprecated fields."""
+    ctx = RunContext(
+        prompt="Test",
+        git=GitConfig(repo_url="https://new.com/repo.git", branch="main", clone=True),
+        git_repo_url="https://old.com/repo.git",  # should be ignored
+        git_branch="old-branch",  # should be ignored
+    )
+    resolved = ctx._resolved_git()
+    assert resolved.repo_url == "https://new.com/repo.git"
+    assert resolved.branch == "main"

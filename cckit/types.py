@@ -1,6 +1,6 @@
 """Data types for cckit.
 
-Contains all data containers: ModelConfig, LiteLlm, WorkspaceConfig,
+Contains all data containers: ModelConfig, LiteLlm, GitConfig, WorkspaceConfig,
 RunContext, AgentResult, AgentEvent, RunnerConfig, SandboxOptions, etc.
 
 These are pure data — no SDK dependency, no I/O.
@@ -82,6 +82,80 @@ class LiteLlm(CustomModel):
 
 
 # ---------------------------------------------------------------------------
+# Git configuration
+# ---------------------------------------------------------------------------
+
+
+class GitConfig(CustomModel):
+    """Git repository configuration — first-class credentials + clone options.
+
+    Centralizes everything related to git operations (clone, push, etc.)
+    so that credentials are explicitly managed and never leak into the
+    Agent subprocess environment.
+
+    Usage::
+
+        # Token-based auth (most common — GitLab/GitHub PAT)
+        GitConfig(
+            repo_url="https://gitlab.com/team/project.git",
+            token="glpat-xxxx",
+            branch="main",
+        )
+
+        # Custom env-based auth (GIT_ASKPASS, SSH keys, etc.)
+        GitConfig(
+            repo_url="git@github.com:team/project.git",
+            auth_env={"GIT_SSH_COMMAND": "ssh -i /path/to/key"},
+        )
+
+    How credentials are resolved (by Runner):
+        1. If ``token`` is set, Runner injects a ``GIT_ASKPASS`` helper
+           that echoes the token — works for any HTTPS remote.
+        2. If ``auth_env`` is set, those vars are passed directly to
+           the git subprocess as ``extra_env``.
+        3. Both can coexist — ``token`` is applied first, then
+           ``auth_env`` is merged on top (explicit wins).
+    """
+
+    repo_url: str = ""
+    branch: str = ""
+    token: str = ""  # PAT / deploy token — Runner converts to GIT_ASKPASS
+    auth_env: dict[str, str] = Field(default_factory=dict)  # extra git-only env
+
+    # Clone options
+    clone: bool = False  # whether to clone during workspace setup
+    depth: int = 1  # --depth for shallow clone, 0 = full history
+
+    def build_git_env(self) -> dict[str, str]:
+        """Build the environment dict for git subprocesses.
+
+        This is the **single source of truth** for git credential
+        injection — used by both clone and push.  The result is
+        **never** merged into the Agent subprocess environment.
+        """
+        env: dict[str, str] = {}
+
+        if self.token:
+            # Use GIT_ASKPASS with an inline echo so the token is
+            # never embedded in the URL or persisted in .git/config.
+            # Works cross-platform: Windows cmd /c, POSIX sh -c.
+            import sys
+
+            if sys.platform == "win32":
+                env["GIT_ASKPASS"] = "cmd /c echo"
+                env["GIT_TERMINAL_PROMPT"] = "0"
+                env["GIT_PASSWORD"] = self.token
+            else:
+                env["GIT_ASKPASS"] = "/bin/echo"
+                env["GIT_TERMINAL_PROMPT"] = "0"
+                env["GIT_PASSWORD"] = self.token
+
+        # auth_env overrides / supplements — user knows best
+        env.update(self.auth_env)
+        return env
+
+
+# ---------------------------------------------------------------------------
 # Workspace configuration
 # ---------------------------------------------------------------------------
 
@@ -95,7 +169,6 @@ class WorkspaceConfig(CustomModel):
     """
 
     enabled: bool = True  # whether to create an isolated workspace directory
-    git_clone: bool = False  # whether to clone a git repo into the workspace
 
 
 # ---------------------------------------------------------------------------
@@ -106,10 +179,16 @@ class WorkspaceConfig(CustomModel):
 class RunContext(CustomModel):
     """Runtime context — controls all runtime parameters for a single execution.
 
-    Replaces the old ``ExecutionContext``. Key changes:
-    - ``extra_params`` renamed to ``params`` (shorter, clearer)
-    - workspace/git_clone moved here from Agent definition
-    - ``prompt`` is the primary instruction field
+    Key design choices:
+    - ``params`` — business data for instruction templates
+    - ``env`` — environment variables for the **Agent subprocess only**
+    - ``git`` — all git config (URL, branch, credentials, clone options)
+
+    Credentials isolation:
+        ``git.token`` / ``git.auth_env`` are **never** injected into the
+        Agent subprocess.  They are only passed to git CLI subprocesses
+        by Runner.  This prevents the Agent (which can run arbitrary
+        Bash commands) from reading secrets via ``env``.
     """
 
     task_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
@@ -121,13 +200,39 @@ class RunContext(CustomModel):
     workspace: WorkspaceConfig = Field(default_factory=WorkspaceConfig)
     workspace_dir: Path | None = None  # injected by Runner, or manually specified
 
-    # Git
-    git_repo_url: str = ""
-    git_branch: str = ""
+    # Git — first-class configuration
+    git: GitConfig = Field(default_factory=GitConfig)
 
     # Session resume
     resume_session_id: str = ""  # when set, resumes a previous SDK session
     fork_session: bool = False  # when resuming, create a new branch session
+
+    # ------------------------------------------------------------------
+    # Backward compatibility — deprecated, will be removed in v1.0
+    # ------------------------------------------------------------------
+
+    git_repo_url: str = ""
+    git_branch: str = ""
+
+    def _resolved_git(self) -> GitConfig:
+        """Return the effective GitConfig, merging deprecated fields.
+
+        Priority: ``git`` (new) > ``git_repo_url``/``git_branch`` (old).
+        If the new ``git`` field has no ``repo_url`` set but the old
+        ``git_repo_url`` is present, upgrade transparently.
+        """
+        if self.git.repo_url:
+            return self.git
+
+        if not self.git_repo_url:
+            return self.git
+
+        # Upgrade from deprecated fields
+        return self.git.model_copy(update={
+            "repo_url": self.git_repo_url,
+            "branch": self.git_branch or self.git.branch,
+            "clone": self.git.clone or bool(self.git_repo_url),
+        })
 
 
 # ---------------------------------------------------------------------------

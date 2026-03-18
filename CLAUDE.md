@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **核心三层设计**：
 - `Agent` = "我是谁"（name、instruction、tools、sub_agents、skills、model）
-- `RunContext` = "怎么跑"（workspace、git_clone、prompt、params、env）
+- `RunContext` = "怎么跑"（workspace、git、prompt、params、env）
 - `Runner` = "执行引擎"（中间件、并发控制、SDK 桥接）
 
 ## SDK 隔离原则
@@ -26,7 +26,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Agent 定义与执行分离
 
 - **`Agent`** — 声明式定义，实例化即可，不需要继承
-- **`RunContext`** — 运行时上下文（workspace、git clone 等控制在此，不在 Agent）
+- **`RunContext`** — 运行时上下文（workspace、git 等控制在此，不在 Agent）
 - **`Runner`** — 执行引擎，管理 workspace/middleware/SDK 桥接
 
 同一 Agent 定义可在不同 RunContext 中复用。业务凭证通过 `RunContext.params` 按任务传递。
@@ -46,7 +46,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Agent 无状态，会话上下文通过 `RunContext.resume_session_id` 传入。SDK/CLI 自动持久化对话历史。
 
 ```
-第一次执行: ctx1 = RunContext(prompt="修复 X", workspace=WorkspaceConfig(git_clone=True), ...)
+第一次执行: ctx1 = RunContext(
+    prompt="修复 X",
+    workspace=WorkspaceConfig(enabled=True),
+    git=GitConfig(repo_url="...", token="glpat-xxx", clone=True),
+)
   → AgentResult(session_id="abc-123")
   → workspace 被 suspend
 
@@ -62,15 +66,16 @@ Agent 无状态，会话上下文通过 `RunContext.resume_session_id` 传入。
 
 ```
 Runner.run_stream(agent, ctx):
-  ├── _validate_context()（required_params、git_repo_url、skills+workspace）
+  ├── _validate_context()（required_params、git.repo_url、skills+workspace）
   ├── agent.before_execute(ctx)
   ├── preflight_check（可选：API key + 网络连通性检测）
   ├── workspace:
   │   ├── resume → WorkspaceManager.resume()
-  │   ├── workspace.enabled=True → create() + git clone + provision skills
+  │   ├── workspace.enabled=True → create() + git clone（凭证隔离） + provision skills
   │   └── workspace.enabled=False → 跳过
   ├── resolve_instruction + _resolve_model
   ├── _build_options（ClaudeAgentOptions: 子 Agent、MCP、沙箱、skills、resume）
+  │   └── env 只含 ANTHROPIC_* + ctx.env，不含 git 凭证
   ├── [中间件链] → SDK bridge → StreamCollector → yield AgentEvent
   ├── agent.after_execute / error_execute
   └── workspace cleanup / suspend
@@ -82,7 +87,7 @@ Runner.run_stream(agent, ctx):
 |------|------|
 | `agent.py` | Agent 类 — 声明式定义（name、instruction、tools、sub_agents、callbacks） |
 | `runner.py` | Runner 类 — 唯一编排 SDK 调用的模块 |
-| `types.py` | 纯数据模型：ModelConfig、LiteLlm、RunContext、WorkspaceConfig、AgentResult、AgentEvent、RunnerConfig |
+| `types.py` | 纯数据模型：ModelConfig、LiteLlm、GitConfig、RunContext、WorkspaceConfig、AgentResult、AgentEvent、RunnerConfig |
 | `exceptions.py` | CckitError 异常层次（含 ConnectivityError） |
 | `_cli.py` | Claude CLI 检测 + API 连通性预检（`check_api_connectivity`） |
 | `_engine/sdk_bridge.py` | SDK 交互：connect → receive_response → disconnect |
@@ -111,9 +116,33 @@ Agent 内部统一归一化为 `ModelConfig`。Runner 的 `_resolve_model()` 合
 ## 多项目并发隔离
 
 - **文件系统**：每个任务通过 `WorkspaceManager.create(task_id)` 获得独立临时目录
-- **凭证**：`ctx.env` / `extra_env` 注入 git 进程环境变量，不污染全局 git config
+- **Git 凭证**：`GitConfig.build_git_env()` 仅注入 git 子进程，不污染 Agent 环境
+- **Agent 环境**：`ctx.env` 仅传递给 Agent 子进程（API key、feature flags 等）
 - **并发**：`asyncio.Semaphore` 防止资源耗尽
 - **会话**：每次 `run_stream` 内的 SDK 连接在调用结束后释放
+
+## Git 凭证隔离
+
+`RunContext` 通过 `git: GitConfig` 管理所有 git 相关配置。凭证与 Agent 子进程环境**完全隔离**：
+
+```python
+ctx = RunContext(
+    prompt="修复 Bug",
+    env={"ANTHROPIC_API_KEY": "sk-..."},      # → Agent 子进程
+    git=GitConfig(
+        repo_url="https://gitlab.com/team/project.git",
+        token="glpat-secret",                  # → 仅 git 子进程
+        branch="main",
+        clone=True,
+        depth=1,
+    ),
+)
+# git.token 不会出现在 Agent 的 Bash 环境中
+# Agent 无法通过 `env` 命令读取 git 凭证
+```
+
+`GitConfig.build_git_env()` 是 git 凭证的**唯一出口**，被 Runner 内部的 clone/push 使用。
+`on_after` 回调中 push 也应使用 `ctx._resolved_git().build_git_env()` 获取凭证。
 
 ## 编码约定
 

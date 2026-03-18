@@ -13,7 +13,7 @@ Run:
 
 import asyncio
 
-from cckit import Agent, Runner, RunContext, WorkspaceConfig
+from cckit import Agent, Runner, RunContext, GitConfig, WorkspaceConfig
 from cckit.git import operations as git_ops
 from cckit.git.gitlab_client import GitLabClient
 from cckit.tools.platform import get_platform_mcp_server
@@ -46,6 +46,7 @@ async def on_fix_complete(ctx, result):
 
     try:
         branch = f"fix/{ctx.task_id}"
+        git_env = ctx._resolved_git().build_git_env() or None
         await git_ops.create_branch(branch, cwd=ctx.workspace_dir)
         await git_ops.add_all(cwd=ctx.workspace_dir)
         await git_ops.commit(
@@ -57,7 +58,7 @@ async def on_fix_complete(ctx, result):
             branch,
             cwd=ctx.workspace_dir,
             set_upstream=True,
-            extra_env=ctx.env or None,
+            extra_env=git_env,
         )
 
         client = GitLabClient(url=gitlab_url, token=gitlab_token)
@@ -106,9 +107,13 @@ async def main():
 
     ctx = RunContext(
         prompt="Fix the broken locator in the test file.",
-        workspace=WorkspaceConfig(enabled=True, git_clone=True),
-        git_repo_url="https://gitlab.com/team/ui-tests.git",
-        git_branch="main",
+        workspace=WorkspaceConfig(enabled=True),
+        git=GitConfig(
+            repo_url="https://gitlab.com/team/ui-tests.git",
+            token="glpat-xxx",  # securely isolated from Agent subprocess
+            branch="main",
+            clone=True,
+        ),
         params={
             "test_file": "tests/test_login.py",
             "error_log": "NoSuchElementException: id=login-btn",
