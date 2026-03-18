@@ -3,6 +3,12 @@
 Creates isolated temporary directories for agent execution and handles
 cleanup.  Git cloning is handled by ``core.git.operations`` — this module
 only manages the filesystem.
+
+Lifecycle states::
+
+    create()  →  [agent execution]  →  cleanup()     (normal one-shot)
+    create()  →  [agent execution]  →  suspend()      (preserves for resume)
+    resume()  →  [agent execution]  →  cleanup()      (continued session)
 """
 
 from __future__ import annotations
@@ -56,3 +62,28 @@ class WorkspaceManager:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _rm)
         logger.info("Cleaned up workspace: %s", workspace)
+
+    async def suspend(self, workspace: Path) -> None:
+        """Mark a workspace as suspended — skip cleanup so it can be resumed.
+
+        The workspace directory is kept intact on disk.  A follow-up
+        execution can pass the same path via ``ExecutionContext.workspace_dir``
+        and call :meth:`resume` to reuse it.
+        """
+        logger.info("Suspended workspace (preserved for resume): %s", workspace)
+
+    async def resume(self, workspace: Path) -> Path:
+        """Validate and return an existing workspace for a resumed session.
+
+        Raises :class:`WorkspaceError` if the directory no longer exists.
+        """
+        if not workspace.exists():
+            raise WorkspaceError(
+                f"Cannot resume — workspace not found: {workspace}",
+            )
+        if not workspace.is_dir():
+            raise WorkspaceError(
+                f"Cannot resume — path is not a directory: {workspace}",
+            )
+        logger.info("Resumed workspace: %s", workspace)
+        return workspace

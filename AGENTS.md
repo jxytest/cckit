@@ -95,10 +95,11 @@ new/
          ┌─────────────────┼──────────────────┐
          ▼                 ▼                  ▼
   validate_context    workspace          build_prompt
-         │            creation                │
+         │            create/resume           │
          ▼                ▼                   ▼
   on_before_execute  ┌─────────┐    ┌──────────────┐
          │           │git clone│    │ClaudeAgentOpts│
+         │           │(首次)   │    │(含 resume)    │
          │           └────┬────┘    └──────┬───────┘
          │                ▼                │
          │         ┌──────────────┐        │
@@ -116,7 +117,7 @@ new/
          │                    └────────┬───────────┘
          │                             │
          │                    ┌──────────────────┐
-         │                    │ SDK query() 流式  │
+         │                    │ ClaudeSDKClient   │
          │                    └────────┬─────────┘
          │                             │ SDK Messages
          │                             ▼
@@ -129,7 +130,7 @@ new/
   (or on_error)
          │
          ▼
-   cleanup workspace
+   cleanup / suspend workspace
 ```
 
 ### 4.2 SDK 隔离原则
@@ -138,8 +139,8 @@ new/
 
 | 文件 | 导入内容 |
 |------|----------|
-| `core/agent/executor.py` | `query`, `ClaudeAgentOptions`, `AgentDefinition` |
-| `core/agent/streaming/collector.py` | `AssistantMessage`, `ResultMessage`, `SystemMessage` |
+| `core/agent/executor.py` | `ClaudeSDKClient`, `ClaudeAgentOptions`, `AgentDefinition` |
+| `core/agent/streaming/collector.py` | `AssistantMessage`, `ResultMessage`, `SystemMessage`, `TextBlock`, `ThinkingBlock`, `ToolUseBlock`, `ToolResultBlock`, `TaskStartedMessage`, `TaskProgressMessage`, `TaskNotificationMessage` |
 | `core/agent/mcp/platform_tools.py` | `create_sdk_mcp_server`, `tool` |
 
 其余所有模块为纯 Python，无 SDK 依赖。这意味着：
@@ -192,7 +193,7 @@ class AuditMiddleware(AgentMiddleware):
 
 多个项目（不同 GitLab token）同时执行时，通过三层机制保证互不干扰：
 
-**1. 文件系统隔离**：每个任务的 `WorkspaceManager.create()` 使用 `tempfile.mkdtemp` 生成唯一目录，`task_id` 基于 UUID：
+**1. 文件系统隔离**：每个任务的 `WorkspaceManager.create()` 使用 `tempfile.mkdtemp` 生成唯一目录，`task_id` 基于 UUID。resume 场景下通过 `WorkspaceManager.resume()` 复用之前的 workspace：
 ```
 /tmp/agent_workspaces/
 ├── agent_3a7f1b2c9e01_xxxxx/   ← 项目 A (token-A)
@@ -249,6 +250,7 @@ class TestRunnerAgent(BaseAgent):
             display_name="Test Runner",
             system_prompt="You execute tests and coordinate sub-agents...",
             allowed_tools=["Bash", "Read", "Grep"],
+            model="claude-opus-4-6",  # 覆盖全局模型（默认 "" = 继承全局值）
             max_turns=80,  # 覆盖全局 max_turns（默认 0 = 使用全局值）
             sub_agents=[
                 SubAgentConfig(
@@ -304,6 +306,7 @@ class AgentConfig:
     allowed_tools: list[str] # SDK 内置工具：Read, Write, Edit, Bash, Glob, Grep 等
     mcp_tool_names: list[str]# 需要的平台 MCP 工具名
     sub_agents: list[SubAgentConfig]  # 子 Agent 声明
+    model: str               # 默认 "" = 继承全局 ANTHROPIC_MODEL（可按 Agent 覆盖）
     max_tokens: int          # 默认 16384
     max_turns: int           # 默认 0 = 使用全局 ANTHROPIC_MAX_TURNS（可按 Agent 覆盖）
     needs_workspace: bool    # 是否需要临时工作目录（默认 True）
@@ -322,9 +325,11 @@ class ExecutionContext:
     extra_params: dict       # 业务参数（test_file, error_log 等）
     git_repo_url: str        # 要克隆的仓库地址
     git_branch: str          # 分支名
+    resume_session_id: str   # 传入时恢复之前的 SDK 会话（对话上下文自动加载）
+    fork_session: bool       # resume 时是否创建新分支会话（默认 False）
 ```
 
-**设计要点**：`cwd`、`env` 不在 AgentConfig 中，而是通过 ExecutionContext 在运行时注入，实现同一 Agent 定义在不同上下文中复用。
+**设计要点**：`cwd`、`env` 不在 AgentConfig 中，而是通过 ExecutionContext 在运行时注入，实现同一 Agent 定义在不同上下文中复用。`resume_session_id` 也是同一模式——Agent 无状态，上下文引用由调用方传入。
 
 ### 6.3 AgentResult（执行结果）
 
@@ -346,7 +351,9 @@ class AgentResult:
 
 ```python
 class AgentEvent:
-    event_type: AgentEventType  # assistant_text | tool_use | tool_result | result | error
+    event_type: AgentEventType  # assistant_text | thinking | tool_use | tool_result |
+                                 # sub_agent_start | sub_agent_progress | sub_agent_end |
+                                 # result | error
     task_id: str
     timestamp: datetime      # timezone-aware UTC
     data: dict               # 事件特定数据（如 tool_name, cost_usd）
@@ -521,6 +528,35 @@ executor = AgentExecutor(
 )
 ```
 
+### 10.3 会话恢复（Resume）
+
+任务结束后，可基于之前的对话上下文继续对话。SDK/CLI 自动持久化对话历史，平台只需保存 `session_id`。
+
+```python
+from core.agent.schemas import AgentEventType
+
+# 第一次执行
+ctx1 = ExecutionContext(
+    git_repo_url="https://gitlab.com/team/ui-tests.git",
+    prompt="修复 login 页面的定位器",
+    extra_params={"test_file": "tests/test_login.py", ...},
+)
+session_id = ""
+async for event in executor.execute_stream(agent, ctx1):
+    if event.event_type == AgentEventType.RESULT:
+        session_id = event.data["session_id"]
+# ctx1.workspace_dir 已被自动设置，workspace 被 suspend 保留
+
+# 第二次执行（可以隔几小时甚至几天）
+ctx2 = ExecutionContext(
+    resume_session_id=session_id,        # SDK 自动加载之前的完整对话
+    workspace_dir=ctx1.workspace_dir,     # 复用之前的工作目录
+    prompt="再加个单元测试覆盖修复的场景",
+)
+async for event in executor.execute_stream(agent, ctx2):
+    ...  # agent 拥有第一次执行的完整上下文
+```
+
 ## 12. 验证方式
 
 ```bash
@@ -544,7 +580,7 @@ cd new && ruff check src/
 | 并行 Agent | 在业务层 `asyncio.gather` 多个 `execute_stream`（ConcurrencyMiddleware 自动限流） | 上层业务 |
 | 沙箱启用 | 设置 `SANDBOX_ENABLED=true` + 安装 `@anthropic-ai/sandbox-runtime` | `core/sandbox/` |
 | 数据库持久化 | 在 `on_after_execute` 中存储 `AgentResult` | 上层业务 |
-| 会话恢复 | 利用 `AgentResult.session_id` 恢复中断的 Agent 对话 | 待实现 |
+| 会话恢复 | 通过 `ExecutionContext.resume_session_id` 恢复之前的 Agent 对话上下文，SDK 自动加载历史 | `core/agent/executor.py`, `core/agent/schemas.py` |
 
 ## 14. 编码规范
 

@@ -43,6 +43,8 @@ class StreamCollector:
 
         events: list[AgentEvent] = []
 
+        # SystemMessage check must come first because TaskStartedMessage,
+        # TaskProgressMessage, etc. are subclasses of SystemMessage.
         if isinstance(message, SystemMessage):
             events.extend(self._handle_system(message))
         elif isinstance(message, AssistantMessage):
@@ -59,23 +61,78 @@ class StreamCollector:
     # ------------------------------------------------------------------
 
     def _handle_system(self, msg: Any) -> list[AgentEvent]:
-        """Handle SystemMessage (e.g. init with session_id)."""
+        """Handle SystemMessage and its Task* subclasses."""
+        from claude_agent_sdk import (  # noqa: WPS433
+            TaskNotificationMessage,
+            TaskProgressMessage,
+            TaskStartedMessage,
+        )
+
         events: list[AgentEvent] = []
-        if hasattr(msg, "subtype") and msg.subtype == "init":
+
+        # Check subclasses *before* the generic init branch (they are also
+        # SystemMessage instances with subtype set).
+        if isinstance(msg, TaskStartedMessage):
+            events.append(
+                AgentEvent(
+                    event_type=AgentEventType.SUB_AGENT_START,
+                    task_id=self.task_id,
+                    data={
+                        "sub_task_id": msg.task_id,
+                        "description": msg.description,
+                        "session_id": msg.session_id,
+                        "tool_use_id": msg.tool_use_id,
+                    },
+                )
+            )
+        elif isinstance(msg, TaskProgressMessage):
+            events.append(
+                AgentEvent(
+                    event_type=AgentEventType.SUB_AGENT_PROGRESS,
+                    task_id=self.task_id,
+                    data={
+                        "sub_task_id": msg.task_id,
+                        "description": msg.description,
+                        "usage": msg.usage,
+                        "last_tool_name": msg.last_tool_name,
+                    },
+                )
+            )
+        elif isinstance(msg, TaskNotificationMessage):
+            events.append(
+                AgentEvent(
+                    event_type=AgentEventType.SUB_AGENT_END,
+                    task_id=self.task_id,
+                    data={
+                        "sub_task_id": msg.task_id,
+                        "status": msg.status,
+                        "summary": msg.summary,
+                        "usage": msg.usage,
+                        "output_file": msg.output_file,
+                    },
+                )
+            )
+        elif hasattr(msg, "subtype") and msg.subtype == "init":
             data = getattr(msg, "data", {}) or {}
             self._session_id = data.get("session_id", "")
+
         return events
 
     def _handle_assistant(self, msg: Any) -> list[AgentEvent]:
-        """Handle AssistantMessage — extract text and tool_use blocks."""
+        """Handle AssistantMessage — extract text, thinking, and tool blocks."""
+        from claude_agent_sdk import (  # noqa: WPS433
+            TextBlock,
+            ThinkingBlock,
+            ToolResultBlock,
+            ToolUseBlock,
+        )
+
         events: list[AgentEvent] = []
         content_blocks = getattr(msg, "content", []) or []
 
         for block in content_blocks:
-            block_type = getattr(block, "type", None)
-
-            if block_type == "text":
-                text = getattr(block, "text", "")
+            if isinstance(block, TextBlock):
+                text = block.text
                 self._text_parts.append(text)
                 events.append(
                     AgentEvent(
@@ -85,49 +142,80 @@ class StreamCollector:
                     )
                 )
 
-            elif block_type == "tool_use":
+            elif isinstance(block, ThinkingBlock):
+                events.append(
+                    AgentEvent(
+                        event_type=AgentEventType.THINKING,
+                        task_id=self.task_id,
+                        text=block.thinking,
+                        data={"signature": block.signature},
+                    )
+                )
+
+            elif isinstance(block, ToolUseBlock):
                 events.append(
                     AgentEvent(
                         event_type=AgentEventType.TOOL_USE,
                         task_id=self.task_id,
                         data={
-                            "tool_name": getattr(block, "name", ""),
-                            "tool_input": getattr(block, "input", {}),
-                            "tool_use_id": getattr(block, "id", ""),
+                            "tool_name": block.name,
+                            "tool_input": block.input,
+                            "tool_use_id": block.id,
                         },
                     )
                 )
 
-            elif block_type == "tool_result":
+            elif isinstance(block, ToolResultBlock):
                 events.append(
                     AgentEvent(
                         event_type=AgentEventType.TOOL_RESULT,
                         task_id=self.task_id,
                         data={
-                            "tool_use_id": getattr(block, "tool_use_id", ""),
-                            "content": getattr(block, "content", ""),
+                            "tool_use_id": block.tool_use_id,
+                            "content": block.content,
+                            "is_error": block.is_error,
                         },
                     )
                 )
+
+        # Surface assistant-level errors (e.g. rate_limit, billing_error)
+        error = getattr(msg, "error", None)
+        if error:
+            events.append(
+                AgentEvent(
+                    event_type=AgentEventType.ERROR,
+                    task_id=self.task_id,
+                    text=str(error),
+                    data={"error_type": str(error)},
+                )
+            )
 
         return events
 
     def _handle_result(self, msg: Any) -> list[AgentEvent]:
         """Handle ResultMessage — the final message from the SDK."""
-        result_text = getattr(msg, "result", "")
-        cost = getattr(msg, "cost_usd", 0.0) or 0.0
+        cost = getattr(msg, "total_cost_usd", 0.0) or 0.0
         self._cost_usd = cost
+
+        session_id = getattr(msg, "session_id", "") or ""
+        if session_id:
+            self._session_id = session_id
 
         return [
             AgentEvent(
                 event_type=AgentEventType.RESULT,
                 task_id=self.task_id,
-                text=result_text,
+                text=getattr(msg, "result", "") or "",
                 data={
                     "cost_usd": cost,
                     "session_id": self._session_id,
                     "stop_reason": getattr(msg, "stop_reason", ""),
-                    "duration_api_seconds": getattr(msg, "duration_api_seconds", 0),
+                    "duration_ms": getattr(msg, "duration_ms", 0),
+                    "duration_api_ms": getattr(msg, "duration_api_ms", 0),
+                    "num_turns": getattr(msg, "num_turns", 0),
+                    "usage": getattr(msg, "usage", None),
+                    "is_error": getattr(msg, "is_error", False),
+                    "structured_output": getattr(msg, "structured_output", None),
                 },
             )
         ]

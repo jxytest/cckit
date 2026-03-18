@@ -41,6 +41,7 @@ class AgentConfig(CustomModel):
     allowed_tools: list[str] = Field(default_factory=list)
     mcp_tool_names: list[str] = Field(default_factory=list)
     sub_agents: list[SubAgentConfig] = Field(default_factory=list)
+    model: str = ""  # empty = inherit global AnthropicSettings.model
     max_tokens: int = 16384
     max_turns: int = 0  # 0 = use global AnthropicSettings.max_turns
     needs_workspace: bool = True
@@ -62,6 +63,8 @@ class ExecutionContext(CustomModel):
     extra_params: dict[str, Any] = Field(default_factory=dict)
     git_repo_url: str = ""
     git_branch: str = ""
+    resume_session_id: str = ""  # when set, resumes a previous SDK session
+    fork_session: bool = False  # when resuming, create a new branch session
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +106,9 @@ class AgentEventType(StrEnum):
     ASSISTANT_TEXT = "assistant_text"
     TOOL_USE = "tool_use"
     TOOL_RESULT = "tool_result"
+    THINKING = "thinking"
     SUB_AGENT_START = "sub_agent_start"
+    SUB_AGENT_PROGRESS = "sub_agent_progress"
     SUB_AGENT_END = "sub_agent_end"
     RESULT = "result"
     ERROR = "error"

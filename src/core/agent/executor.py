@@ -4,14 +4,14 @@ Orchestration flow::
 
     on_before_execute
     → validate context
-    → create workspace (optional)
-    → git clone (optional)
-    → provision skills (optional)
+    → create workspace (or resume existing one)
+    → git clone (optional, skipped on resume)
+    → provision skills (optional, skipped on resume)
     → build_prompt
-    → build ClaudeAgentOptions (sub-agents, MCP, sandbox, skills)
-    → [Middleware chain] → SDK query()  →  StreamCollector  →  yield AgentEvent
+    → build ClaudeAgentOptions (sub-agents, MCP, sandbox, skills, resume)
+    → [Middleware chain] → ClaudeSDKClient  →  StreamCollector  →  yield AgentEvent
     → on_after_execute  (or on_error if failed)
-    → cleanup workspace
+    → cleanup workspace (or suspend if resumable)
 """
 
 from __future__ import annotations
@@ -125,27 +125,33 @@ class AgentExecutor:
 
             # --- workspace ---
             if cfg.needs_workspace:
-                workspace_dir = await self._workspace.create(ctx.task_id)
-                ctx.workspace_dir = workspace_dir
+                if ctx.resume_session_id and ctx.workspace_dir:
+                    # Resume: reuse existing workspace (caller passes it via
+                    # ctx.workspace_dir from a previous execution).
+                    workspace_dir = await self._workspace.resume(ctx.workspace_dir)
+                else:
+                    # First execution: create a fresh workspace.
+                    workspace_dir = await self._workspace.create(ctx.task_id)
+                    ctx.workspace_dir = workspace_dir
 
-                if cfg.needs_git_clone and ctx.git_repo_url:
-                    # Semaphore prevents saturating network/disk when
-                    # many tasks clone concurrently.  ctx.env is passed
-                    # so each task can authenticate with its own token
-                    # (e.g. via GIT_ASKPASS or token-embedded URL).
-                    async with self._clone_semaphore:
-                        await git_ops.clone(
-                            ctx.git_repo_url,
-                            workspace_dir,
-                            branch=ctx.git_branch,
-                            extra_env=ctx.env or None,
+                    if cfg.needs_git_clone and ctx.git_repo_url:
+                        # Semaphore prevents saturating network/disk when
+                        # many tasks clone concurrently.  ctx.env is passed
+                        # so each task can authenticate with its own token
+                        # (e.g. via GIT_ASKPASS or token-embedded URL).
+                        async with self._clone_semaphore:
+                            await git_ops.clone(
+                                ctx.git_repo_url,
+                                workspace_dir,
+                                branch=ctx.git_branch,
+                                extra_env=ctx.env or None,
+                            )
+
+                    # --- provision skills ---
+                    if cfg.skills:
+                        await self._skill_provisioner.provision(
+                            cfg.skills, workspace_dir
                         )
-
-                # --- provision skills ---
-                if cfg.skills:
-                    await self._skill_provisioner.provision(
-                        cfg.skills, workspace_dir
-                    )
 
             # --- prompt ---
             prompt = agent.build_prompt(ctx)
@@ -218,9 +224,20 @@ class AgentExecutor:
                     result.duration_seconds,
                 )
 
-            # --- cleanup ---
+            # --- cleanup or suspend workspace ---
             if workspace_dir:
-                await self._workspace.cleanup(workspace_dir)
+                # Completed normally with no resume intent → clean up.
+                # Otherwise (resume scenario, failure) → suspend for potential
+                # follow-up execution.
+                should_cleanup = (
+                    result is not None
+                    and result.status == TaskStatus.COMPLETED
+                    and not ctx.resume_session_id
+                )
+                if should_cleanup:
+                    await self._workspace.cleanup(workspace_dir)
+                else:
+                    await self._workspace.suspend(workspace_dir)
 
     # ------------------------------------------------------------------
     # Context validation
@@ -241,7 +258,7 @@ class AgentExecutor:
                 missing.append(param)
 
         # Check structural requirements
-        if cfg.needs_git_clone and not ctx.git_repo_url:
+        if cfg.needs_git_clone and not ctx.git_repo_url and not ctx.resume_session_id:
             missing.append("git_repo_url")
 
         # Skills require a workspace for SDK discovery
@@ -302,17 +319,25 @@ class AgentExecutor:
         options: Any,
         collector: StreamCollector,
     ) -> AsyncIterator[AgentEvent]:
-        """Call ``claude_agent_sdk.query()`` and yield events via collector."""
+        """Open a ``ClaudeSDKClient`` session and yield events via collector.
+
+        Uses one-shot semantics: connect → receive full response → disconnect.
+        Resume is handled transparently by ``ClaudeAgentOptions.resume``.
+        """
         try:
-            from claude_agent_sdk import query  # noqa: WPS433
+            from claude_agent_sdk import ClaudeSDKClient  # noqa: WPS433
         except ImportError as exc:
             raise AgentExecutionError(
                 "claude-agent-sdk is not installed",
                 detail=str(exc),
             ) from exc
 
+        client: Any = None
         try:
-            async for message in query(prompt=prompt, options=options):
+            client = ClaudeSDKClient(options=options)
+            await client.connect(prompt=prompt)
+
+            async for message in client.receive_response():
                 events = collector.process_message(message)
                 for event in events:
                     yield event
@@ -321,6 +346,9 @@ class AgentExecutor:
                 f"SDK query failed: {exc}",
                 detail=str(exc),
             ) from exc
+        finally:
+            if client is not None:
+                await client.disconnect()
 
     # ------------------------------------------------------------------
     # Options builder (private)
@@ -372,8 +400,8 @@ class AgentExecutor:
             env["ANTHROPIC_BASE_URL"] = anthropic_settings.base_url
         env.update(ctx.env)
 
-        # -- model --
-        model = anthropic_settings.model
+        # -- model (agent-level override → global default) --
+        model = cfg.model or anthropic_settings.model
 
         # -- configurable SDK params --
         max_turns = cfg.max_turns or anthropic_settings.max_turns
@@ -402,5 +430,10 @@ class AgentExecutor:
         # -- skills: enable SDK filesystem-based skill discovery --
         if cfg.skills:
             opts.setting_sources = ["project"]
+
+        # -- resume: restore a previous session's conversation context --
+        if ctx.resume_session_id:
+            opts.resume = ctx.resume_session_id
+            opts.fork_session = ctx.fork_session
 
         return opts

@@ -19,7 +19,8 @@ This script does NOT require a real ANTHROPIC_API_KEY.  It validates:
  12. AgentExecutor clone semaphore + skill provisioner DI
  13. SkillProvisioner: scan, provision, security validation, cleanup
  14. AgentConfig.skills field
- 15. skills + needs_workspace validation in executor
+ 15. AgentConfig.model field (agent-level model override)
+ 16. skills + needs_workspace validation in executor
 """
 
 from __future__ import annotations
@@ -399,8 +400,34 @@ def test_skills_on_agent_config() -> None:
     print(f"   [OK] AgentConfig.skills = {cfg_with.skills}")
 
 
+def test_model_on_agent_config() -> None:
+    print("15. Testing model field on AgentConfig...")
+    from core.agent.schemas import AgentConfig
+
+    # Default: empty string (inherit global)
+    cfg = AgentConfig(agent_type="test")
+    assert cfg.model == "", "model defaults to empty string (inherit global)"
+    print('   [OK] AgentConfig.model defaults to ""')
+
+    # Agent-level override
+    cfg_with = AgentConfig(agent_type="test", model="claude-opus-4-6")
+    assert cfg_with.model == "claude-opus-4-6"
+    print(f"   [OK] AgentConfig.model = {cfg_with.model}")
+
+    # model fallback in executor: cfg.model or anthropic_settings.model
+    from core.config import anthropic_settings
+
+    effective_default = cfg.model or anthropic_settings.model
+    assert effective_default == anthropic_settings.model, "empty model falls back to global"
+    print(f"   [OK] Empty model inherits global: {effective_default}")
+
+    effective_override = cfg_with.model or anthropic_settings.model
+    assert effective_override == "claude-opus-4-6", "non-empty model overrides global"
+    print(f"   [OK] Non-empty model overrides global: {effective_override}")
+
+
 def test_skills_validation_in_executor() -> None:
-    print("15. Testing skills + needs_workspace validation...")
+    print("16. Testing skills + needs_workspace validation...")
     from core.agent.base import BaseAgent
     from core.agent.executor import AgentExecutor
     from core.agent.schemas import AgentConfig, ExecutionContext
@@ -445,6 +472,7 @@ async def main() -> None:
     test_executor_clone_semaphore()
     await test_skill_provisioner()
     test_skills_on_agent_config()
+    test_model_on_agent_config()
     test_skills_validation_in_executor()
 
     print()
