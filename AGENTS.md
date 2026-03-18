@@ -33,7 +33,7 @@ cckit/                              # pip install cckit
 ├── __init__.py                    # 公共 API: Agent, Runner, RunContext 等
 ├── agent.py                       # Agent 类（核心）
 ├── runner.py                      # Runner 类（执行引擎）
-├── types.py                       # ModelConfig, LiteLlm, RunContext, AgentResult, AgentEvent...
+├── types.py                       # ModelConfig, LiteLlm, RunContext, AgentResult, AgentEvent, StreamResult...
 ├── exceptions.py                  # CckitError 异常层次
 ├── _models.py                     # CustomModel 基类（内部）
 ├── _cli.py                        # Claude CLI 检测
@@ -51,7 +51,7 @@ cckit/                              # pip install cckit
 ├── skill/                         # Skill 供给
 │   └── provisioner.py             # SkillProvisioner（安全复制 skills 到 workspace）
 ├── git/                           # Git 操作 + GitLab
-│   ├── operations.py              # async git CLI（clone/branch/commit/push）
+│   ├── operations.py              # async git CLI（run_git/clone/branch/commit/push/status/diff）
 │   └── gitlab_client.py           # GitLabClient
 └── tools/                         # 可选内置工具包
     └── platform.py                # 平台 MCP 工具（用户显式导入）
@@ -155,6 +155,12 @@ runner = Runner(
 async for event in runner.run_stream(fix_agent, ctx):
     print(f"[{event.event_type}] {event.text}")
 
+# 流式 + 最终结果
+stream = runner.run_stream(fix_agent, ctx)
+async for event in stream:
+    print(f"[{event.event_type}] {event.text}")
+result = stream.result  # on_after 回调修改的同一个对象
+
 # 一次性
 result = await runner.run(fix_agent, ctx)
 ```
@@ -162,7 +168,7 @@ result = await runner.run(fix_agent, ctx)
 ## 5. 执行流程
 
 ```
-Runner.run_stream(agent, ctx):
+Runner.run_stream(agent, ctx) → StreamResult:
   ├── _validate_context()
   │   ├── 检查 agent.required_params
   │   ├── git_clone=True 但无 git_repo_url → 报错
@@ -178,6 +184,11 @@ Runner.run_stream(agent, ctx):
   ├── [中间件链] → SDK bridge → StreamCollector → yield AgentEvent
   ├── agent.after_execute(ctx, result) / agent.error_execute(ctx, error)
   └── workspace cleanup / suspend
+
+Runner.run(agent, ctx) → AgentResult:
+  ├── stream = run_stream(agent, ctx)
+  ├── 消费所有事件
+  └── return stream.result（与 on_after 操作的是同一个对象）
 ```
 
 ## 6. SDK 隔离

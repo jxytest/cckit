@@ -57,8 +57,16 @@ asyncio.run(main())
 ```python
 runner = Runner()
 
+# 基础用法（向后兼容）
 async for event in runner.run_stream(assistant, ctx):
     print(f"[{event.event_type}] {event.text}")
+
+# 流式 + 最终结果
+stream = runner.run_stream(assistant, ctx)
+async for event in stream:
+    print(f"[{event.event_type}] {event.text}")
+final = stream.result  # 流结束后获取最终 AgentResult
+print(f"Cost: ${final.cost_usd}, Extra: {final.extra}")
 ```
 
 ## 核心概念
@@ -164,12 +172,18 @@ runner = Runner(
     ],
 )
 
-# 一次性获取结果
+# 一次性获取结果（on_after 回调修改的 result.extra 会保留）
 result = await runner.run(fix_agent, ctx)
 
 # 流式获取事件
 async for event in runner.run_stream(fix_agent, ctx):
     print(f"[{event.event_type}] {event.text}")
+
+# 流式 + 最终结果
+stream = runner.run_stream(fix_agent, ctx)
+async for event in stream:
+    print(f"[{event.event_type}] {event.text}")
+result = stream.result  # 与 on_after 操作的是同一个对象
 ```
 
 ### 自定义中间件
