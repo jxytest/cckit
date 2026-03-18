@@ -39,15 +39,10 @@ async def on_modify_complete(ctx, result):
 
     # Capture modified files
     try:
-        import subprocess
-
-        diff_result = subprocess.run(
-            ["git", "diff", "--name-only"],
-            capture_output=True,
-            text=True,
-            cwd=str(ctx.workspace_dir),
-        )
-        result.extra["modified_files"] = diff_result.stdout.strip().split("\n")
+        diff_output = await git_ops.diff(cwd=ctx.workspace_dir, name_only=True)
+        result.extra["modified_files"] = [
+            f for f in diff_output.strip().split("\n") if f
+        ]
     except Exception:
         pass
 

@@ -38,6 +38,7 @@ from cckit import (  # noqa: F401 — test_imports verifies all public API symbo
     RunnerConfig,
     SandboxOptions,
     SkillError,
+    StreamResult,
     TaskStatus,
     WorkspaceConfig,
     WorkspaceError,
@@ -285,3 +286,116 @@ def test_gitlab_client():
     client = GitLabClient(url="https://gitlab.com", token="glpat-xxx")
     assert client._url == "https://gitlab.com"
     assert client._token == "glpat-xxx"
+
+
+# ---------------------------------------------------------------------------
+# StreamResult tests
+# ---------------------------------------------------------------------------
+
+
+def test_stream_result_basic():
+    """StreamResult wraps an async iterator and exposes .result."""
+    from cckit.types import _ResultHolder
+
+    async def _fake_events():
+        yield AgentEvent(event_type=AgentEventType.ASSISTANT_TEXT, text="hello")
+        yield AgentEvent(event_type=AgentEventType.ASSISTANT_TEXT, text=" world")
+
+    holder = _ResultHolder()
+    holder.result = AgentResult(
+        task_id="t1", agent_type="test", status=TaskStatus.COMPLETED,
+    )
+    stream = StreamResult(_fake_events(), holder)
+
+    import asyncio
+
+    async def _consume():
+        texts = []
+        async for event in stream:
+            texts.append(event.text)
+        return texts
+
+    texts = asyncio.run(_consume())
+    assert texts == ["hello", " world"]
+    assert stream.result is not None
+    assert stream.result.task_id == "t1"
+
+
+def test_stream_result_identity():
+    """StreamResult.result is the exact same object as the holder's result.
+
+    This is the core guarantee: on_after mutations are visible to the caller.
+    """
+    from cckit.types import _ResultHolder
+
+    async def _no_events():
+        return
+        yield  # noqa: unreachable — makes it an async generator
+
+    holder = _ResultHolder()
+    result_obj = AgentResult(
+        task_id="t2", agent_type="test", status=TaskStatus.COMPLETED,
+    )
+    holder.result = result_obj
+
+    # Simulate on_after writing extra data
+    result_obj.extra["mr_url"] = "https://gitlab.com/mr/42"
+
+    stream = StreamResult(_no_events(), holder)
+
+    import asyncio
+    asyncio.run(_drain(stream))
+
+    # The key assertion: same object identity
+    assert stream.result is result_obj
+    assert stream.result.extra["mr_url"] == "https://gitlab.com/mr/42"
+
+
+def test_stream_result_none_before_consumption():
+    """StreamResult.result is None before the holder has a result."""
+    from cckit.types import _ResultHolder
+
+    async def _no_events():
+        return
+        yield  # noqa: unreachable
+
+    holder = _ResultHolder()
+    stream = StreamResult(_no_events(), holder)
+    assert stream.result is None
+
+
+async def _drain(stream):
+    """Helper: consume all events from a StreamResult."""
+    async for _ in stream:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Git operations: public API tests
+# ---------------------------------------------------------------------------
+
+
+def test_git_run_git_is_public():
+    """run_git is public and _run_git is a backward-compat alias."""
+    from cckit.git import operations as git_ops
+
+    assert hasattr(git_ops, "run_git")
+    assert hasattr(git_ops, "_run_git")
+    assert git_ops._run_git is git_ops.run_git
+
+
+def test_git_status_and_diff_exist():
+    """status() and diff() are importable from the git module."""
+    from cckit.git import operations as git_ops
+
+    assert callable(git_ops.status)
+    assert callable(git_ops.diff)
+
+
+def test_git_module_exports():
+    """All public functions are exported from cckit.git."""
+    from cckit import git
+
+    for name in ["run_git", "clone", "create_branch", "add_all",
+                  "commit", "push", "status", "diff"]:
+        assert hasattr(git, name), f"cckit.git missing export: {name}"

@@ -9,6 +9,7 @@ These are pure data — no SDK dependency, no I/O.
 from __future__ import annotations
 
 import uuid
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -187,6 +188,70 @@ class AgentEvent(CustomModel):
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     data: dict[str, Any] = Field(default_factory=dict)
     text: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Stream result wrapper
+# ---------------------------------------------------------------------------
+
+
+class _ResultHolder:
+    """Mutable container shared between the async generator and StreamResult.
+
+    This is an internal implementation detail — not a data model, so it's
+    a plain class (same pattern as Runner, StreamCollector, WorkspaceManager).
+    """
+
+    __slots__ = ("result", "workspace_dir")
+
+    def __init__(self) -> None:
+        self.result: AgentResult | None = None
+        self.workspace_dir: Path | None = None
+
+
+class StreamResult:
+    """Async-iterable wrapper around an agent execution stream.
+
+    Returned by :meth:`Runner.run_stream`.  Implements ``__aiter__`` so
+    it is a drop-in replacement for ``AsyncIterator[AgentEvent]``::
+
+        # Existing usage (unchanged):
+        async for event in runner.run_stream(agent, ctx):
+            print(event.text)
+
+        # New usage — access the final result after iteration:
+        stream = runner.run_stream(agent, ctx)
+        async for event in stream:
+            print(event.text)
+        final = stream.result  # same object the on_after callback received
+    """
+
+    def __init__(
+        self,
+        aiter: AsyncIterator[AgentEvent],
+        holder: _ResultHolder,
+    ) -> None:
+        self._aiter = aiter
+        self._holder = holder
+
+    def __aiter__(self) -> StreamResult:
+        return self
+
+    async def __anext__(self) -> AgentEvent:
+        return await self._aiter.__anext__()
+
+    @property
+    def result(self) -> AgentResult | None:
+        """The final :class:`AgentResult`, available after the stream ends.
+
+        This is the **same object instance** that lifecycle callbacks
+        (``on_after``) receive, so any mutations (e.g. writing to
+        ``result.extra``) are visible here.
+
+        Returns ``None`` if the stream has not been fully consumed yet
+        or was interrupted before a result could be built.
+        """
+        return self._holder.result
 
 
 # ---------------------------------------------------------------------------

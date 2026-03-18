@@ -58,6 +58,7 @@ from cckit.types import (
     RunContext,
     RunnerConfig,
     SandboxOptions,
+    StreamResult,
     TaskStatus,
     WorkspaceConfig,
 )
@@ -75,6 +76,7 @@ __all__ = [
     "RunContext",
     "RunnerConfig",
     "SandboxOptions",
+    "StreamResult",
     "TaskStatus",
     "WorkspaceConfig",
     # Exceptions

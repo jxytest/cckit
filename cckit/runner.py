@@ -30,7 +30,9 @@ from cckit.types import (
     ModelConfig,
     RunContext,
     RunnerConfig,
+    StreamResult,
     TaskStatus,
+    _ResultHolder,
 )
 
 logger = logging.getLogger(__name__)
@@ -100,45 +102,63 @@ class Runner:
     ) -> AgentResult:
         """Run agent to completion and return the final result.
 
-        Convenience wrapper around ``run_stream`` that consumes all events
-        and reconstructs an ``AgentResult`` from the RESULT/ERROR event.
+        Convenience wrapper around :meth:`run_stream` that consumes all
+        events and returns the :class:`AgentResult`.  The returned object
+        is the **same instance** that lifecycle callbacks (``on_after``)
+        receive, so any mutations (e.g. ``result.extra["mr_url"] = ...``)
+        are preserved.
         """
-        last_result_event: AgentEvent | None = None
-        last_error_event: AgentEvent | None = None
+        stream = self.run_stream(agent, ctx)
+        async for _event in stream:
+            pass
 
-        async for event in self.run_stream(agent, ctx):
-            if event.event_type == AgentEventType.RESULT:
-                last_result_event = event
-            elif event.event_type == AgentEventType.ERROR:
-                last_error_event = event
+        if stream.result is not None:
+            return stream.result
 
-        if last_result_event is not None:
-            return AgentResult(
-                task_id=ctx.task_id,
-                agent_type=agent.name,
-                status=TaskStatus.COMPLETED,
-                result_text=last_result_event.text,
-                cost_usd=last_result_event.data.get("cost_usd", 0.0),
-                session_id=last_result_event.data.get("session_id", ""),
-            )
-
-        error_msg = last_error_event.text if last_error_event else "Unknown error"
+        # Defensive fallback — should not happen in normal execution.
         return AgentResult(
             task_id=ctx.task_id,
             agent_type=agent.name,
             status=TaskStatus.FAILED,
             is_error=True,
-            error_message=error_msg,
+            error_message="Stream completed without producing a result",
         )
 
-    async def run_stream(
+    def run_stream(
         self,
         agent: Agent,
         ctx: RunContext,
-    ) -> AsyncIterator[AgentEvent]:
-        """Run *agent* and yield ``AgentEvent`` objects as they arrive.
+    ) -> StreamResult:
+        """Run *agent* and return a :class:`StreamResult` for streaming events.
 
-        This is the primary execution method — an async generator.
+        ``StreamResult`` is async-iterable, so existing code continues to
+        work unchanged::
+
+            async for event in runner.run_stream(agent, ctx):
+                print(event.text)
+
+        New usage — access the final result after the stream ends::
+
+            stream = runner.run_stream(agent, ctx)
+            async for event in stream:
+                print(event.text)
+            result = stream.result  # same object on_after received
+        """
+        holder = _ResultHolder()
+        aiter = self._execute(agent, ctx, holder)
+        return StreamResult(aiter, holder)
+
+    # ------------------------------------------------------------------
+    # Core execution (private async generator)
+    # ------------------------------------------------------------------
+
+    async def _execute(
+        self,
+        agent: Agent,
+        ctx: RunContext,
+        holder: _ResultHolder,
+    ) -> AsyncIterator[AgentEvent]:
+        """Internal async generator — the full orchestration flow.
 
         Orchestration flow:
             1. Validate context (required_params, structural checks)
@@ -153,8 +173,6 @@ class Runner:
             10. Cleanup/suspend workspace
         """
         start = time.monotonic()
-        workspace_dir: Path | None = None
-        result: AgentResult | None = None
 
         try:
             # --- validate context ---
@@ -166,7 +184,7 @@ class Runner:
                     task_id=ctx.task_id,
                     text=msg,
                 )
-                result = AgentResult(
+                holder.result = AgentResult(
                     task_id=ctx.task_id,
                     agent_type=agent.name,
                     status=TaskStatus.FAILED,
@@ -183,17 +201,17 @@ class Runner:
             if ctx.workspace.enabled:
                 if ctx.resume_session_id and ctx.workspace_dir:
                     # Resume: reuse existing workspace
-                    workspace_dir = await self._workspace.resume(ctx.workspace_dir)
+                    holder.workspace_dir = await self._workspace.resume(ctx.workspace_dir)
                 else:
                     # First execution: create a fresh workspace
-                    workspace_dir = await self._workspace.create(ctx.task_id)
-                    ctx.workspace_dir = workspace_dir
+                    holder.workspace_dir = await self._workspace.create(ctx.task_id)
+                    ctx.workspace_dir = holder.workspace_dir
 
                     if ctx.workspace.git_clone and ctx.git_repo_url:
                         async with self._clone_semaphore:
                             await git_ops.clone(
                                 ctx.git_repo_url,
-                                workspace_dir,
+                                holder.workspace_dir,
                                 branch=ctx.git_branch,
                                 extra_env=ctx.env or None,
                             )
@@ -204,7 +222,7 @@ class Runner:
                         provisioner = self._skill_provisioner
                         if agent.skills_dir:
                             provisioner = SkillProvisioner(skills_dir=agent.skills_dir)
-                        await provisioner.provision(agent.skills, workspace_dir)
+                        await provisioner.provision(agent.skills, holder.workspace_dir)
 
             # --- instruction ---
             instruction = agent.resolve_instruction(ctx)
@@ -214,7 +232,9 @@ class Runner:
 
             # --- build SDK options ---
             model = self._resolve_model(agent)
-            options = self._build_options(agent, ctx, model, workspace_dir, instruction)
+            options = self._build_options(
+                agent, ctx, model, holder.workspace_dir, instruction,
+            )
 
             # --- stream from SDK (through middleware chain) ---
             collector = StreamCollector(ctx.task_id)
@@ -225,7 +245,7 @@ class Runner:
 
             # --- build result ---
             duration = time.monotonic() - start
-            result = AgentResult(
+            holder.result = AgentResult(
                 task_id=ctx.task_id,
                 agent_type=agent.name,
                 status=TaskStatus.COMPLETED,
@@ -237,7 +257,7 @@ class Runner:
 
         except Exception as exc:
             duration = time.monotonic() - start
-            result = AgentResult(
+            holder.result = AgentResult(
                 task_id=ctx.task_id,
                 agent_type=agent.name,
                 status=TaskStatus.FAILED,
@@ -260,9 +280,9 @@ class Runner:
 
         finally:
             # --- lifecycle: after ---
-            if result is not None:
+            if holder.result is not None:
                 try:
-                    await agent.after_execute(ctx, result)
+                    await agent.after_execute(ctx, holder.result)
                 except Exception:
                     logger.exception(
                         "after_execute hook failed for %s", agent.name
@@ -272,23 +292,23 @@ class Runner:
                 logger.info(
                     "Agent %s completed: task_id=%s status=%s cost=$%.4f duration=%.2fs",
                     agent.name,
-                    result.task_id,
-                    result.status,
-                    result.cost_usd,
-                    result.duration_seconds,
+                    holder.result.task_id,
+                    holder.result.status,
+                    holder.result.cost_usd,
+                    holder.result.duration_seconds,
                 )
 
             # --- cleanup or suspend workspace ---
-            if workspace_dir:
+            if holder.workspace_dir:
                 should_cleanup = (
-                    result is not None
-                    and result.status == TaskStatus.COMPLETED
+                    holder.result is not None
+                    and holder.result.status == TaskStatus.COMPLETED
                     and not ctx.resume_session_id
                 )
                 if should_cleanup:
-                    await self._workspace.cleanup(workspace_dir)
+                    await self._workspace.cleanup(holder.workspace_dir)
                 else:
-                    await self._workspace.suspend(workspace_dir)
+                    await self._workspace.suspend(holder.workspace_dir)
 
     # ------------------------------------------------------------------
     # Model resolution

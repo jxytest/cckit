@@ -15,12 +15,16 @@ from cckit.exceptions import GitOperationError
 logger = logging.getLogger(__name__)
 
 
-async def _run_git(
+async def run_git(
     *args: str,
     cwd: Path | str | None = None,
     extra_env: dict[str, str] | None = None,
 ) -> str:
-    """Run a git command and return stdout; raise on non-zero exit.
+    """Run an arbitrary git command and return stdout; raise on non-zero exit.
+
+    This is the public low-level API for running any ``git`` sub-command.
+    Higher-level helpers like :func:`clone`, :func:`status`, :func:`diff`
+    are built on top of it.
 
     Parameters
     ----------
@@ -29,6 +33,11 @@ async def _run_git(
         Use this to inject per-task credentials (e.g. ``GIT_ASKPASS``,
         ``GIT_TOKEN``) so that concurrent clones with different tokens
         don't interfere.
+
+    Example::
+
+        sha = await run_git("rev-parse", "HEAD", cwd=repo_dir)
+        await run_git("config", "user.email", "bot@example.com", cwd=repo_dir)
     """
     import os
 
@@ -56,6 +65,10 @@ async def _run_git(
     return stdout.decode(errors="replace").strip()
 
 
+# Backward-compatible alias for internal callers
+_run_git = run_git
+
+
 # ---------------------------------------------------------------------------
 # High-level operations
 # ---------------------------------------------------------------------------
@@ -81,26 +94,26 @@ async def clone(
     if branch:
         args.extend(["--branch", branch])
     args.extend([repo_url, str(target)])
-    await _run_git(*args, extra_env=extra_env)
+    await run_git(*args, extra_env=extra_env)
     logger.info("Cloned %s → %s", repo_url, target)
     return target
 
 
 async def create_branch(name: str, *, cwd: Path) -> None:
     """Create and checkout a new branch."""
-    await _run_git("checkout", "-b", name, cwd=cwd)
+    await run_git("checkout", "-b", name, cwd=cwd)
     logger.info("Created branch %s in %s", name, cwd)
 
 
 async def add_all(*, cwd: Path) -> None:
     """Stage all changes."""
-    await _run_git("add", "-A", cwd=cwd)
+    await run_git("add", "-A", cwd=cwd)
 
 
 async def commit(message: str, *, cwd: Path) -> str:
     """Commit staged changes.  Returns the commit SHA."""
-    await _run_git("commit", "-m", message, cwd=cwd)
-    sha = await _run_git("rev-parse", "HEAD", cwd=cwd)
+    await run_git("commit", "-m", message, cwd=cwd)
+    sha = await run_git("rev-parse", "HEAD", cwd=cwd)
     logger.info("Committed %s in %s", sha[:8], cwd)
     return sha
 
@@ -126,5 +139,45 @@ async def push(
     args.append(remote)
     if branch:
         args.append(branch)
-    await _run_git(*args, cwd=cwd, extra_env=extra_env)
+    await run_git(*args, cwd=cwd, extra_env=extra_env)
     logger.info("Pushed to %s/%s from %s", remote, branch, cwd)
+
+
+async def status(*, cwd: Path, short: bool = False) -> str:
+    """Return ``git status`` output.
+
+    Parameters
+    ----------
+    short:
+        If ``True``, use ``--short`` (porcelain-like) format.
+    """
+    args = ["status"]
+    if short:
+        args.append("--short")
+    return await run_git(*args, cwd=cwd)
+
+
+async def diff(
+    *,
+    cwd: Path,
+    name_only: bool = False,
+    staged: bool = False,
+    extra_env: dict[str, str] | None = None,
+) -> str:
+    """Return ``git diff`` output.
+
+    Parameters
+    ----------
+    name_only:
+        Only show changed file names (``--name-only``).
+    staged:
+        Show staged (cached) changes instead of working-tree changes.
+    extra_env:
+        Per-task environment variables for credential isolation.
+    """
+    args = ["diff"]
+    if staged:
+        args.append("--cached")
+    if name_only:
+        args.append("--name-only")
+    return await run_git(*args, cwd=cwd, extra_env=extra_env)
