@@ -491,8 +491,13 @@ class Runner:
             opts.cwd = str(workspace_dir)
 
         # -- skills: enable SDK filesystem-based skill discovery --
-        if agent.skills:
-            opts.setting_sources = ["project"]
+        # Always set setting_sources explicitly to avoid SDK passing an empty
+        # string for ``--setting-sources`` when the value is ``None``.  On
+        # Windows the empty-string argument is silently dropped by the OS,
+        # causing the CLI to swallow the next flag as the option value and
+        # ultimately time-out.  "local" is the safe default (no project-level
+        # settings); "project" enables skill discovery from ``.claude/``.
+        opts.setting_sources = ["project"] if agent.skills else ["local"]
 
         # -- resume: restore a previous session's conversation context --
         if ctx.resume_session_id:

@@ -64,6 +64,7 @@ Agent 无状态，会话上下文通过 `RunContext.resume_session_id` 传入。
 Runner.run_stream(agent, ctx):
   ├── _validate_context()（required_params、git_repo_url、skills+workspace）
   ├── agent.before_execute(ctx)
+  ├── preflight_check（可选：API key + 网络连通性检测）
   ├── workspace:
   │   ├── resume → WorkspaceManager.resume()
   │   ├── workspace.enabled=True → create() + git clone + provision skills
@@ -82,7 +83,8 @@ Runner.run_stream(agent, ctx):
 | `agent.py` | Agent 类 — 声明式定义（name、instruction、tools、sub_agents、callbacks） |
 | `runner.py` | Runner 类 — 唯一编排 SDK 调用的模块 |
 | `types.py` | 纯数据模型：ModelConfig、LiteLlm、RunContext、WorkspaceConfig、AgentResult、AgentEvent、RunnerConfig |
-| `exceptions.py` | CckitError 异常层次 |
+| `exceptions.py` | CckitError 异常层次（含 ConnectivityError） |
+| `_cli.py` | Claude CLI 检测 + API 连通性预检（`check_api_connectivity`） |
 | `_engine/sdk_bridge.py` | SDK 交互：connect → receive_response → disconnect |
 | `_engine/collector.py` | StreamCollector：SDK 消息 → AgentEvent |
 | `middleware/` | 可插拔中间件链（Middleware 基类 + retry/concurrency/logging） |
@@ -121,3 +123,52 @@ Agent 内部统一归一化为 `ModelConfig`。Runner 的 `_resolve_model()` 合
 - Pydantic 模型继承 `CustomModel`（`from_attributes=True`、`use_enum_values=True`）
 - `GitLabClient` 构造时必须显式传入 `url`/`token`，无全局 fallback
 - Ruff 格式化，行宽 100，目标 Python 3.12
+
+## API 连通性预检（Preflight Check）
+
+执行前可选检测 API key 有效性和网络连通性，避免等待 CLI 初始化超时才发现配置问题。
+
+### 方式一：Runner 自动检测
+
+每次执行前自动检测，适合生产环境：
+
+```python
+runner = Runner(preflight_check=True)
+
+# 正常使用，如果 key 无效或网络不通会立即抛 ConnectivityError
+result = await runner.run(agent, ctx)
+```
+
+### 方式二：手动调用
+
+应用启动时检测一次，或在自定义流程中按需调用：
+
+```python
+from cckit import check_api_connectivity
+from cckit.exceptions import ConnectivityError
+
+# 使用环境变量中的 ANTHROPIC_API_KEY 和 ANTHROPIC_BASE_URL
+try:
+    check_api_connectivity()
+except ConnectivityError as e:
+    print(f"连接失败: {e}")
+
+# 显式指定（适合代理接口场景）
+check_api_connectivity(
+    api_key="sk-...",
+    base_url="https://your-proxy.example.com",
+    model="your-model-name",
+)
+```
+
+### 错误类型
+
+| 场景 | 错误信息 |
+|------|----------|
+| 未设置 API key | `ANTHROPIC_API_KEY is not set` |
+| key 无效 | `API key is invalid (HTTP 401)` |
+| key 无权限 | `API key lacks permission (HTTP 403)` |
+| 网络不通 | `Cannot reach API at {url}` |
+| 连接超时 | `API connection timed out after {n}s` |
+
+所有错误抛出 `ConnectivityError`（继承自 `CckitError`）。
