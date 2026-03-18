@@ -318,6 +318,9 @@ class Runner:
                     holder.result.duration_seconds,
                 )
 
+            # --- cleanup temporary askpass script ---
+            git_cfg.cleanup_askpass()
+
             # --- cleanup or suspend workspace ---
             if holder.workspace_dir:
                 should_cleanup = (

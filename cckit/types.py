@@ -15,7 +15,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from pydantic import Field
+from pydantic import Field, PrivateAttr
 
 from cckit._models import CustomModel
 
@@ -126,33 +126,74 @@ class GitConfig(CustomModel):
     clone: bool = False  # whether to clone during workspace setup
     depth: int = 1  # --depth for shallow clone, 0 = full history
 
+    # Internal: cached path to the temporary askpass helper script.
+    # Created on first call to build_git_env() and reused afterwards.
+    _askpass_script: str | None = PrivateAttr(default=None)
+
     def build_git_env(self) -> dict[str, str]:
         """Build the environment dict for git subprocesses.
 
         This is the **single source of truth** for git credential
         injection — used by both clone and push.  The result is
         **never** merged into the Agent subprocess environment.
+
+        The temporary helper script is created once and cached so that
+        multiple calls (clone, push, …) reuse the same file.  Call
+        :meth:`cleanup_askpass` when the script is no longer needed.
         """
         env: dict[str, str] = {}
 
         if self.token:
-            # Use GIT_ASKPASS with an inline echo so the token is
-            # never embedded in the URL or persisted in .git/config.
-            # Works cross-platform: Windows cmd /c, POSIX sh -c.
-            import sys
-
-            if sys.platform == "win32":
-                env["GIT_ASKPASS"] = "cmd /c echo"
-                env["GIT_TERMINAL_PROMPT"] = "0"
-                env["GIT_PASSWORD"] = self.token
-            else:
-                env["GIT_ASKPASS"] = "/bin/echo"
-                env["GIT_TERMINAL_PROMPT"] = "0"
-                env["GIT_PASSWORD"] = self.token
+            # Lazily create the askpass helper script.
+            if self._askpass_script is None:
+                self._askpass_script = self._create_askpass_script(self.token)
+            env["GIT_ASKPASS"] = self._askpass_script
+            env["GIT_TERMINAL_PROMPT"] = "0"
 
         # auth_env overrides / supplements — user knows best
         env.update(self.auth_env)
         return env
+
+    def cleanup_askpass(self) -> None:
+        """Remove the temporary askpass helper script if it exists."""
+        if self._askpass_script is not None:
+            import os
+
+            try:
+                os.unlink(self._askpass_script)
+            except OSError:
+                pass
+            self._askpass_script = None
+
+    @staticmethod
+    def _create_askpass_script(token: str) -> str:
+        """Write a temporary script that prints *token* to stdout.
+
+        ``GIT_ASKPASS`` is invoked by git as::
+
+            $GIT_ASKPASS "Password for 'https://…': "
+
+        The script ignores the prompt argument and simply echoes the
+        token.  This is the standard, portable approach that works for
+        any HTTPS remote without embedding the token in the URL or
+        persisting it in ``.git/config``.
+        """
+        import os
+        import stat
+        import sys
+        import tempfile
+
+        if sys.platform == "win32":
+            fd, path = tempfile.mkstemp(suffix=".bat", prefix="cckit_askpass_")
+            with os.fdopen(fd, "w") as f:
+                f.write(f"@echo off\necho {token}\n")
+        else:
+            fd, path = tempfile.mkstemp(suffix=".sh", prefix="cckit_askpass_")
+            with os.fdopen(fd, "w") as f:
+                f.write(f"#!/bin/sh\necho '{token}'\n")
+            os.chmod(path, stat.S_IRWXU)  # 0o700
+
+        return path
 
 
 # ---------------------------------------------------------------------------
