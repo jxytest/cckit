@@ -1,4 +1,4 @@
-"""Example: CodeModifyAgent using the clab SDK.
+"""Example: CodeModifyAgent using the cckit SDK.
 
 Demonstrates:
 - Agent for code modification tasks
@@ -12,10 +12,10 @@ Run:
 
 import asyncio
 
-from clab import Agent, Runner, RunContext, WorkspaceConfig
-from clab.git import operations as git_ops
-from clab.git.gitlab_client import GitLabClient
-from clab.tools.platform import get_platform_mcp_server
+from cckit import Agent, Runner, RunContext, WorkspaceConfig
+from cckit.git import operations as git_ops
+from cckit.git.gitlab_client import GitLabClient
+from cckit.tools.platform import get_platform_mcp_server
 
 
 def build_modify_instruction(ctx):

@@ -1,4 +1,4 @@
-"""Smoke test for clab — no API key required.
+"""Smoke test for cckit — no API key required.
 
 Verifies:
 1. All public imports work
@@ -18,13 +18,13 @@ from pathlib import Path
 
 import pytest
 
-from clab import (  # noqa: F401 — test_imports verifies all public API symbols
+from cckit import (  # noqa: F401 — test_imports verifies all public API symbols
     Agent,
     AgentEvent,
     AgentEventType,
     AgentExecutionError,
     AgentResult,
-    ClabError,
+    CckitError,
     ConcurrencyMiddleware,
     GitLabAPIError,
     GitOperationError,
@@ -42,10 +42,10 @@ from clab import (  # noqa: F401 — test_imports verifies all public API symbol
     WorkspaceConfig,
     WorkspaceError,
 )
-from clab.git.gitlab_client import GitLabClient
-from clab.sandbox.config import SandboxConfigBuilder
-from clab.sandbox.workspace import WorkspaceManager
-from clab.skill.provisioner import SkillProvisioner
+from cckit.git.gitlab_client import GitLabClient
+from cckit.sandbox.config import SandboxConfigBuilder
+from cckit.sandbox.workspace import WorkspaceManager
+from cckit.skill.provisioner import SkillProvisioner
 
 
 def test_imports():
@@ -179,7 +179,7 @@ def test_types():
     assert model.max_tokens == 16384
 
     sandbox = SandboxOptions(enabled=True)
-    assert sandbox.workspace_root == Path("/tmp/clab_workspaces")
+    assert sandbox.workspace_root == Path("/tmp/cckit_workspaces")
 
 
 def test_runner_config_from_env():
@@ -246,7 +246,7 @@ def test_exceptions():
         SkillError,
     ]:
         exc = exc_cls("test message", detail="detail info")
-        assert isinstance(exc, ClabError)
+        assert isinstance(exc, CckitError)
         assert str(exc) == "test message"
         assert exc.detail == "detail info"
 

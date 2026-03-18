@@ -1,8 +1,8 @@
-# clab — Claude Agent Builder
+# cckit — Claude Agent Kit
 
 [![Python](https://img.shields.io/badge/python-%3E%3D3.12-blue)](https://www.python.org/)
 
-**clab** 是一个基于 `claude-agent-sdk`的多 Agent SDK，对其进一步抽象。可以通过声明式 API 快速定义、组合和运行 AI Agent。
+**cckit** 是一个基于 `claude-agent-sdk`的多 Agent SDK，对其进一步抽象。可以通过声明式 API 快速定义、组合和运行 AI Agent。
 
 ## 安装
 
@@ -11,7 +11,7 @@
 - Python >= 3.12
 - [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) 已安装（`claude-agent-sdk` 通过 subprocess 调用 Claude CLI）
 
-### 安装 clab
+### 安装 cckit
 
 ```bash
 pip install git+<repo-url>
@@ -22,7 +22,7 @@ pip install git+<repo-url>
 ### 开发环境安装
 
 ```bash
-git clone <repo-url> && cd clab
+git clone <repo-url> && cd cckit
 pip install -e ".[dev]"
 ```
 
@@ -30,7 +30,7 @@ pip install -e ".[dev]"
 
 ```python
 import asyncio
-from clab import Agent, Runner, RunContext, ModelConfig
+from cckit import Agent, Runner, RunContext, ModelConfig
 
 # 1. 定义 Agent
 assistant = Agent(
@@ -63,7 +63,7 @@ async for event in runner.run_stream(assistant, ctx):
 
 ## 核心概念
 
-clab 采用三层设计，将**定义**、**上下文**和**执行**彻底分离：
+cckit 采用三层设计，将**定义**、**上下文**和**执行**彻底分离：
 
 | 层 | 类 | 职责 |
 |---|---|---|
@@ -76,7 +76,7 @@ clab 采用三层设计，将**定义**、**上下文**和**执行**彻底分离
 ## Agent 定义
 
 ```python
-from clab import Agent, ModelConfig, LiteLlm
+from cckit import Agent, ModelConfig, LiteLlm
 
 # 最简用法
 assistant = Agent(
@@ -126,7 +126,7 @@ fix_agent = Agent(
 ## 运行上下文
 
 ```python
-from clab import RunContext, WorkspaceConfig
+from cckit import RunContext, WorkspaceConfig
 
 # 带 git clone 的沙箱工作空间
 ctx = RunContext(
@@ -150,8 +150,8 @@ ctx = RunContext(
 ## Runner 与中间件
 
 ```python
-from clab import Runner, RunnerConfig, ModelConfig
-from clab.middleware import ConcurrencyMiddleware, RetryMiddleware, LoggingMiddleware
+from cckit import Runner, RunnerConfig, ModelConfig
+from cckit.middleware import ConcurrencyMiddleware, RetryMiddleware, LoggingMiddleware
 
 runner = Runner(
     config=RunnerConfig(
@@ -177,7 +177,7 @@ async for event in runner.run_stream(fix_agent, ctx):
 继承 `Middleware`，实现 `wrap` 方法：
 
 ```python
-from clab.middleware import Middleware
+from cckit.middleware import Middleware
 
 class AuditMiddleware(Middleware):
     async def wrap(self, next_call, prompt, options, collector, ctx):
@@ -191,8 +191,8 @@ class AuditMiddleware(Middleware):
 **无全局单例** — 所有配置通过构造函数显式传递。
 
 ```python
-from clab import RunnerConfig, ModelConfig
-from clab.sandbox import SandboxOptions
+from cckit import RunnerConfig, ModelConfig
+from cckit.sandbox import SandboxOptions
 from pathlib import Path
 
 # 方式 1: 显式配置
@@ -211,7 +211,7 @@ config = RunnerConfig.from_env()  # 读取 ANTHROPIC_*、SANDBOX_*、PLATFORM_*
 ### 使用内置平台工具
 
 ```python
-from clab.tools.platform import get_platform_mcp_server
+from cckit.tools.platform import get_platform_mcp_server
 
 runner = Runner(mcp_servers={"platform": get_platform_mcp_server})
 agent = Agent(name="fix", mcp_tools=["get_failure_info"], ...)

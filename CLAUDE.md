@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-这是 **clab**（Claude Agent Builder）—— 一个 pip 可安装的多 Agent SDK，基于 `claude-agent-sdk` 构建。
+这是 **cckit**（Claude Agent Builder）—— 一个 pip 可安装的多 Agent SDK，基于 `claude-agent-sdk` 构建。
 
 **核心三层设计**：
 - `Agent` = "我是谁"（name、instruction、tools、sub_agents、skills、model）
@@ -17,11 +17,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 | 文件 | 导入内容 |
 |------|----------|
-| `clab/_engine/sdk_bridge.py` | `ClaudeSDKClient`, `ClaudeAgentOptions`, `AgentDefinition` |
-| `clab/_engine/collector.py` | `AssistantMessage`, `ResultMessage`, `SystemMessage`, `TextBlock`, `ThinkingBlock`, `ToolUseBlock`, `ToolResultBlock`, `TaskStartedMessage`, `TaskProgressMessage`, `TaskNotificationMessage` |
-| `clab/tools/platform.py` | `create_sdk_mcp_server`, `tool` |
+| `cckit/_engine/sdk_bridge.py` | `ClaudeSDKClient`, `ClaudeAgentOptions`, `AgentDefinition` |
+| `cckit/_engine/collector.py` | `AssistantMessage`, `ResultMessage`, `SystemMessage`, `TextBlock`, `ThinkingBlock`, `ToolUseBlock`, `ToolResultBlock`, `TaskStartedMessage`, `TaskProgressMessage`, `TaskNotificationMessage` |
+| `cckit/tools/platform.py` | `create_sdk_mcp_server`, `tool` |
 
-所有导入都是惰性的（在函数内部）。`import clab` 不触发 SDK 导入。
+所有导入都是惰性的（在函数内部）。`import cckit` 不触发 SDK 导入。
 
 ## Agent 定义与执行分离
 
@@ -82,7 +82,7 @@ Runner.run_stream(agent, ctx):
 | `agent.py` | Agent 类 — 声明式定义（name、instruction、tools、sub_agents、callbacks） |
 | `runner.py` | Runner 类 — 唯一编排 SDK 调用的模块 |
 | `types.py` | 纯数据模型：ModelConfig、LiteLlm、RunContext、WorkspaceConfig、AgentResult、AgentEvent、RunnerConfig |
-| `exceptions.py` | ClabError 异常层次 |
+| `exceptions.py` | CckitError 异常层次 |
 | `_engine/sdk_bridge.py` | SDK 交互：connect → receive_response → disconnect |
 | `_engine/collector.py` | StreamCollector：SDK 消息 → AgentEvent |
 | `middleware/` | 可插拔中间件链（Middleware 基类 + retry/concurrency/logging） |

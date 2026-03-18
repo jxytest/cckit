@@ -1,6 +1,6 @@
 # Examples
 
-Usage examples for the `clab` SDK.
+Usage examples for the `cckit` SDK.
 
 ## Fix Agent
 
@@ -20,7 +20,7 @@ python examples/code_modify_agent.py
 
 ## Prerequisites
 
-1. Install clab: `pip install -e .`
+1. Install cckit: `pip install -e .`
 2. Install Claude CLI: `npm install -g @anthropic-ai/claude-code`
 3. Login: `claude login`
 4. Set environment variables (or pass via `RunnerConfig`):
