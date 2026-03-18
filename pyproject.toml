@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Claude Agent Builder — build multi-agent systems on Claude CLI"
 requires-python = ">=3.12"
 dependencies = [
-    "claude-agent-sdk>=0.1.0,!=0.1.49",
+    "claude-agent-sdk==0.1.48",
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
     "python-gitlab>=4.0.0",
@@ -36,3 +36,7 @@ select = ["E", "F", "I", "N", "W", "UP", "B", "SIM"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true
