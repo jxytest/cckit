@@ -27,12 +27,14 @@ Quick start::
 __version__ = "0.1.0"
 
 # Core classes
+from cckit._cli import check_api_connectivity
 from cckit.agent import Agent
 
 # Exceptions
 from cckit.exceptions import (
     AgentExecutionError,
     CckitError,
+    ConnectivityError,
     GitLabAPIError,
     GitOperationError,
     SkillError,
@@ -67,6 +69,7 @@ __all__ = [
     # Core
     "Agent",
     "Runner",
+    "check_api_connectivity",
     # Types
     "AgentEvent",
     "AgentEventType",
@@ -82,6 +85,7 @@ __all__ = [
     # Exceptions
     "CckitError",
     "AgentExecutionError",
+    "ConnectivityError",
     "WorkspaceError",
     "GitOperationError",
     "GitLabAPIError",

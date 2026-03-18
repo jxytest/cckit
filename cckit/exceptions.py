@@ -21,6 +21,13 @@ class AgentExecutionError(CckitError):
     """Raised when agent execution fails (SDK error, timeout, etc.)."""
 
 
+class ConnectivityError(CckitError):
+    """Raised when API connectivity preflight check fails.
+
+    Possible causes: invalid API key, network unreachable, proxy misconfigured.
+    """
+
+
 # -- Workspace / Sandbox ----------------------------------------------------
 
 class WorkspaceError(CckitError):

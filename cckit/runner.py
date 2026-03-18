@@ -14,7 +14,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-from cckit._cli import check_claude_cli
+from cckit._cli import check_api_connectivity, check_claude_cli
 from cckit._engine.collector import StreamCollector
 from cckit._engine.sdk_bridge import run_sdk_query
 from cckit.agent import Agent
@@ -59,6 +59,10 @@ class Runner:
         Override the default WorkspaceManager.
     skill_provisioner:
         Override the default SkillProvisioner.
+    preflight_check:
+        If ``True``, verify API key validity and network connectivity
+        before each execution.  Fails fast with a clear error instead
+        of waiting for a CLI initialization timeout.
     """
 
     def __init__(
@@ -69,6 +73,7 @@ class Runner:
         mcp_servers: dict[str, Any] | None = None,
         workspace_manager: WorkspaceManager | None = None,
         skill_provisioner: SkillProvisioner | None = None,
+        preflight_check: bool = False,
     ) -> None:
         # Validate Claude CLI on first Runner instantiation
         check_claude_cli()
@@ -76,6 +81,7 @@ class Runner:
         self._config = config or RunnerConfig.from_env()
         self._middlewares: list[Middleware] = middlewares or []
         self._mcp_servers = mcp_servers or {}
+        self._preflight_check = preflight_check
 
         self._workspace = workspace_manager or WorkspaceManager(
             root=self._config.sandbox.workspace_root
@@ -163,14 +169,15 @@ class Runner:
         Orchestration flow:
             1. Validate context (required_params, structural checks)
             2. agent.before_execute(ctx)
-            3. Create/resume workspace
-            4. Git clone (if needed, skipped on resume)
-            5. Provision skills (if needed, skipped on resume)
-            6. Resolve instruction (string or callable)
-            7. Build SDK options (model, tools, sub-agents, MCP, sandbox)
-            8. [Middleware chain] → SDK bridge → StreamCollector → yield AgentEvent
-            9. agent.after_execute(ctx, result) or agent.error_execute(ctx, error)
-            10. Cleanup/suspend workspace
+            3. Preflight API connectivity check (if enabled)
+            4. Create/resume workspace
+            5. Git clone (if needed, skipped on resume)
+            6. Provision skills (if needed, skipped on resume)
+            7. Resolve instruction (string or callable)
+            8. Build SDK options (model, tools, sub-agents, MCP, sandbox)
+            9. [Middleware chain] → SDK bridge → StreamCollector → yield AgentEvent
+            10. agent.after_execute(ctx, result) or agent.error_execute(ctx, error)
+            11. Cleanup/suspend workspace
         """
         start = time.monotonic()
 
@@ -196,6 +203,15 @@ class Runner:
 
             # --- lifecycle: before ---
             await agent.before_execute(ctx)
+
+            # --- preflight: API connectivity check ---
+            if self._preflight_check:
+                model = self._resolve_model(agent)
+                api_key = model.api_key or ctx.env.get("ANTHROPIC_API_KEY", "")
+                base_url = model.base_url or ctx.env.get("ANTHROPIC_BASE_URL", "")
+                check_api_connectivity(
+                    api_key=api_key, base_url=base_url, model=model.model,
+                )
 
             # --- workspace ---
             if ctx.workspace.enabled:
