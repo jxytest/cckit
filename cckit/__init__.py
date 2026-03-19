@@ -37,6 +37,7 @@ from cckit.exceptions import (
     ConnectivityError,
     GitLabAPIError,
     GitOperationError,
+    HookError,
     SkillError,
     WorkspaceError,
 )
@@ -88,6 +89,7 @@ __all__ = [
     "CckitError",
     "AgentExecutionError",
     "ConnectivityError",
+    "HookError",
     "WorkspaceError",
     "GitOperationError",
     "GitLabAPIError",

@@ -27,6 +27,29 @@ class AgentExecutionError(CckitError):
     """Raised when agent execution fails (SDK error, timeout, etc.)."""
 
 
+class HookError(CckitError):
+    """Raised when a lifecycle hook (after_execute / error_execute) raises.
+
+    Wraps the original exception so the hook name and original traceback
+    are preserved while still propagating to the caller.
+
+    Attributes
+    ----------
+    hook_name:
+        Name of the hook that failed (e.g. ``"after_execute"``).
+    original:
+        The original exception raised by the hook.
+    """
+
+    def __init__(self, hook_name: str, original: BaseException) -> None:
+        self.hook_name = hook_name
+        self.original = original
+        super().__init__(
+            f"{hook_name} hook failed: {original}",
+            detail=repr(original),
+        )
+
+
 class ConnectivityError(CckitError):
     """Raised when API connectivity preflight check fails.
 

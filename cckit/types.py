@@ -205,9 +205,41 @@ class WorkspaceConfig(CustomModel):
     This was previously ``needs_workspace`` / ``needs_git_clone`` on the Agent;
     now it's part of RunContext so execution environment is controlled by the
     caller, not the agent definition.
+
+    Fields
+    ------
+    enabled:
+        Whether to create an isolated workspace directory.
+    keep:
+        When ``True``, the workspace directory is **never deleted** after
+        execution — it will be suspended instead, allowing a subsequent
+        ``RunContext(resume_session_id=..., workspace_dir=...)`` to reuse it.
+
+        When ``False`` (the default), the workspace is cleaned up (deleted)
+        on successful completion and suspended on failure/cancellation.
+
+        Set this to ``True`` on the *first* execution whenever you plan to
+        resume the session later::
+
+            # First run — keep workspace for resume
+            ctx1 = RunContext(
+                prompt="Fix bug X",
+                workspace=WorkspaceConfig(enabled=True, keep=True),
+                git=GitConfig(repo_url="...", clone=True),
+            )
+            result1 = await runner.run(agent, ctx1)
+
+            # Second run — resume from saved session
+            ctx2 = RunContext(
+                prompt="Add unit tests",
+                resume_session_id=result1.session_id,
+                workspace_dir=ctx1.workspace_dir,
+            )
+            result2 = await runner.run(agent, ctx2)
     """
 
     enabled: bool = True  # whether to create an isolated workspace directory
+    keep: bool = False    # when True, always suspend instead of cleaning up
 
 
 # ---------------------------------------------------------------------------

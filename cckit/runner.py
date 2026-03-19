@@ -18,6 +18,7 @@ from cckit._cli import check_api_connectivity, check_claude_cli
 from cckit._engine.collector import StreamCollector
 from cckit._engine.sdk_bridge import run_sdk_query
 from cckit.agent import Agent
+from cckit.exceptions import HookError
 from cckit.git import operations as git_ops
 from cckit.middleware.base import Middleware
 from cckit.sandbox.config import SandboxConfigBuilder
@@ -322,18 +323,20 @@ class Runner:
             # --- lifecycle: on_error ---
             try:
                 await agent.error_execute(ctx, exc)
-            except Exception:
+            except Exception as hook_exc:
                 logger.exception("error_execute hook failed for %s", agent.name)
+                raise HookError("error_execute", hook_exc) from hook_exc
 
         finally:
             # --- lifecycle: after ---
             if holder.result is not None:
                 try:
                     await agent.after_execute(ctx, holder.result)
-                except Exception:
+                except Exception as hook_exc:
                     logger.exception(
                         "after_execute hook failed for %s", agent.name
                     )
+                    raise HookError("after_execute", hook_exc) from hook_exc
 
                 # --- log final summary ---
                 logger.info(
@@ -352,16 +355,20 @@ class Runner:
                 logger.exception("Failed to cleanup git askpass for task %s", ctx.task_id)
 
             # --- cleanup or suspend workspace ---
+            # Cleanup policy:
+            #   - workspace.keep=True  → always suspend (caller wants to resume later)
+            #   - task failed          → suspend (preserve for debugging / resume)
+            #   - task succeeded       → cleanup (delete) by default
             if holder.workspace_dir:
-                should_cleanup = (
-                    holder.result is not None
-                    and holder.result.status == TaskStatus.COMPLETED
-                    and not ctx.resume_session_id
+                should_suspend = (
+                    ctx.workspace.keep
+                    or holder.result is None
+                    or holder.result.status != TaskStatus.COMPLETED
                 )
-                if should_cleanup:
-                    await self._workspace.cleanup(holder.workspace_dir)
-                else:
+                if should_suspend:
                     await self._workspace.suspend(holder.workspace_dir)
+                else:
+                    await self._workspace.cleanup(holder.workspace_dir)
 
     # ------------------------------------------------------------------
     # Model resolution
