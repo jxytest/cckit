@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from typing import Any
 
 from cckit.types import AgentEvent, RunContext
@@ -33,7 +33,7 @@ class Middleware(ABC):
         options: Any,
         collector: Any,
         ctx: RunContext,
-    ) -> AsyncIterator[AgentEvent]:
+    ) -> AsyncGenerator[AgentEvent, None]:
         """Wrap the next callable in the middleware chain.
 
         Parameters

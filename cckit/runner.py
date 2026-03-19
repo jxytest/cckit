@@ -12,7 +12,7 @@ import logging
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 from cckit._cli import check_api_connectivity, check_claude_cli
 from cckit._engine.collector import StreamCollector
@@ -180,6 +180,7 @@ class Runner:
             11. Cleanup/suspend workspace
         """
         start = time.monotonic()
+        git_cfg = ctx.resolved_git()
 
         try:
             # --- validate context ---
@@ -214,8 +215,6 @@ class Runner:
                 )
 
             # --- workspace ---
-            git_cfg = ctx._resolved_git()
-
             if ctx.workspace.enabled:
                 if ctx.resume_session_id and ctx.workspace_dir:
                     # Resume: reuse existing workspace
@@ -319,7 +318,10 @@ class Runner:
                 )
 
             # --- cleanup temporary askpass script ---
-            git_cfg.cleanup_askpass()
+            try:
+                git_cfg.cleanup_askpass()
+            except Exception:
+                logger.exception("Failed to cleanup git askpass for task %s", ctx.task_id)
 
             # --- cleanup or suspend workspace ---
             if holder.workspace_dir:
@@ -373,7 +375,7 @@ class Runner:
                 missing.append(param)
 
         # Check structural requirements
-        git_cfg = ctx._resolved_git()
+        git_cfg = ctx.resolved_git()
         if git_cfg.clone and not git_cfg.repo_url and not ctx.resume_session_id:
             missing.append("git.repo_url")
 
@@ -440,6 +442,7 @@ class Runner:
         from claude_agent_sdk import (  # noqa: WPS433
             AgentDefinition,
             ClaudeAgentOptions,
+            SandboxSettings,
         )
 
         # -- allowed tools --
@@ -466,6 +469,9 @@ class Runner:
 
         # -- sandbox --
         sandbox_dict = self._sandbox_builder.build(workspace_dir)
+        sandbox: SandboxSettings | None = (
+            SandboxSettings(**sandbox_dict) if sandbox_dict else None
+        )
 
         # -- environment (Agent subprocess only — NO git credentials) --
         env: dict[str, str] = {}
@@ -473,6 +479,12 @@ class Runner:
             env["ANTHROPIC_API_KEY"] = model.api_key
         if model.base_url:
             env["ANTHROPIC_BASE_URL"] = model.base_url
+            # Third-party proxies often reject Anthropic-specific beta headers
+            # and non-essential traffic (telemetry, autoupdater, etc.)
+            env.setdefault("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "1")
+            env.setdefault("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+            # Disable extended thinking — many proxies don't support it
+            env.setdefault("MAX_THINKING_TOKENS", "0")
         # ctx.env is for the Agent subprocess (API keys, feature flags, etc.)
         # Git credentials live in ctx.git / GitConfig and are NEVER injected here.
         env.update(ctx.env)
@@ -481,6 +493,11 @@ class Runner:
         max_turns = agent.max_turns if agent.max_turns > 0 else model.max_turns
 
         # -- assemble --
+        import sys as _sys
+
+        def _stderr_cb(line: str) -> None:
+            print(f"[CLI stderr] {line.rstrip()}", file=_sys.stderr, flush=True)
+
         opts = ClaudeAgentOptions(
             allowed_tools=allowed_tools,
             system_prompt=instruction or None,
@@ -488,6 +505,9 @@ class Runner:
             model=model.model,
             permission_mode=model.permission_mode,
             env=env,
+            stderr=_stderr_cb,
+            sandbox=sandbox,
+            extra_args={"debug-to-stderr": None},
         )
 
         # Set optional fields only when non-empty (SDK may reject empty dicts)
@@ -495,8 +515,6 @@ class Runner:
             opts.agents = agents
         if mcp_servers:
             opts.mcp_servers = mcp_servers
-        if sandbox_dict:
-            opts.sandbox = sandbox_dict
         if workspace_dir:
             opts.cwd = str(workspace_dir)
 
@@ -507,7 +525,10 @@ class Runner:
         # causing the CLI to swallow the next flag as the option value and
         # ultimately time-out.  "local" is the safe default (no project-level
         # settings); "project" enables skill discovery from ``.claude/``.
-        opts.setting_sources = ["project"] if agent.skills else ["local"]
+        opts.setting_sources = cast(
+            list[Literal["user", "project", "local"]],
+            ["project"] if agent.skills else ["local"],
+        )
 
         # -- resume: restore a previous session's conversation context --
         if ctx.resume_session_id:

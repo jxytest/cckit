@@ -56,7 +56,7 @@ async def on_modify_complete(ctx, result):
 
     try:
         branch = f"code-modify/{ctx.task_id}"
-        git_env = ctx._resolved_git().build_git_env() or None
+        git_env = ctx.resolved_git().build_git_env() or None
         await git_ops.create_branch(branch, cwd=ctx.workspace_dir)
         await git_ops.add_all(cwd=ctx.workspace_dir)
         await git_ops.commit(

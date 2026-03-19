@@ -483,7 +483,7 @@ def test_run_context_backward_compat():
         git_repo_url="https://example.com/old-style.git",
         git_branch="develop",
     )
-    resolved = ctx._resolved_git()
+    resolved = ctx.resolved_git()
     assert resolved.repo_url == "https://example.com/old-style.git"
     assert resolved.branch == "develop"
     assert resolved.clone is True  # auto-upgraded when git_repo_url is set
@@ -497,6 +497,6 @@ def test_run_context_new_git_takes_precedence():
         git_repo_url="https://old.com/repo.git",  # should be ignored
         git_branch="old-branch",  # should be ignored
     )
-    resolved = ctx._resolved_git()
+    resolved = ctx.resolved_git()
     assert resolved.repo_url == "https://new.com/repo.git"
     assert resolved.branch == "main"

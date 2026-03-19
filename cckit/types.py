@@ -15,6 +15,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from claude_agent_sdk import PermissionMode
 from pydantic import Field, PrivateAttr
 
 from cckit._models import CustomModel
@@ -38,7 +39,7 @@ class ModelConfig(CustomModel):
     base_url: str = ""  # empty = use ANTHROPIC_BASE_URL env var or default
     max_tokens: int = 16384
     max_turns: int = 50
-    permission_mode: str = "bypassPermissions"
+    permission_mode: PermissionMode = "bypassPermissions"
     timeout_seconds: int = 300
 
 
@@ -65,7 +66,7 @@ class LiteLlm(CustomModel):
     api_key: str = ""  # LiteLLM proxy API key
     max_tokens: int = 16384
     max_turns: int = 50
-    permission_mode: str = "bypassPermissions"
+    permission_mode: PermissionMode = "bypassPermissions"
     timeout_seconds: int = 300
 
     def to_model_config(self) -> ModelConfig:
@@ -255,7 +256,7 @@ class RunContext(CustomModel):
     git_repo_url: str = ""
     git_branch: str = ""
 
-    def _resolved_git(self) -> GitConfig:
+    def resolved_git(self) -> GitConfig:
         """Return the effective GitConfig, merging deprecated fields.
 
         Priority: ``git`` (new) > ``git_repo_url``/``git_branch`` (old).
@@ -451,7 +452,7 @@ class RunnerConfig(CustomModel):
             model: str = "claude-sonnet-4-6"
             max_tokens: int = 16384
             max_turns: int = 50
-            permission_mode: str = "bypassPermissions"
+            permission_mode: PermissionMode = "bypassPermissions"
             timeout_seconds: int = 300
 
         class _EnvSandbox(BaseSettings):

@@ -46,7 +46,7 @@ async def on_fix_complete(ctx, result):
 
     try:
         branch = f"fix/{ctx.task_id}"
-        git_env = ctx._resolved_git().build_git_env() or None
+        git_env = ctx.resolved_git().build_git_env() if ctx.resolved_git() else None
         await git_ops.create_branch(branch, cwd=ctx.workspace_dir)
         await git_ops.add_all(cwd=ctx.workspace_dir)
         await git_ops.commit(

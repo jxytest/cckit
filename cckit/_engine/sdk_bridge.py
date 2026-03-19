@@ -25,7 +25,8 @@ async def run_sdk_query(
 ) -> AsyncIterator[AgentEvent]:
     """Open a ``ClaudeSDKClient`` session and yield events via collector.
 
-    Uses one-shot semantics: connect → receive full response → disconnect.
+    Uses async context manager semantics: ``async with ClaudeSDKClient`` →
+    ``client.query(prompt)`` → ``client.receive_response()``.
     Resume is handled transparently by ``ClaudeAgentOptions.resume``.
     """
     try:
@@ -36,20 +37,16 @@ async def run_sdk_query(
             detail=str(exc),
         ) from exc
 
-    client: Any = None
     try:
-        client = ClaudeSDKClient(options=options)
-        await client.connect(prompt=prompt)
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(prompt)
 
-        async for message in client.receive_response():
-            events = collector.process_message(message)
-            for event in events:
-                yield event
+            async for message in client.receive_response():
+                events = collector.process_message(message)
+                for event in events:
+                    yield event
     except Exception as exc:
         raise AgentExecutionError(
             f"SDK query failed: {exc}",
             detail=str(exc),
         ) from exc
-    finally:
-        if client is not None:
-            await client.disconnect()
