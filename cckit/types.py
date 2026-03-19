@@ -39,7 +39,6 @@ class ModelConfig(CustomModel):
     base_url: str = ""  # empty = use ANTHROPIC_BASE_URL env var or default
     max_tokens: int = 16384
     max_turns: int = 50
-    permission_mode: PermissionMode = "bypassPermissions"
     timeout_seconds: int = 300
 
 
@@ -66,7 +65,6 @@ class LiteLlm(CustomModel):
     api_key: str = ""  # LiteLLM proxy API key
     max_tokens: int = 16384
     max_turns: int = 50
-    permission_mode: PermissionMode = "bypassPermissions"
     timeout_seconds: int = 300
 
     def to_model_config(self) -> ModelConfig:
@@ -77,7 +75,6 @@ class LiteLlm(CustomModel):
             base_url=self.api_base,
             max_tokens=self.max_tokens,
             max_turns=self.max_turns,
-            permission_mode=self.permission_mode,
             timeout_seconds=self.timeout_seconds,
         )
 
@@ -407,12 +404,53 @@ class StreamResult:
 
 
 class SandboxOptions(CustomModel):
-    """Sandbox / workspace isolation configuration."""
+    """Sandbox isolation configuration (macOS / Linux / WSL2 only).
 
+    Maps to two SDK injection points:
+    - ``ClaudeAgentOptions.sandbox``  — SandboxSettings TypedDict (bash process behaviour)
+    - ``ClaudeAgentOptions.settings`` — JSON with ``sandbox.filesystem`` / ``sandbox.network``
+      keys (OS-level path & domain rules, enforced by Seatbelt / bubblewrap)
+
+    Filesystem rules
+    ----------------
+    workspace_root is **always** added to ``allowWrite`` automatically at runtime,
+    so the agent can only write inside its own workspace directory.
+
+    ``deny_read`` defaults to ``["~/"]`` to prevent reading the home directory
+    (e.g. ~/.ssh).  Set to ``[]`` to disable.
+
+    Network rules
+    -------------
+    ``allowed_domains`` restricts which hosts Bash subprocesses can reach.
+    Leave empty to allow all outbound traffic.
+
+    Bash-sandbox behaviour
+    ----------------------
+    ``excluded_commands`` lists commands that run *outside* the sandbox
+    (e.g. ``["git", "docker"]``) so they can access the full network / filesystem.
+    ``allow_unsandboxed_commands`` controls whether ``dangerouslyDisableSandbox``
+    is honoured; set to ``False`` for stricter enforcement.
+    """
+
+    # --- core ---
     enabled: bool = False
     workspace_root: Path = Path("/tmp/cckit_workspaces")
-    network_allowed_hosts: list[str] = Field(default_factory=list)
-    max_file_size_mb: int = 50
+
+    # --- sandbox.filesystem (settings JSON) ---
+    # workspace_root is appended to allow_write automatically at runtime
+    allow_write: list[str] = Field(default_factory=list)   # extra write-allowed paths
+    deny_write:  list[str] = Field(default_factory=list)   # write-blocked paths
+    allow_read:  list[str] = Field(default_factory=list)   # re-allow inside deny_read zones
+    deny_read:   list[str] = Field(default_factory=lambda: ["~/"])  # read-blocked paths
+
+    # --- sandbox.network (settings JSON) ---
+    allowed_domains: list[str] = Field(default_factory=list)  # empty = allow all
+
+    # --- SandboxSettings TypedDict (bash process behaviour) ---
+    auto_allow_bash: bool = True           # autoAllowBashIfSandboxed
+    excluded_commands: list[str] = Field(default_factory=list)   # e.g. ["git", "docker"]
+    allow_unsandboxed_commands: bool = True   # allowUnsandboxedCommands
+    enable_weaker_nested_sandbox: bool = False  # for unprivileged Docker (Linux)
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +471,7 @@ class RunnerConfig(CustomModel):
     max_concurrent_agents: int = 5
     debug: bool = False
     log_level: str = "INFO"
+    permission_mode: PermissionMode = "bypassPermissions"
 
     @classmethod
     def from_env(cls) -> RunnerConfig:
@@ -452,15 +491,24 @@ class RunnerConfig(CustomModel):
             model: str = "claude-sonnet-4-6"
             max_tokens: int = 16384
             max_turns: int = 50
-            permission_mode: PermissionMode = "bypassPermissions"
             timeout_seconds: int = 300
 
         class _EnvSandbox(BaseSettings):
             model_config = {"env_prefix": "SANDBOX_", "case_sensitive": False}
             enabled: bool = False
             workspace_root: Path = Path("/tmp/cckit_workspaces")
-            network_allowed_hosts: list[str] = []
-            max_file_size_mb: int = 50
+            # filesystem
+            allow_write: list[str] = []   # SANDBOX_ALLOW_WRITE
+            deny_write:  list[str] = []   # SANDBOX_DENY_WRITE
+            allow_read:  list[str] = []   # SANDBOX_ALLOW_READ
+            deny_read:   list[str] = ["~/"]  # SANDBOX_DENY_READ
+            # network
+            allowed_domains: list[str] = []  # SANDBOX_ALLOWED_DOMAINS
+            # bash behaviour
+            auto_allow_bash: bool = True             # SANDBOX_AUTO_ALLOW_BASH
+            excluded_commands: list[str] = []        # SANDBOX_EXCLUDED_COMMANDS
+            allow_unsandboxed_commands: bool = True  # SANDBOX_ALLOW_UNSANDBOXED_COMMANDS
+            enable_weaker_nested_sandbox: bool = False  # SANDBOX_ENABLE_WEAKER_NESTED_SANDBOX
 
         class _EnvPlatform(BaseSettings):
             model_config = {"env_prefix": "PLATFORM_", "case_sensitive": False}
@@ -468,6 +516,7 @@ class RunnerConfig(CustomModel):
             log_level: str = "INFO"
             max_concurrent_agents: int = 5
             skills_dir: Path = Path("/opt/agent-platform/skills")
+            permission_mode: PermissionMode = "bypassPermissions"
 
         env_m = _EnvModel()
         env_s = _EnvSandbox()
@@ -480,17 +529,24 @@ class RunnerConfig(CustomModel):
                 base_url=env_m.base_url,
                 max_tokens=env_m.max_tokens,
                 max_turns=env_m.max_turns,
-                permission_mode=env_m.permission_mode,
                 timeout_seconds=env_m.timeout_seconds,
             ),
             sandbox=SandboxOptions(
                 enabled=env_s.enabled,
                 workspace_root=env_s.workspace_root,
-                network_allowed_hosts=env_s.network_allowed_hosts,
-                max_file_size_mb=env_s.max_file_size_mb,
+                allow_write=env_s.allow_write,
+                deny_write=env_s.deny_write,
+                allow_read=env_s.allow_read,
+                deny_read=env_s.deny_read,
+                allowed_domains=env_s.allowed_domains,
+                auto_allow_bash=env_s.auto_allow_bash,
+                excluded_commands=env_s.excluded_commands,
+                allow_unsandboxed_commands=env_s.allow_unsandboxed_commands,
+                enable_weaker_nested_sandbox=env_s.enable_weaker_nested_sandbox,
             ),
             skills_dir=env_p.skills_dir,
             max_concurrent_agents=env_p.max_concurrent_agents,
             debug=env_p.debug,
             log_level=env_p.log_level,
+            permission_mode=env_p.permission_mode,
         )

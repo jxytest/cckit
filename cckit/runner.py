@@ -38,6 +38,11 @@ from cckit.types import (
 logger = logging.getLogger(__name__)
 
 
+def _is_windows() -> bool:
+    import sys
+    return sys.platform == "win32"
+
+
 class Runner:
     """Execute an Agent and yield AgentEvent objects.
 
@@ -98,8 +103,24 @@ class Runner:
         )
         self._sandbox_builder = SandboxConfigBuilder(
             enabled=self._config.sandbox.enabled,
-            network_hosts=list(self._config.sandbox.network_allowed_hosts),
+            workspace_root=self._config.sandbox.workspace_root,
+            allow_write=list(self._config.sandbox.allow_write),
+            deny_write=list(self._config.sandbox.deny_write),
+            allow_read=list(self._config.sandbox.allow_read),
+            deny_read=list(self._config.sandbox.deny_read),
+            allowed_domains=list(self._config.sandbox.allowed_domains),
+            auto_allow_bash=self._config.sandbox.auto_allow_bash,
+            excluded_commands=list(self._config.sandbox.excluded_commands),
+            allow_unsandboxed_commands=self._config.sandbox.allow_unsandboxed_commands,
+            enable_weaker_nested_sandbox=self._config.sandbox.enable_weaker_nested_sandbox,
         )
+        if self._config.sandbox.enabled and _is_windows():
+            logger.warning(
+                "Sandbox is enabled but the current platform is Windows. "
+                "OS-level filesystem/network isolation (Seatbelt/bubblewrap) is "
+                "not supported on native Windows — sandbox settings will have no effect. "
+                "Use macOS, Linux, or WSL2 for full sandbox enforcement."
+            )
         self._clone_semaphore = asyncio.Semaphore(
             self._config.max_concurrent_agents
         )
@@ -360,7 +381,6 @@ class Runner:
             base_url=agent_model.base_url or base.base_url,
             max_tokens=agent_model.max_tokens,
             max_turns=agent_model.max_turns if agent_model.max_turns > 0 else base.max_turns,
-            permission_mode=agent_model.permission_mode or base.permission_mode,
             timeout_seconds=agent_model.timeout_seconds or base.timeout_seconds,
         )
 
@@ -475,7 +495,7 @@ class Runner:
                 mcp_servers[name] = factory()
 
         # -- sandbox --
-        sandbox_dict = self._sandbox_builder.build(workspace_dir)
+        sandbox_dict, settings_json = self._sandbox_builder.build(workspace_dir)
         sandbox: SandboxSettings | None = (
             SandboxSettings(**sandbox_dict) if sandbox_dict else None
         )
@@ -483,7 +503,12 @@ class Runner:
         # -- environment (Agent subprocess only — NO git credentials) --
         env: dict[str, str] = {}
         if model.api_key:
+            # ANTHROPIC_API_KEY  → sent as X-Api-Key header (direct Anthropic API)
+            # ANTHROPIC_AUTH_TOKEN → sent as Authorization: Bearer header (LLM gateway / proxy)
+            # Both are injected so the CLI authenticates correctly regardless of
+            # whether the endpoint is a first-party Anthropic host or a third-party proxy.
             env["ANTHROPIC_API_KEY"] = model.api_key
+            env["ANTHROPIC_AUTH_TOKEN"] = model.api_key
         if model.base_url:
             env["ANTHROPIC_BASE_URL"] = model.base_url
             # Third-party proxies often reject Anthropic-specific beta headers
@@ -508,10 +533,14 @@ class Runner:
             system_prompt=instruction or None,
             max_turns=max_turns,
             model=model.model,
-            permission_mode=model.permission_mode,
+            # When sandbox is enabled, switch to dontAsk so that permissions.deny
+            # rules are enforced. bypassPermissions skips all permission checks
+            # (including deny rules) and is only safe inside pre-isolated envs.
+            permission_mode="dontAsk" if self._config.sandbox.enabled else self._config.permission_mode,
             env=env,
             stderr=_stderr_cb,
             sandbox=sandbox,
+            settings=settings_json,
             extra_args={"debug-to-stderr": None},
         )
 

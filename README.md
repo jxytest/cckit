@@ -217,12 +217,102 @@ from pathlib import Path
 config = RunnerConfig(
     default_model=ModelConfig(model="claude-sonnet-4-6", api_key="sk-..."),
     sandbox=SandboxOptions(enabled=True, workspace_root=Path("/data/ws")),
+    permission_mode="bypassPermissions",  # 沙箱开启时自动覆盖为 dontAsk
 )
 runner = Runner(config=config)
 
 # 方式 2: 从环境变量读取（兼容旧部署）
 config = RunnerConfig.from_env()  # 读取 ANTHROPIC_*、SANDBOX_*、PLATFORM_*
 ```
+
+### 环境变量一览
+
+| 变量 | 对应字段 | 默认值 |
+|------|----------|--------|
+| `ANTHROPIC_API_KEY` | `default_model.api_key` | — |
+| `ANTHROPIC_BASE_URL` | `default_model.base_url` | — |
+| `ANTHROPIC_MODEL` | `default_model.model` | `claude-sonnet-4-6` |
+| `ANTHROPIC_MAX_TOKENS` | `default_model.max_tokens` | `16384` |
+| `ANTHROPIC_MAX_TURNS` | `default_model.max_turns` | `50` |
+| `ANTHROPIC_TIMEOUT_SECONDS` | `default_model.timeout_seconds` | `300` |
+| `SANDBOX_ENABLED` | `sandbox.enabled` | `false` |
+| `SANDBOX_WORKSPACE_ROOT` | `sandbox.workspace_root` | `/tmp/cckit_workspaces` |
+| `SANDBOX_DENY_READ` | `sandbox.deny_read` | `["~/"]` |
+| `PLATFORM_PERMISSION_MODE` | `permission_mode` | `bypassPermissions` |
+| `PLATFORM_MAX_CONCURRENT_AGENTS` | `max_concurrent_agents` | `5` |
+| `PLATFORM_SKILLS_DIR` | `skills_dir` | `/opt/agent-platform/skills` |
+
+## 沙箱隔离
+
+> **平台支持**：沙箱依赖 macOS Seatbelt / Linux bubblewrap，**Windows 原生不支持**（cckit 会在启动时打印警告）。WSL2 可正常使用。
+
+### 默认行为说明
+
+开启沙箱（`enabled=True`）后，默认规则如下：
+
+| 能力 | 默认行为 |
+|------|----------|
+| **写入** | 仅允许写入当前任务的 workspace 目录，其他路径均不可写 |
+| **读取** | 可读取大部分系统路径；**家目录（`~/`）被屏蔽**（防止访问 `~/.ssh` 等敏感文件） |
+| **网络** | Bash 子进程可访问所有出站网络 |
+
+> 沙箱**不是**"只读工作目录"的白名单模式。读取限制仅屏蔽家目录，`/etc`、`/usr` 等系统路径仍可读。
+> 如需更严格的隔离，使用 `deny_read` 追加更多路径。
+
+### 最小安全配置
+
+对于大多数场景，直接开启即可——默认已屏蔽家目录（`~/.ssh`、`~/.aws` 等）：
+
+```python
+from cckit import Runner, RunnerConfig
+from cckit.sandbox import SandboxOptions
+
+runner = Runner(
+    config=RunnerConfig(
+        sandbox=SandboxOptions(enabled=True),
+    )
+)
+```
+
+沙箱开启后，cckit 会自动将 `permission_mode` 切换为 `dontAsk`，确保 `deny` 规则对 Claude 内置工具（Read / Edit / Glob）同样生效。
+
+### 两套隔离机制
+
+cckit 同时配置 SDK 的两个隔离层，单独配置任意一层都会有死角：
+
+| 机制 | 覆盖范围 |
+|------|----------|
+| `sandbox.filesystem`（OS 级） | 限制 **Bash 子进程**的文件读写 |
+| `permissions.deny`（SDK 级） | 限制 Claude **内置工具**（Read / Edit / Glob / Grep） |
+
+`deny_read` / `deny_write` 中配置的路径会自动同步到两侧，无需手动维护。
+
+### 追加更严格的限制
+
+如果需要在默认基础上进一步收紧：
+
+```python
+SandboxOptions(
+    enabled=True,
+    # 额外屏蔽敏感目录（家目录已默认屏蔽）
+    deny_read=["~/", "/etc/ssl", "/run/secrets"],
+    # 限制出站网络，只允许访问指定域名
+    allowed_domains=["api.example.com"],
+    # git 在沙箱外运行，保留完整网络权限
+    excluded_commands=["git"],
+)
+```
+
+### permission_mode 说明
+
+`permission_mode` 位于 `RunnerConfig`（非 `ModelConfig`），控制 Claude 内置工具的权限策略：
+
+| 值 | 行为 |
+|----|------|
+| `bypassPermissions`（默认） | 跳过所有权限检查，**deny 规则不生效** |
+| `dontAsk` | 遵守 deny 规则，不弹出审批提示 |
+
+沙箱开启时 cckit 自动切换为 `dontAsk`，**无需手动设置**。
 
 ## MCP 工具
 
