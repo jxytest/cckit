@@ -79,6 +79,13 @@ class Runner:
         check_claude_cli()
 
         self._config = config or RunnerConfig.from_env()
+
+        # Apply log_level to the cckit logger hierarchy only.
+        # We intentionally do NOT touch the root logger — that is the
+        # caller's responsibility.  Setting the level on "cckit" is enough
+        # to control all cckit.* child loggers uniformly.
+        _level = getattr(logging, self._config.log_level.upper(), logging.INFO)
+        logging.getLogger("cckit").setLevel(_level)
         self._middlewares: list[Middleware] = middlewares or []
         self._mcp_servers = mcp_servers or {}
         self._preflight_check = preflight_check
@@ -493,10 +500,8 @@ class Runner:
         max_turns = agent.max_turns if agent.max_turns > 0 else model.max_turns
 
         # -- assemble --
-        import sys as _sys
-
         def _stderr_cb(line: str) -> None:
-            print(f"[CLI stderr] {line.rstrip()}", file=_sys.stderr, flush=True)
+            logger.debug("[CLI stderr] %s", line.rstrip())
 
         opts = ClaudeAgentOptions(
             allowed_tools=allowed_tools,

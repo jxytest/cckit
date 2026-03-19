@@ -104,6 +104,7 @@ def check_api_connectivity(
         data=body,
         headers={
             "x-api-key": key,
+            "Authorization": f"Bearer {key}",  # 兼容 OpenAI 格式的中转网关
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         },
