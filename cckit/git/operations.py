@@ -105,9 +105,32 @@ async def create_branch(name: str, *, cwd: Path) -> None:
     logger.info("Created branch %s in %s", name, cwd)
 
 
-async def add_all(*, cwd: Path) -> None:
-    """Stage all changes."""
-    await run_git("add", "-A", cwd=cwd)
+async def add_all(
+    *,
+    cwd: Path,
+    exclude: list[str] | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> None:
+    """Stage all changes, with optional path exclusions.
+
+    Parameters
+    ----------
+    exclude:
+        Paths to exclude from staging.  Each entry is converted to a git
+        pathspec exclusion (``':!<path>'``).  Useful for keeping
+        platform-managed directories (e.g. ``.claude/``) out of commits::
+
+            await add_all(cwd=workspace, exclude=[".claude"])
+
+        This is a defence-in-depth complement to the ``.git/info/exclude``
+        rule written by :class:`~cckit.skill.provisioner.SkillProvisioner`.
+    extra_env:
+        Per-task environment variables for credential isolation.
+    """
+    pathspecs = ["."]
+    if exclude:
+        pathspecs += [f":!{p}" for p in exclude]
+    await run_git("add", "--", *pathspecs, cwd=cwd, extra_env=extra_env)
 
 
 async def commit(message: str, *, cwd: Path) -> str:

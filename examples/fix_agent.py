@@ -48,7 +48,10 @@ async def on_fix_complete(ctx, result):
         branch = f"fix/{ctx.task_id}"
         git_env = ctx.resolved_git().build_git_env() if ctx.resolved_git() else None
         await git_ops.create_branch(branch, cwd=ctx.workspace_dir)
-        await git_ops.add_all(cwd=ctx.workspace_dir)
+        await git_ops.add_all(
+            cwd=ctx.workspace_dir,
+            exclude=[".claude"],   # defence-in-depth: keep skills out of the MR
+        )
         await git_ops.commit(
             f"fix: repair broken locator ({ctx.task_id})",
             cwd=ctx.workspace_dir,

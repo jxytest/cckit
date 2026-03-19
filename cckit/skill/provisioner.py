@@ -97,6 +97,12 @@ class SkillProvisioner:
             deployed.append(name)
             logger.info("Provisioned skill %r → %s", name, target)
 
+        # Step 4 — exclude .claude/ from git tracking via local exclude rules.
+        # Skills are platform-managed runtime files and must not appear in MRs.
+        # .git/info/exclude acts like .gitignore but is never committed, so it
+        # silently protects every downstream `git add` without touching the repo.
+        await self._write_git_exclude(workspace_dir)
+
         return deployed
 
     def list_available(self) -> list[str]:
@@ -173,6 +179,45 @@ class SkillProvisioner:
     # ------------------------------------------------------------------
     # Async filesystem helpers (private)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _write_git_exclude(workspace_dir: Path) -> None:
+        """Append ``.claude/`` to ``.git/info/exclude`` so git ignores skills.
+
+        ``.git/info/exclude`` is the per-clone equivalent of ``.gitignore``.
+        It is local-only (never committed) and takes effect immediately for
+        all subsequent ``git add`` / ``git status`` calls in the workspace.
+
+        If the ``.git/`` directory is absent (e.g. workspace without a clone)
+        the write is silently skipped.
+        """
+        exclude_file = workspace_dir / ".git" / "info" / "exclude"
+        if not exclude_file.parent.exists():
+            # Not a git repo (e.g. plain workspace without clone) — skip.
+            return
+
+        _MARKER = "# cckit: platform-managed — do not commit\n"
+        _RULE = ".claude/\n"
+
+        loop = asyncio.get_running_loop()
+
+        def _append() -> None:
+            existing = exclude_file.read_text(encoding="utf-8") if exclude_file.exists() else ""
+            if _RULE in existing:
+                return  # already present, nothing to do
+            with exclude_file.open("a", encoding="utf-8") as fh:
+                if existing and not existing.endswith("\n"):
+                    fh.write("\n")
+                fh.write(_MARKER)
+                fh.write(_RULE)
+
+        try:
+            await loop.run_in_executor(None, _append)
+            logger.debug("Added .claude/ to %s", exclude_file)
+        except OSError as exc:
+            # Non-fatal — log and continue.  A missing exclude entry is
+            # inconvenient but not a correctness blocker.
+            logger.warning("Could not write git exclude (%s): %s", exclude_file, exc)
 
     @staticmethod
     async def _copytree(src: Path, dst: Path) -> None:
