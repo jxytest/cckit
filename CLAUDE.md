@@ -17,7 +17,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 | 文件 | 导入内容 |
 |------|----------|
-| `cckit/_engine/sdk_bridge.py` | `ClaudeSDKClient`, `ClaudeAgentOptions`, `AgentDefinition` |
+| `cckit/_engine/sdk_bridge.py` | `query`, `ClaudeAgentOptions` |
 | `cckit/_engine/collector.py` | `AssistantMessage`, `ResultMessage`, `SystemMessage`, `TextBlock`, `ThinkingBlock`, `ToolUseBlock`, `ToolResultBlock`, `TaskStartedMessage`, `TaskProgressMessage`, `TaskNotificationMessage` |
 | `cckit/tools/platform.py` | `create_sdk_mcp_server`, `tool` |
 

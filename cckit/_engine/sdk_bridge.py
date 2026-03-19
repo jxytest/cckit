@@ -1,8 +1,11 @@
-"""SDK bridge — the only module that directly interacts with ClaudeSDKClient.
+"""SDK bridge — the only module that directly interacts with the claude-agent-sdk.
 
 Extracted from the old ``executor.py``.  Provides a standalone async generator
-that opens an SDK session, streams messages through a ``StreamCollector``, and
+that calls ``query()``, streams messages through a ``StreamCollector``, and
 yields ``AgentEvent`` objects.
+
+Session resume / fork is handled transparently via ``ClaudeAgentOptions.resume``
+and ``ClaudeAgentOptions.fork_session`` — no special logic needed here.
 """
 
 from __future__ import annotations
@@ -23,14 +26,14 @@ async def run_sdk_query(
     options: Any,
     collector: StreamCollector,
 ) -> AsyncIterator[AgentEvent]:
-    """Open a ``ClaudeSDKClient`` session and yield events via collector.
+    """Call ``query(prompt, options=options)`` and yield events via collector.
 
-    Uses async context manager semantics: ``async with ClaudeSDKClient`` →
-    ``client.query(prompt)`` → ``client.receive_response()``.
-    Resume is handled transparently by ``ClaudeAgentOptions.resume``.
+    Uses the top-level ``query()`` async generator from ``claude_agent_sdk``
+    instead of the stateful ``query`` context-manager approach.
+    Session resume is handled transparently by ``ClaudeAgentOptions.resume``.
     """
     try:
-        from claude_agent_sdk import ClaudeSDKClient  # noqa: WPS433
+        from claude_agent_sdk import query  # noqa: WPS433
     except ImportError as exc:
         raise AgentExecutionError(
             "claude-agent-sdk is not installed",
@@ -38,13 +41,10 @@ async def run_sdk_query(
         ) from exc
 
     try:
-        async with ClaudeSDKClient(options=options) as client:
-            await client.query(prompt)
-
-            async for message in client.receive_response():
-                events = collector.process_message(message)
-                for event in events:
-                    yield event
+        async for message in query(prompt=prompt, options=options):
+            events = collector.process_message(message)
+            for event in events:
+                yield event
     except Exception as exc:
         raise AgentExecutionError(
             f"SDK query failed: {exc}",

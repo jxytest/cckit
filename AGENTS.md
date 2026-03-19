@@ -38,7 +38,7 @@ cckit/                              # pip install cckit
 ├── _models.py                     # CustomModel 基类（内部）
 ├── _cli.py                        # Claude CLI 检测
 ├── _engine/                       # SDK 桥接层（私有）
-│   ├── sdk_bridge.py              # ClaudeSDKClient 交互
+│   ├── sdk_bridge.py              # query 交互
 │   └── collector.py               # StreamCollector（SDK 消息 → AgentEvent）
 ├── middleware/                     # 可插拔中间件
 │   ├── base.py                    # Middleware 抽象类
@@ -201,7 +201,7 @@ Runner.run(agent, ctx) → AgentResult:
 
 | 文件 | 导入内容 |
 |------|----------|
-| `cckit/_engine/sdk_bridge.py` | `ClaudeSDKClient`, `ClaudeAgentOptions`, `AgentDefinition` |
+| `cckit/_engine/sdk_bridge.py` | `query`, `ClaudeAgentOptions`, `AgentDefinition` |
 | `cckit/_engine/collector.py` | 消息类型（`AssistantMessage` 等） |
 | `cckit/tools/platform.py` | `create_sdk_mcp_server`, `tool` |
 
