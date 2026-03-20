@@ -14,6 +14,8 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Literal, cast
 
+from claude_agent_sdk.types import SystemPromptPreset
+
 from cckit._cli import check_api_connectivity, check_claude_cli
 from cckit._engine.collector import StreamCollector
 from cckit._engine.sdk_bridge import run_sdk_query
@@ -537,7 +539,11 @@ class Runner:
 
         opts = ClaudeAgentOptions(
             allowed_tools=allowed_tools,
-            system_prompt=instruction or None,
+            system_prompt=SystemPromptPreset(
+                type='preset',
+                preset='claude_code',
+                append=instruction or None,
+            ),
             max_turns=max_turns,
             model=model.model,
             # When sandbox is enabled, switch to dontAsk so that permissions.deny
@@ -549,6 +555,7 @@ class Runner:
             sandbox=sandbox,
             settings=settings_json,
             extra_args={"debug-to-stderr": None},
+            user=ctx.user,
         )
 
         # Set optional fields only when non-empty (SDK may reject empty dicts)

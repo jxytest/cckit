@@ -359,3 +359,7 @@ agent = Agent(
 
 - **FixAgent** — 自动修复 + 创建 Merge Request
 - **CodeModifyAgent** — 代码修改 Agent
+
+
+## 已知问题
+- [ ] `Windows`下，系统提示词设置无法生效， 属于`claude-agent-sdk`本身问题

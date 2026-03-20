@@ -42,7 +42,7 @@ class StreamCollector:
         )
 
         events: list[AgentEvent] = []
-
+        # UserMessage | AssistantMessage | SystemMessage | ResultMessage | StreamEvent
         # SystemMessage check must come first because TaskStartedMessage,
         # TaskProgressMessage, etc. are subclasses of SystemMessage.
         if isinstance(message, SystemMessage):
@@ -92,6 +92,8 @@ class StreamCollector:
                         "sub_task_id": msg.task_id,
                         "description": msg.description,
                         "usage": msg.usage,
+                        "session_id": msg.session_id,
+                        "tool_use_id": msg.tool_use_id,
                         "last_tool_name": msg.last_tool_name,
                     },
                 )
@@ -107,6 +109,8 @@ class StreamCollector:
                         "summary": msg.summary,
                         "usage": msg.usage,
                         "output_file": msg.output_file,
+                        "session_id": msg.session_id,
+                        "tool_use_id": msg.tool_use_id,
                     },
                 )
             )
@@ -127,7 +131,7 @@ class StreamCollector:
 
         events: list[AgentEvent] = []
         content_blocks = getattr(msg, "content", []) or []
-
+        # TextBlock | ThinkingBlock | ToolUseBlock | ToolResultBlock
         for block in content_blocks:
             if isinstance(block, TextBlock):
                 text = block.text

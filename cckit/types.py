@@ -266,7 +266,7 @@ class RunContext(CustomModel):
     prompt: str = ""
     params: dict[str, Any] = Field(default_factory=dict)
     env: dict[str, str] = Field(default_factory=dict)
-
+    user: str | None = None
     # Workspace
     workspace: WorkspaceConfig = Field(default_factory=WorkspaceConfig)
     workspace_dir: Path | None = None  # injected by Runner, or manually specified
