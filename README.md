@@ -316,28 +316,77 @@ SandboxOptions(
 
 ## MCP 工具
 
-### 使用内置平台工具
+
+| 类型 | TypedDict | 说明 |
+|------|-----------|------|
+| `stdio` | `McpStdioServerConfig` | 启动子进程（`command` + `args`） |
+| `sse` | `McpSSEServerConfig` | 连接远程 SSE 端点 |
+| `http` | `McpHttpServerConfig` | 连接远程 HTTP 端点 |
+| `sdk` | `McpSdkServerConfig` | 进程内 SDK 服务（`create_sdk_mcp_server`） |
+
+### Playwright MCP（浏览器自动化）
+
+cckit 内置 `playwright_mcp_server()` 工厂函数，开箱即用：
 
 ```python
-from cckit.tools.platform import get_platform_mcp_server
+from cckit.tools.platform import playwright_mcp_server
+from cckit import Agent
 
-runner = Runner(mcp_servers={"platform": get_platform_mcp_server})
-agent = Agent(name="fix", mcp_tools=["get_failure_info"], ...)
+agent = Agent(
+    name="browser-agent",
+    tools=["Bash"],
+    mcp_servers={"playwright": playwright_mcp_server()},  # 默认 headless=True
+    instruction="Use playwright MCP tools to automate browser tasks.",
+)
 ```
 
-### 自定义 MCP 工具
+> **前置条件**：需要 Node.js / `npx`。`@playwright/mcp` 会在首次运行时自动下载，
+> 或提前安装：`npm install -g @playwright/mcp`
+
+可选参数：
 
 ```python
-def my_mcp_server():
-    from claude_agent_sdk import create_sdk_mcp_server, tool
+playwright_mcp_server(headless=False)                      # 显示浏览器窗口（调试用）
+playwright_mcp_server(extra_args=["--timeout", "30000"])   # 追加 CLI 参数
+```
 
-    @tool("my_tool", "Description", {"arg": str})
-    async def my_tool(args):
-        return {"content": [{"type": "text", "text": "result"}]}
+### 自定义 SDK MCP 工具
 
-    return create_sdk_mcp_server("my-tools", tools=[my_tool])
+使用 `@tool` 装饰器定义进程内工具，返回 `McpSdkServerConfig`：
 
-runner = Runner(mcp_servers={"custom": my_mcp_server})
+```python
+from claude_agent_sdk import create_sdk_mcp_server, tool
+from claude_agent_sdk.types import McpSdkServerConfig
+from cckit import Agent
+
+@tool("fetch_data", "Fetch data from the platform", {"id": str})
+async def fetch_data(args: dict) -> dict:
+    result = await my_api.get(args["id"])
+    return {"content": [{"type": "text", "text": result}]}
+
+server = create_sdk_mcp_server("my-tools", tools=[fetch_data])
+
+agent = Agent(
+    name="my-agent",
+    mcp_servers={"my-tools": McpSdkServerConfig(type="sdk", name="my-tools", instance=server)},
+)
+```
+
+`cckit.tools.platform.sdk_mcp_server()` 提供了一个带 `echo` 工具的完整示例，可直接复制修改。
+
+### 使用 SSE / HTTP 远程服务
+
+```python
+from claude_agent_sdk.types import McpSSEServerConfig, McpHttpServerConfig
+from cckit import Agent
+
+agent = Agent(
+    name="my-agent",
+    mcp_servers={
+        "remote-sse":  McpSSEServerConfig(type="sse",  url="https://my-mcp.example.com/sse"),
+        "remote-http": McpHttpServerConfig(type="http", url="https://my-mcp.example.com/mcp"),
+    },
+)
 ```
 
 ## Skills

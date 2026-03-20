@@ -60,9 +60,6 @@ class Runner:
     middlewares:
         Optional list of ``Middleware`` instances.  Executed in order,
         the first middleware is the outermost wrapper.
-    mcp_servers:
-        Optional dict of MCP server name → server factory callable.
-        Agents reference these by name via ``Agent.mcp_tools``.
     workspace_manager:
         Override the default WorkspaceManager.
     skill_provisioner:
@@ -78,7 +75,6 @@ class Runner:
         *,
         config: RunnerConfig | None = None,
         middlewares: list[Middleware] | None = None,
-        mcp_servers: dict[str, Any] | None = None,
         workspace_manager: WorkspaceManager | None = None,
         skill_provisioner: SkillProvisioner | None = None,
         preflight_check: bool = False,
@@ -95,7 +91,6 @@ class Runner:
         _level = getattr(logging, self._config.log_level.upper(), logging.INFO)
         logging.getLogger("cckit").setLevel(_level)
         self._middlewares: list[Middleware] = middlewares or []
-        self._mcp_servers = mcp_servers or {}
         self._preflight_check = preflight_check
 
         self._workspace = workspace_manager or WorkspaceManager(
@@ -498,10 +493,7 @@ class Runner:
             )
 
         # -- MCP servers --
-        mcp_servers: dict[str, Any] = {}
-        if agent.mcp_tools:
-            for name, factory in self._mcp_servers.items():
-                mcp_servers[name] = factory()
+        mcp_servers = agent.mcp_servers
 
         # -- sandbox --
         sandbox_dict, settings_json = self._sandbox_builder.build(workspace_dir)

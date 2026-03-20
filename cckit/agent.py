@@ -55,9 +55,11 @@ class Agent:
     skills_dir:
         Base directory containing skill sub-directories. Overrides
         RunnerConfig.skills_dir for this agent.
-    mcp_tools:
-        List of MCP tool names to expose (resolved from MCP servers
-        configured on the Runner).
+    mcp_servers:
+        MCP servers to expose to this agent.  Pass a dict of server name →
+        :class:`~claude_agent_sdk.types.McpServerConfig` (stdio, SSE, HTTP or
+        SDK in-process).  Passed directly to the SDK — no Runner-level
+        registry needed.
     required_params:
         List of keys that must be present in ``RunContext.params``.
     max_turns:
@@ -83,7 +85,7 @@ class Agent:
         sub_agents: list[Agent] | None = None,
         skills: list[str] | None = None,
         skills_dir: str | Path | None = None,
-        mcp_tools: list[str] | None = None,
+        mcp_servers: dict[str, Any] | None = None,
         required_params: list[str] | None = None,
         max_turns: int = 0,
         # Lifecycle callbacks
@@ -97,7 +99,7 @@ class Agent:
         self.sub_agents = sub_agents or []
         self.skills = skills or []
         self.skills_dir = Path(skills_dir) if skills_dir else None
-        self.mcp_tools = mcp_tools or []
+        self.mcp_servers: dict[str, Any] = mcp_servers or {}
         self.required_params = required_params or []
         self.max_turns = max_turns
 
