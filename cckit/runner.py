@@ -531,7 +531,6 @@ class Runner:
             logger.debug("[CLI stderr] %s", line.rstrip())
 
         opts = ClaudeAgentOptions(
-            allowed_tools=allowed_tools,
             system_prompt=SystemPromptPreset(
                 type='preset',
                 preset='claude_code',
@@ -550,6 +549,10 @@ class Runner:
             extra_args={"debug-to-stderr": None},
             user=ctx.user,
         )
+
+        if allowed_tools:
+            opts.tools = allowed_tools
+            opts.allowed_tools = allowed_tools
 
         # Set optional fields only when non-empty (SDK may reject empty dicts)
         if agents:
