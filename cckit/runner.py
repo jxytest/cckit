@@ -337,9 +337,10 @@ class Runner:
 
                 # --- log final summary ---
                 logger.info(
-                    "Agent %s completed: task_id=%s status=%s cost=$%.4f duration=%.2fs",
+                    "Agent %s completed: task_id=%s session_id=%s status=%s cost=$%.4f duration=%.2fs",
                     agent.name,
                     holder.result.task_id,
+                    holder.result.session_id,
                     holder.result.status,
                     holder.result.cost_usd,
                     holder.result.duration_seconds,
@@ -575,4 +576,8 @@ class Runner:
             opts.resume = ctx.resume_session_id
             opts.fork_session = ctx.fork_session
 
+        # -- resume implies continue_conversation (unless forking) --
+        if ctx.resume_session_id and not ctx.fork_session:
+            opts.continue_conversation = True
+            
         return opts
