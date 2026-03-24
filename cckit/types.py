@@ -470,9 +470,11 @@ class SandboxOptions(CustomModel):
 
     # --- sandbox.filesystem (settings JSON) ---
     # workspace_root is appended to allow_write automatically at runtime
+    # 写默认全部禁止，仅在allow_write可写
     allow_write: list[str] = Field(default_factory=list)   # extra write-allowed paths
     deny_write:  list[str] = Field(default_factory=list)   # write-blocked paths
     allow_read:  list[str] = Field(default_factory=list)   # re-allow inside deny_read zones
+    # 读默认全部允许，仅在deny_read中不可读。不支持*这种通配符，但可以`//`代表所有
     deny_read:   list[str] = Field(default_factory=lambda: ["~/"])  # read-blocked paths
 
     # --- sandbox.network (settings JSON) ---

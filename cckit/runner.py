@@ -550,7 +550,7 @@ class Runner:
             user=ctx.user,
         )
 
-        if allowed_tools:
+        if allowed_tools and allowed_tools != []:
             opts.tools = allowed_tools
             opts.allowed_tools = allowed_tools
 
