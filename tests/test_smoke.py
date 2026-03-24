@@ -13,6 +13,7 @@ Verifies:
 
 from __future__ import annotations
 
+import json
 import tempfile
 from pathlib import Path
 
@@ -207,6 +208,7 @@ def test_middleware():
     assert _l is not None
 
 
+@pytest.mark.anyio
 async def test_workspace():
     """WorkspaceManager lifecycle."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -261,20 +263,23 @@ def test_sandbox_config():
     """SandboxConfigBuilder."""
     # Disabled
     builder = SandboxConfigBuilder(enabled=False)
-    assert builder.build() == {}
+    assert builder.build() is None
 
     # Enabled with workspace
     builder = SandboxConfigBuilder(
         enabled=True,
-        network_hosts=["api.example.com"],
+        allowed_domains=["api.example.com"],
     )
     with tempfile.TemporaryDirectory() as ws_dir:
         ws_path = Path(ws_dir)
-        cfg = builder.build(workspace_dir=ws_path)
-        assert cfg["enabled"] is True
-        assert str(ws_path) in cfg["allowRead"]
-        assert str(ws_path) in cfg["allowWrite"]
-        assert "api.example.com" in cfg["networkAllowedHosts"]
+        cfg = json.loads(builder.build(workspace_dir=ws_path))
+        sandbox = cfg["sandbox"]
+        fs = sandbox["filesystem"]
+        net = sandbox["network"]
+        assert sandbox["enabled"] is True
+        assert str(ws_path) in fs["allowRead"]
+        assert str(ws_path) in fs["allowWrite"]
+        assert "api.example.com" in net["allowedDomains"]
 
 
 def test_gitlab_client():
@@ -423,15 +428,16 @@ def test_git_config_basic():
 
 
 def test_git_config_build_git_env_with_token():
-    """build_git_env() produces GIT_ASKPASS + GIT_PASSWORD from token."""
+    """build_git_env() produces an askpass helper without leaking the token."""
     cfg = GitConfig(
         repo_url="https://gitlab.com/team/project.git",
         token="glpat-secret",
     )
     env = cfg.build_git_env()
-    assert env["GIT_PASSWORD"] == "glpat-secret"
     assert "GIT_ASKPASS" in env
     assert env["GIT_TERMINAL_PROMPT"] == "0"
+    assert "GIT_PASSWORD" not in env
+    assert "glpat-secret" not in env.values()
 
 
 def test_git_config_build_git_env_empty():
@@ -450,8 +456,9 @@ def test_git_config_auth_env_overrides_token():
     env = cfg.build_git_env()
     # auth_env takes precedence over token-derived GIT_ASKPASS
     assert env["GIT_ASKPASS"] == "/custom/askpass.sh"
-    # but token-derived GIT_PASSWORD is still present
-    assert env["GIT_PASSWORD"] == "glpat-secret"
+    # token is still kept out of the subprocess environment
+    assert "GIT_PASSWORD" not in env
+    assert "glpat-secret" not in env.values()
 
 
 def test_run_context_credential_isolation():
@@ -473,7 +480,8 @@ def test_run_context_credential_isolation():
     git_env = ctx.git.build_git_env()
     assert "ANTHROPIC_API_KEY" not in git_env
     assert "MY_FLAG" not in git_env
-    assert git_env["GIT_PASSWORD"] == "glpat-secret-should-not-leak"
+    assert "GIT_PASSWORD" not in git_env
+    assert "glpat-secret-should-not-leak" not in git_env.values()
 
 
 def test_run_context_backward_compat():

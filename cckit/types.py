@@ -454,7 +454,8 @@ class SandboxOptions(CustomModel):
     Network rules
     -------------
     ``allowed_domains`` restricts which hosts Bash subprocesses can reach.
-    Leave empty to allow all outbound traffic.
+    Empty list means *block all* outbound traffic (allow-only semantics).
+    ``denied_domains`` takes precedence over ``allowed_domains``.
 
     Bash-sandbox behaviour
     ----------------------
@@ -478,12 +479,13 @@ class SandboxOptions(CustomModel):
     deny_read:   list[str] = Field(default_factory=lambda: ["~/"])  # read-blocked paths
 
     # --- sandbox.network (settings JSON) ---
-    allowed_domains: list[str] = Field(default_factory=list)  # empty = allow all
+    allowed_domains: list[str] = Field(default_factory=list)  # empty = block all
+    denied_domains: list[str] = Field(default_factory=list)   # takes precedence over allowed
 
     # --- SandboxSettings TypedDict (bash process behaviour) ---
     auto_allow_bash: bool = True           # autoAllowBashIfSandboxed
     excluded_commands: list[str] = Field(default_factory=list)   # e.g. ["git", "docker"]
-    allow_unsandboxed_commands: bool = True   # allowUnsandboxedCommands
+    allow_unsandboxed_commands: bool = False   # allowUnsandboxedCommands
     enable_weaker_nested_sandbox: bool = False  # for unprivileged Docker (Linux)
 
 
@@ -538,10 +540,11 @@ class RunnerConfig(CustomModel):
             deny_read:   list[str] = ["~/"]  # SANDBOX_DENY_READ
             # network
             allowed_domains: list[str] = []  # SANDBOX_ALLOWED_DOMAINS
+            denied_domains: list[str] = []   # SANDBOX_DENIED_DOMAINS
             # bash behaviour
             auto_allow_bash: bool = True             # SANDBOX_AUTO_ALLOW_BASH
             excluded_commands: list[str] = []        # SANDBOX_EXCLUDED_COMMANDS
-            allow_unsandboxed_commands: bool = True  # SANDBOX_ALLOW_UNSANDBOXED_COMMANDS
+            allow_unsandboxed_commands: bool = False  # SANDBOX_ALLOW_UNSANDBOXED_COMMANDS
             enable_weaker_nested_sandbox: bool = False  # SANDBOX_ENABLE_WEAKER_NESTED_SANDBOX
 
         class _EnvPlatform(BaseSettings):
@@ -573,6 +576,7 @@ class RunnerConfig(CustomModel):
                 allow_read=env_s.allow_read,
                 deny_read=env_s.deny_read,
                 allowed_domains=env_s.allowed_domains,
+                denied_domains=env_s.denied_domains,
                 auto_allow_bash=env_s.auto_allow_bash,
                 excluded_commands=env_s.excluded_commands,
                 allow_unsandboxed_commands=env_s.allow_unsandboxed_commands,

@@ -107,6 +107,7 @@ class Runner:
             allow_read=list(self._config.sandbox.allow_read),
             deny_read=list(self._config.sandbox.deny_read),
             allowed_domains=list(self._config.sandbox.allowed_domains),
+            denied_domains=list(self._config.sandbox.denied_domains),
             auto_allow_bash=self._config.sandbox.auto_allow_bash,
             excluded_commands=list(self._config.sandbox.excluded_commands),
             allow_unsandboxed_commands=self._config.sandbox.allow_unsandboxed_commands,
@@ -474,7 +475,6 @@ class Runner:
         from claude_agent_sdk import (  # noqa: WPS433
             AgentDefinition,
             ClaudeAgentOptions,
-            SandboxSettings,
         )
 
         # -- allowed tools --
@@ -497,10 +497,10 @@ class Runner:
         mcp_servers = agent.mcp_servers
 
         # -- sandbox --
-        sandbox_dict, settings_json = self._sandbox_builder.build(workspace_dir)
-        sandbox: SandboxSettings | None = (
-            SandboxSettings(**sandbox_dict) if sandbox_dict else None
-        )
+        # build() returns a unified settings JSON string (or None when disabled).
+        # ClaudeAgentOptions.sandbox must be None to avoid the SDK overwriting
+        # the sandbox section in settings JSON with a SandboxSettings TypedDict.
+        settings_json = self._sandbox_builder.build(workspace_dir)
 
         # -- environment (Agent subprocess only — NO git credentials) --
         env: dict[str, str] = {}
@@ -544,7 +544,7 @@ class Runner:
             permission_mode="dontAsk" if self._config.sandbox.enabled else self._config.permission_mode,
             env=env,
             stderr=_stderr_cb,
-            sandbox=sandbox,
+            sandbox=None,
             settings=settings_json,
             extra_args={"debug-to-stderr": None},
             user=ctx.user,

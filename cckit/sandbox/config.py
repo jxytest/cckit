@@ -1,16 +1,28 @@
 """Sandbox configuration builder.
 
-Translates high-level ``SandboxOptions`` into the two injection points
-expected by ``claude-agent-sdk``:
+Translates high-level ``SandboxOptions`` into a single unified settings JSON
+string expected by ``ClaudeAgentOptions.settings``.
 
-- ``ClaudeAgentOptions.sandbox``  — ``SandboxSettings`` TypedDict
-  Controls bash process isolation behaviour (macOS Seatbelt / Linux bubblewrap).
+The settings JSON contains a single ``sandbox`` section that merges:
+- Behaviour flags (``enabled``, ``autoAllowBashIfSandboxed``, etc.)
+- ``filesystem`` rules (``allowWrite``, ``denyWrite``, ``denyRead``, ``allowRead``)
+- ``network`` rules (``allowedDomains``, ``deniedDomains``)
 
-- ``ClaudeAgentOptions.settings`` — JSON string with ``sandbox.filesystem``
-  and ``sandbox.network`` keys.
-  Controls OS-level path allow/deny rules and domain restrictions.
-  These are merged by the SDK's ``_build_settings_value()`` with any
-  existing ``settings`` JSON before being passed to the CLI via ``--settings``.
+And a ``permissions`` section for built-in tool (Read/Edit/Write) access control.
+
+**Important:** ``ClaudeAgentOptions.sandbox`` must be set to ``None`` when using
+the unified settings JSON approach, because the SDK's ``_build_settings_value()``
+would otherwise overwrite the ``sandbox`` section in settings JSON with the
+``SandboxSettings`` TypedDict, losing filesystem/network rules.
+
+Sandbox-runtime schema reference
+--------------------------------
+- ``network.allowedDomains`` (required array) — empty = block all outbound traffic
+- ``network.deniedDomains`` (required array) — takes precedence over allowedDomains
+- ``filesystem.denyRead`` (required array) — paths denied for reading
+- ``filesystem.allowRead`` (optional array) — re-allow within denied regions
+- ``filesystem.allowWrite`` (required array) — paths allowed for writing (default: deny all)
+- ``filesystem.denyWrite`` (required array) — overrides within allowWrite
 """
 
 from __future__ import annotations
@@ -18,20 +30,21 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
 class SandboxConfigBuilder:
-    """Build the two sandbox config blobs consumed by the SDK.
+    """Build the unified sandbox settings JSON consumed by the SDK.
 
     All parameters must be passed explicitly — no global config fallback.
 
     Parameters
     ----------
     enabled:
-        Master switch.  When ``False``, ``build()`` returns ``(None, None)``.
+        Master switch.  When ``False``, ``build()`` returns ``None``.
     workspace_root:
         Root directory under which per-task workspaces are created.
         Added to ``allowWrite`` automatically so the agent can write to its
@@ -40,7 +53,8 @@ class SandboxConfigBuilder:
     allow_write:
         Extra paths the sandbox may write to beyond ``workspace_root``.
     deny_write:
-        Paths explicitly blocked from writes.
+        Paths explicitly blocked from writes.  Defaults to ``[]`` because
+        writes are already deny-all by default in sandbox-runtime.
     allow_read:
         Paths re-allowed for reading inside a ``deny_read`` zone.
     deny_read:
@@ -48,7 +62,10 @@ class SandboxConfigBuilder:
         agent from accessing the home directory (e.g. ``~/.ssh``).
     allowed_domains:
         Outbound network domains allowed for Bash subprocesses.
-        Empty list means *allow all*.
+        Empty list means *block all* (sandbox-runtime allow-only semantics).
+    denied_domains:
+        Domains explicitly blocked even if matched by ``allowed_domains``.
+        Takes precedence over ``allowed_domains``.
     auto_allow_bash:
         ``autoAllowBashIfSandboxed`` — skip per-command approval prompts
         when running inside the sandbox.
@@ -56,7 +73,8 @@ class SandboxConfigBuilder:
         Commands that run *outside* the sandbox (e.g. ``["git", "docker"]``).
     allow_unsandboxed_commands:
         ``allowUnsandboxedCommands`` — whether ``dangerouslyDisableSandbox``
-        is honoured.  Set to ``False`` for stricter enforcement.
+        is honoured.  Defaults to ``False`` for stricter enforcement to
+        prevent agents from trivially escaping sandbox restrictions.
     enable_weaker_nested_sandbox:
         ``enableWeakerNestedSandbox`` — weaker isolation for unprivileged
         Docker environments (Linux only).  Reduces security.
@@ -72,18 +90,21 @@ class SandboxConfigBuilder:
             allow_read: list[str] | None = None,
             deny_read: list[str] | None = None,
             allowed_domains: list[str] | None = None,
+            denied_domains: list[str] | None = None,
             auto_allow_bash: bool = True,
             excluded_commands: list[str] | None = None,
-            allow_unsandboxed_commands: bool = True,
+            allow_unsandboxed_commands: bool = False,
             enable_weaker_nested_sandbox: bool = False,
     ) -> None:
         self.enabled = enabled
         self.workspace_root = workspace_root
         self.allow_write = allow_write or []
-        self.deny_write = deny_write if deny_write is not None else ["~/"]
+        # deny_write defaults to [] — writes are already deny-all by default
+        self.deny_write = deny_write or []
         self.allow_read = allow_read or []
         self.deny_read = deny_read if deny_read is not None else ["~/"]
         self.allowed_domains = allowed_domains or []
+        self.denied_domains = denied_domains or []
         self.auto_allow_bash = auto_allow_bash
         self.excluded_commands = excluded_commands or []
         self.allow_unsandboxed_commands = allow_unsandboxed_commands
@@ -95,8 +116,9 @@ class SandboxConfigBuilder:
 
     def build(
             self, workspace_dir: Path | None = None
-    ) -> tuple[dict[str, Any] | None, str | None]:
-        """Return ``(sandbox_dict, settings_json)``.
+    ) -> str | None:
+        """Return a unified settings JSON string, or ``None`` when disabled.
+
         Parameters
         ----------
         workspace_dir:
@@ -104,24 +126,28 @@ class SandboxConfigBuilder:
             ``WorkspaceManager``.  When provided it is added to
             ``sandbox.filesystem.allowWrite`` **and** ``allowRead``
             so the agent can only read/write inside its own workspace.
+
         Returns
         -------
-        sandbox_dict:
-            Dict suitable for ``SandboxSettings(**sandbox_dict)`` and passed
-            to ``ClaudeAgentOptions.sandbox``.  ``None`` when disabled.
         settings_json:
-            JSON string with ``sandbox``, ``permissions`` keys, passed to
-            ``ClaudeAgentOptions.settings``.  ``None`` when there are no
-            rules to inject.
+            JSON string with a unified ``sandbox`` section (behaviour flags +
+            filesystem + network) and ``permissions`` section, passed to
+            ``ClaudeAgentOptions.settings``.  ``None`` when disabled.
+
+        Notes
+        -----
+        When using this output, set ``ClaudeAgentOptions.sandbox = None``
+        to avoid the SDK overwriting the ``sandbox`` section in settings JSON.
         """
         if not self.enabled:
-            return None, None
+            return None
 
-        sandbox = self._build_sandbox_settings()
         allow_read, allow_write, deny_read, deny_write = self._collect_paths(workspace_dir)
 
         settings_obj: dict[str, Any] = {}
-        self._attach_filesystem_and_network(
+
+        # Build unified sandbox section: behaviour flags + filesystem + network
+        self._attach_unified_sandbox(
             settings_obj,
             allow_read=allow_read,
             allow_write=allow_write,
@@ -136,13 +162,30 @@ class SandboxConfigBuilder:
             deny_write=deny_write,
         )
 
-        settings_json = json.dumps(settings_obj) if settings_obj else None
+        settings_json = json.dumps(settings_obj)
         logger.info("Sandbox settings JSON: %s", settings_json)
-        logger.info("Sandbox JSON: %s", sandbox)
-        return sandbox, settings_json
+        print("Sandbox settings JSON:", settings_json)
+        return settings_json
 
-    def _build_sandbox_settings(self) -> dict[str, Any]:
-        """Build ``SandboxSettings`` dict for ``ClaudeAgentOptions.sandbox``."""
+    # ------------------------------------------------------------------
+    # Internal builders
+    # ------------------------------------------------------------------
+
+    def _attach_unified_sandbox(
+            self,
+            settings_obj: dict[str, Any],
+            *,
+            allow_read: list[str],
+            allow_write: list[str],
+            deny_read: list[str],
+            deny_write: list[str],
+    ) -> None:
+        """Build the unified ``sandbox`` section with behaviour + filesystem + network.
+
+        All three sub-sections live as siblings under ``settings.sandbox`` so
+        the SDK does not overwrite any of them.
+        """
+        # -- behaviour flags --
         sandbox: dict[str, Any] = {
             "enabled": True,
             "autoAllowBashIfSandboxed": self.auto_allow_bash,
@@ -153,8 +196,32 @@ class SandboxConfigBuilder:
         if self.enable_weaker_nested_sandbox:
             sandbox["enableWeakerNestedSandbox"] = True
 
-        logger.debug("SandboxSettings dict: %s", sandbox)
-        return sandbox
+        # -- filesystem --
+        # Always emit filesystem section; sandbox-runtime requires
+        # allowWrite as an array (can be empty).  denyWrite is only
+        # meaningful when non-empty (writes are deny-all by default).
+        filesystem: dict[str, Any] = {
+            "allowWrite": allow_write,
+        }
+        if deny_write:
+            filesystem["denyWrite"] = deny_write
+        if allow_read:
+            filesystem["allowRead"] = allow_read
+        if deny_read:
+            filesystem["denyRead"] = deny_read
+        sandbox["filesystem"] = filesystem
+
+        # -- network --
+        # Always emit network section; sandbox-runtime requires
+        # allowedDomains and deniedDomains as arrays (can be empty).
+        # Empty allowedDomains = block all outbound traffic.
+        network: dict[str, Any] = {
+            "allowedDomains": self.allowed_domains,
+            "deniedDomains": self.denied_domains,
+        }
+        sandbox["network"] = network
+
+        settings_obj["sandbox"] = sandbox
 
     def _collect_paths(
             self, workspace_dir: Path | None
@@ -163,38 +230,9 @@ class SandboxConfigBuilder:
         ws = str(workspace_dir) if workspace_dir else None
         allow_read = ([ws] if ws else []) + list(self.allow_read)
         allow_write = ([ws] if ws else []) + list(self.allow_write)
-        deny_read = self.deny_read
-        deny_write = self.deny_write
+        deny_read = list(self.deny_read)
+        deny_write = list(self.deny_write)
         return allow_read, allow_write, deny_read, deny_write
-
-    def _attach_filesystem_and_network(
-            self,
-            settings_obj: dict[str, Any],
-            *,
-            allow_read: list[str],
-            allow_write: list[str],
-            deny_read: list[str],
-            deny_write: list[str],
-    ) -> None:
-        """Attach ``sandbox.filesystem`` and ``sandbox.network`` sections."""
-        filesystem: dict[str, Any] = {}
-        if allow_write:
-            filesystem["allowWrite"] = allow_write
-        if deny_write:
-            filesystem["denyWrite"] = deny_write
-        if allow_read:
-            filesystem["allowRead"] = allow_read
-        if deny_read:
-            filesystem["denyRead"] = deny_read
-
-        network: dict[str, Any] = {}
-        if self.allowed_domains:
-            network["allowedDomains"] = self.allowed_domains
-
-        if filesystem:
-            settings_obj.setdefault("sandbox", {})["filesystem"] = filesystem
-        if network:
-            settings_obj.setdefault("sandbox", {})["network"] = network
 
     def _attach_permissions(
             self,
@@ -205,13 +243,26 @@ class SandboxConfigBuilder:
             deny_read: list[str],
             deny_write: list[str],
     ) -> None:
-        """Attach permission allow/deny rules for built-in tools."""
+        """Attach permission allow/deny rules for built-in tools.
+
+        Mapping between sandbox filesystem rules and permission tool rules:
+
+        - ``allow_read``  → ``Read(path/**)``  (allow)
+        - ``allow_write`` → ``Read(path/**)``, ``Edit(path/**)``, ``Write(path/**)``  (allow)
+        - ``deny_read``   → ``Read(path/**)``, ``Edit(path/**)``, ``Write(path/**)``  (deny)
+          If a path is denied for reading, it is implicitly denied for all
+          tool access — reading, editing, and writing.  This mirrors the
+          principle that ``sandbox.filesystem.denyRead`` blocks the OS-level
+          Bash sandbox entirely, so the permissions layer should be equally
+          restrictive for built-in tools.
+        - ``deny_write``  → ``Edit(path/**)``, ``Write(path/**)``  (deny)
+        """
         read_tools = ("Read",)
-        write_tools = ("Read", "Edit", "Write")
+        all_tools = ("Read", "Edit", "Write")
         write_only_tools = ("Edit", "Write")
         raw_allow = (
                 self._permission_rules(allow_read, read_tools)
-                + self._permission_rules(allow_write, write_tools)
+                + self._permission_rules(allow_write, all_tools)
         )
         permission_allow = list(dict.fromkeys(raw_allow))
         filtered_deny_read, filtered_deny_write = self._filter_conflicting_denies(
@@ -219,8 +270,8 @@ class SandboxConfigBuilder:
             deny_read=deny_read, deny_write=deny_write,
         )
         raw_deny = (
-                self._permission_rules(filtered_deny_read, write_tools)  # 禁止所有访问
-                + self._permission_rules(filtered_deny_write, write_only_tools)  # 只禁止写入
+                self._permission_rules(filtered_deny_read, all_tools)  # deny_read → block all tools
+                + self._permission_rules(filtered_deny_write, write_only_tools)  # deny_write → block Edit/Write only
         )
         permission_deny = list(dict.fromkeys(raw_deny))
         if permission_allow:
@@ -230,11 +281,31 @@ class SandboxConfigBuilder:
 
     @staticmethod
     def _normalize_path(path: str) -> str:
-        """Normalize a path: strip trailing slash and expand ``~``."""
-        stripped = path.rstrip("/")
-        if stripped == "~" or stripped.startswith("~/"):
-            stripped = str(Path(stripped).expanduser())
+        """Normalize a path: strip trailing separators and expand ``~``."""
+        stripped = path.rstrip("/\\")
+        if not stripped:
+            stripped = path
+        if stripped == "~" or stripped.startswith("~/") or stripped.startswith("~\\"):
+            stripped = str(Path(stripped.replace("\\", "/")).expanduser())
         return stripped
+
+    @staticmethod
+    def _to_permission_path_specifier(path: str) -> str:
+        """Convert a filesystem path into Claude Code's permission path syntax."""
+        specifier = SandboxConfigBuilder._normalize_path(path)
+
+        if specifier == "~" or specifier.startswith("~/"):
+            return specifier
+
+        if re.match(r"^[A-Za-z]:([\\/]|$)", specifier):
+            drive = specifier[0].lower()
+            remainder = specifier[2:].replace("\\", "/").lstrip("/")
+            return f"//{drive}" + (f"/{remainder}" if remainder else "")
+
+        if specifier.startswith("/"):
+            return f"/{specifier}"
+
+        return specifier.replace("\\", "/")
 
     @staticmethod
     def _filter_conflicting_denies(
@@ -244,21 +315,24 @@ class SandboxConfigBuilder:
             deny_read: list[str],
             deny_write: list[str],
     ) -> tuple[list[str], list[str]]:
-        """Remove deny paths that would shadow allow paths."""
+        """Remove deny paths that exactly match an allow path.
+
+        Only exact matches are removed.  A child allow (e.g. ``/data/public``)
+        does NOT remove a parent deny (e.g. ``/data``), because
+        sandbox-runtime uses "most-specific wins" semantics — the parent
+        deny still applies to paths outside the allowed child.
+        """
         allow_resolved = {
             SandboxConfigBuilder._normalize_path(p)
             for p in allow_read + allow_write
         }
 
-        def is_covered_by_allow(deny_path: str) -> bool:
+        def is_exact_allow(deny_path: str) -> bool:
             deny_norm = SandboxConfigBuilder._normalize_path(deny_path)
-            for allow_path in allow_resolved:
-                if allow_path == deny_norm or allow_path.startswith(deny_norm + "/"):
-                    return True
-            return False
+            return deny_norm in allow_resolved
 
-        filtered_deny_read = [p for p in deny_read if not is_covered_by_allow(p)]
-        filtered_deny_write = [p for p in deny_write if not is_covered_by_allow(p)]
+        filtered_deny_read = [p for p in deny_read if not is_exact_allow(p)]
+        filtered_deny_write = [p for p in deny_write if not is_exact_allow(p)]
         return filtered_deny_read, filtered_deny_write
 
     @staticmethod
@@ -266,12 +340,12 @@ class SandboxConfigBuilder:
             paths: list[str], tools: tuple[str, ...]
     ) -> list[str]:
         """Generate permission rules for *paths* × *tools*.
-        Each path is normalised (trailing ``/`` stripped) and combined with
-        every tool name to produce rules like ``Edit(/tmp/work/**)``.
+        Each path is converted into Claude Code's permission syntax and
+        combined with every tool name to produce rules like ``Edit(//tmp/work/**)``.
         """
         rules: list[str] = []
         for path in paths:
-            specifier = path.rstrip("/")
+            specifier = SandboxConfigBuilder._to_permission_path_specifier(path)
             for tool in tools:
                 rule = f"{tool}({specifier}/**)"
                 if rule not in rules:
