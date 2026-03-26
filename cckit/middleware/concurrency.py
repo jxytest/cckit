@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from cckit.middleware.base import Middleware, SdkQueryFunc
-from cckit.types import AgentEvent, RunContext
+from cckit.types import RunContext
 
 logger = logging.getLogger(__name__)
 
@@ -29,14 +29,14 @@ class ConcurrencyMiddleware(Middleware):
         next_call: SdkQueryFunc,
         prompt: str,
         options: Any,
-        collector: Any,
+        state: Any,
         ctx: RunContext,
-    ) -> AsyncIterator[AgentEvent]:
+    ) -> AsyncIterator[Any]:
         logger.debug(
             "Acquiring concurrency slot (limit=%d) for task %s",
             self._limit,
             ctx.task_id,
         )
         async with self._semaphore:
-            async for event in next_call(prompt, options, collector):
-                yield event
+            async for message in next_call(prompt, options, state):
+                yield message

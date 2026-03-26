@@ -20,8 +20,6 @@ import json
 import tempfile
 from pathlib import Path
 
-import pytest
-
 from cckit.sandbox.config import SandboxConfigBuilder
 from cckit.types import RunnerConfig, SandboxOptions
 

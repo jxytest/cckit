@@ -14,7 +14,9 @@ Run:
 
 import asyncio
 
-from cckit import Agent, Runner, RunContext, RunnerConfig, SandboxOptions, WorkspaceConfig
+from claude_agent_sdk import AssistantMessage, TextBlock
+
+from cckit import Agent, RunContext, Runner, RunnerConfig, SandboxOptions, WorkspaceConfig
 
 agent = Agent(
     name="sandbox-demo",
@@ -46,9 +48,11 @@ async def main() -> None:
         workspace=WorkspaceConfig(enabled=True),
     )
 
-    async for event in runner.run_stream(agent, ctx):
-        if event.text:
-            print(event.text, end="", flush=True)
+    async for message in runner.run_stream(agent, ctx):
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    print(block.text, end="", flush=True)
     print()
 
 

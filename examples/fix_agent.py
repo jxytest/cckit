@@ -13,10 +13,11 @@ Run:
 
 import asyncio
 
-from cckit import Agent, Runner, RunContext, GitConfig, WorkspaceConfig
+from claude_agent_sdk import AssistantMessage, ResultMessage, SystemMessage, TextBlock
+
+from cckit import Agent, GitConfig, RunContext, Runner, WorkspaceConfig
 from cckit.git import operations as git_ops
 from cckit.git.gitlab_client import GitLabClient
-from cckit.tools.platform import get_platform_mcp_server
 
 
 def build_fix_instruction(ctx):
@@ -98,15 +99,12 @@ fix_agent = Agent(
     tools=["Bash", "Read", "Write", "Edit", "Glob", "Grep"],
     sub_agents=[log_analyzer],
     required_params=["test_file", "error_log"],
-    mcp_tools=["get_failure_info", "report_progress"],
     on_after=on_fix_complete,
 )
 
 
 async def main():
-    runner = Runner(
-        mcp_servers={"platform": get_platform_mcp_server},
-    )
+    runner = Runner()
 
     ctx = RunContext(
         prompt="Fix the broken locator in the test file.",
@@ -127,11 +125,17 @@ async def main():
         },
     )
 
-    async for event in runner.run_stream(fix_agent, ctx):
-        if event.text:
-            print(f"[{event.event_type}] {event.text[:200]}")
-        else:
-            print(f"[{event.event_type}] {event.data}")
+    async for message in runner.run_stream(fix_agent, ctx):
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    print(block.text, end="", flush=True)
+        elif isinstance(message, SystemMessage):
+            print(f"\n[system:{message.subtype}] {message.data}")
+        elif isinstance(message, ResultMessage) and message.is_error:
+            print(f"\n[error] {message.result or 'unknown error'}")
+
+    print()
 
 
 if __name__ == "__main__":

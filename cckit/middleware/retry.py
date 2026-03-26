@@ -9,7 +9,7 @@ from typing import Any
 
 from cckit.exceptions import AgentExecutionError
 from cckit.middleware.base import Middleware, SdkQueryFunc
-from cckit.types import AgentEvent, AgentEventType, RunContext
+from cckit.types import RunContext
 
 logger = logging.getLogger(__name__)
 
@@ -45,15 +45,15 @@ class RetryMiddleware(Middleware):
         next_call: SdkQueryFunc,
         prompt: str,
         options: Any,
-        collector: Any,
+        state: Any,
         ctx: RunContext,
-    ) -> AsyncIterator[AgentEvent]:
+    ) -> AsyncIterator[Any]:
         last_exc: Exception | None = None
 
         for attempt in range(self.max_retries):
             try:
-                async for event in next_call(prompt, options, collector):
-                    yield event
+                async for message in next_call(prompt, options, state):
+                    yield message
                 return  # success — exit retry loop
             except AgentExecutionError as exc:
                 last_exc = exc
@@ -71,11 +71,6 @@ class RetryMiddleware(Middleware):
                         self.max_retries,
                         delay,
                         exc,
-                    )
-                    yield AgentEvent(
-                        event_type=AgentEventType.ERROR,
-                        task_id=ctx.task_id,
-                        text=f"Retry {attempt + 1}/{self.max_retries}: {exc}",
                     )
                     await asyncio.sleep(delay)
 

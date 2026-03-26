@@ -1,4 +1,4 @@
-"""Runner — executes agents and yields streaming events.
+"""Runner — executes agents and yields streaming SDK messages.
 
 This is the orchestration layer that replaces ``AgentExecutor``.
 It is the only class that ties together workspace management,
@@ -14,11 +14,9 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Literal, cast
 
-from claude_agent_sdk.types import SystemPromptPreset
-
 from cckit._cli import check_api_connectivity, check_claude_cli
-from cckit._engine.collector import StreamCollector
 from cckit._engine.sdk_bridge import run_sdk_query
+from cckit._engine.state import RunState
 from cckit.agent import Agent
 from cckit.exceptions import HookError
 from cckit.git import operations as git_ops
@@ -27,8 +25,6 @@ from cckit.sandbox.config import SandboxConfigBuilder
 from cckit.sandbox.workspace import WorkspaceManager
 from cckit.skill.provisioner import SkillProvisioner
 from cckit.types import (
-    AgentEvent,
-    AgentEventType,
     AgentResult,
     ModelConfig,
     RunContext,
@@ -47,7 +43,7 @@ def _is_windows() -> bool:
 
 
 class Runner:
-    """Execute an Agent and yield AgentEvent objects.
+    """Execute an Agent and yield SDK message objects.
 
     This is the primary execution engine of cckit.  It separates
     agent *definition* (what) from *execution* (how).
@@ -136,13 +132,13 @@ class Runner:
         """Run agent to completion and return the final result.
 
         Convenience wrapper around :meth:`run_stream` that consumes all
-        events and returns the :class:`AgentResult`.  The returned object
+        messages and returns the :class:`AgentResult`.  The returned object
         is the **same instance** that lifecycle callbacks (``on_after``)
         receive, so any mutations (e.g. ``result.extra["mr_url"] = ...``)
         are preserved.
         """
         stream = self.run_stream(agent, ctx)
-        async for _event in stream:
+        async for _message in stream:
             pass
 
         if stream.result is not None:
@@ -162,19 +158,19 @@ class Runner:
         agent: Agent,
         ctx: RunContext,
     ) -> StreamResult:
-        """Run *agent* and return a :class:`StreamResult` for streaming events.
+        """Run *agent* and return a :class:`StreamResult` for streaming messages.
 
         ``StreamResult`` is async-iterable, so existing code continues to
         work unchanged::
 
-            async for event in runner.run_stream(agent, ctx):
-                print(event.text)
+            async for message in runner.run_stream(agent, ctx):
+                print(message)
 
         New usage — access the final result after the stream ends::
 
             stream = runner.run_stream(agent, ctx)
-            async for event in stream:
-                print(event.text)
+            async for message in stream:
+                print(message)
             result = stream.result  # same object on_after received
         """
         holder = _ResultHolder()
@@ -190,7 +186,7 @@ class Runner:
         agent: Agent,
         ctx: RunContext,
         holder: _ResultHolder,
-    ) -> AsyncIterator[AgentEvent]:
+    ) -> AsyncIterator[Any]:
         """Internal async generator — the full orchestration flow.
 
         Orchestration flow:
@@ -202,7 +198,7 @@ class Runner:
             6. Provision skills (if needed, skipped on resume)
             7. Resolve instruction (string or callable)
             8. Build SDK options (model, tools, sub-agents, MCP, sandbox)
-            9. [Middleware chain] → SDK bridge → StreamCollector → yield AgentEvent
+            9. [Middleware chain] → SDK bridge → yield SDK messages
             10. agent.after_execute(ctx, result) or agent.error_execute(ctx, error)
             11. Cleanup/suspend workspace
         """
@@ -214,11 +210,6 @@ class Runner:
             missing = self._validate_context(agent, ctx)
             if missing:
                 msg = f"Missing required parameters: {', '.join(missing)}"
-                yield AgentEvent(
-                    event_type=AgentEventType.ERROR,
-                    task_id=ctx.task_id,
-                    text=msg,
-                )
                 holder.result = AgentResult(
                     task_id=ctx.task_id,
                     agent_type=agent.name,
@@ -227,6 +218,7 @@ class Runner:
                     error_message=msg,
                     duration_seconds=round(time.monotonic() - start, 2),
                 )
+                logger.error("Agent %s failed validation: %s", agent.name, msg)
                 return
 
             # --- lifecycle: before ---
@@ -283,23 +275,43 @@ class Runner:
             )
 
             # --- stream from SDK (through middleware chain) ---
-            collector = StreamCollector(ctx.task_id)
-            query_fn = self._build_middleware_chain(collector, ctx)
+            state = RunState(ctx.task_id)
+            query_fn = self._build_middleware_chain(ctx)
 
-            async for event in query_fn(prompt, options, collector):
-                yield event
+            async for message in query_fn(prompt, options, state):
+                yield message
 
             # --- build result ---
             duration = time.monotonic() - start
-            holder.result = AgentResult(
-                task_id=ctx.task_id,
-                agent_type=agent.name,
-                status=TaskStatus.COMPLETED,
-                result_text=collector.full_text,
-                cost_usd=collector.cost_usd,
-                duration_seconds=round(duration, 2),
-                session_id=collector.session_id,
-            )
+            final_message = state.final_message
+            if final_message is None:
+                holder.result = AgentResult(
+                    task_id=ctx.task_id,
+                    agent_type=agent.name,
+                    status=TaskStatus.FAILED,
+                    is_error=True,
+                    error_message="SDK stream completed without a ResultMessage",
+                    duration_seconds=round(duration, 2),
+                    session_id=state.session_id,
+                )
+            else:
+                output_text = final_message.result or ""
+                is_error = bool(final_message.is_error)
+                holder.result = AgentResult(
+                    task_id=ctx.task_id,
+                    agent_type=agent.name,
+                    status=TaskStatus.FAILED if is_error else TaskStatus.COMPLETED,
+                    output_text=output_text,
+                    cost_usd=final_message.total_cost_usd or 0.0,
+                    duration_seconds=round(duration, 2),
+                    is_error=is_error,
+                    error_message=output_text if is_error else "",
+                    session_id=final_message.session_id or state.session_id,
+                    stop_reason=final_message.stop_reason or "",
+                    usage=final_message.usage,
+                    structured_output=final_message.structured_output,
+                    final_message=final_message,
+                )
 
         except Exception as exc:
             duration = time.monotonic() - start
@@ -310,11 +322,6 @@ class Runner:
                 is_error=True,
                 error_message=str(exc),
                 duration_seconds=round(duration, 2),
-            )
-            yield AgentEvent(
-                event_type=AgentEventType.ERROR,
-                task_id=ctx.task_id,
-                text=str(exc),
             )
             logger.exception("Agent %s failed: %s", agent.name, exc)
 
@@ -338,7 +345,10 @@ class Runner:
 
                 # --- log final summary ---
                 logger.info(
-                    "Agent %s completed: task_id=%s session_id=%s status=%s cost=$%.4f duration=%.2fs",
+                    (
+                        "Agent %s completed: task_id=%s session_id=%s "
+                        "status=%s cost=$%.4f duration=%.2fs"
+                    ),
                     agent.name,
                     holder.result.task_id,
                     holder.result.session_id,
@@ -424,20 +434,19 @@ class Runner:
 
     def _build_middleware_chain(
         self,
-        collector: StreamCollector,
         ctx: RunContext,
     ) -> Any:
         """Wrap ``run_sdk_query`` with the middleware stack.
 
-        Returns a callable with signature (prompt, options, collector).
+        Returns a callable with signature ``(prompt, options, state)``.
         """
 
         # The innermost function — actual SDK call
         async def inner(
-            prompt: str, options: Any, collector_: Any
-        ) -> AsyncIterator[AgentEvent]:
-            async for event in run_sdk_query(prompt, options, collector_):
-                yield event
+            prompt: str, options: Any, state: Any
+        ) -> AsyncIterator[Any]:
+            async for message in run_sdk_query(prompt, options, state):
+                yield message
 
         current = inner
 
@@ -446,12 +455,12 @@ class Runner:
 
             def make_wrapper(middleware: Middleware, next_fn: Any) -> Any:
                 async def wrapper(
-                    prompt: str, options: Any, collector_: Any
-                ) -> AsyncIterator[AgentEvent]:
-                    async for event in middleware.wrap(
-                        next_fn, prompt, options, collector_, ctx
+                    prompt: str, options: Any, state: Any
+                ) -> AsyncIterator[Any]:
+                    async for message in middleware.wrap(
+                        next_fn, prompt, options, state, ctx
                     ):
-                        yield event
+                        yield message
 
                 return wrapper
 
@@ -530,24 +539,32 @@ class Runner:
         def _stderr_cb(line: str) -> None:
             logger.debug("[CLI stderr] %s", line.rstrip())
 
+        system_prompt: dict[str, str] = {
+            "type": "preset",
+            "preset": "claude_code",
+        }
+        if instruction:
+            system_prompt["append"] = instruction
+
         opts = ClaudeAgentOptions(
-            system_prompt=SystemPromptPreset(
-                type='preset',
-                preset='claude_code',
-                append=instruction or None,
-            ),
+            system_prompt=system_prompt,
             max_turns=max_turns,
             model=model.model,
             # When sandbox is enabled, switch to dontAsk so that permissions.deny
             # rules are enforced. bypassPermissions skips all permission checks
             # (including deny rules) and is only safe inside pre-isolated envs.
-            permission_mode="dontAsk" if self._config.sandbox.enabled else self._config.permission_mode,
+            permission_mode=(
+                "dontAsk"
+                if self._config.sandbox.enabled
+                else self._config.permission_mode
+            ),
             env=env,
             stderr=_stderr_cb,
             sandbox=None,
             settings=settings_json,
             extra_args={"debug-to-stderr": None},
             user=ctx.user,
+            include_partial_messages=ctx.include_partial_messages,
         )
 
         if allowed_tools and allowed_tools != []:
@@ -582,5 +599,5 @@ class Runner:
         # -- resume implies continue_conversation (unless forking) --
         if ctx.resume_session_id and not ctx.fork_session:
             opts.continue_conversation = True
-            
+
         return opts

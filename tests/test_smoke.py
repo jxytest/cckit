@@ -21,8 +21,6 @@ import pytest
 
 from cckit import (  # noqa: F401 — test_imports verifies all public API symbols
     Agent,
-    AgentEvent,
-    AgentEventType,
     AgentExecutionError,
     AgentResult,
     CckitError,
@@ -175,12 +173,7 @@ def test_types():
         status=TaskStatus.COMPLETED,
     )
     assert result.status == "completed"
-
-    event = AgentEvent(
-        event_type=AgentEventType.ASSISTANT_TEXT,
-        text="Hello",
-    )
-    assert event.text == "Hello"
+    assert result.output_text == ""
 
     model = ModelConfig(model="claude-sonnet-4-6", api_key="sk-test")
     assert model.max_tokens == 16384
@@ -308,8 +301,8 @@ def test_stream_result_basic():
     from cckit.types import _ResultHolder
 
     async def _fake_events():
-        yield AgentEvent(event_type=AgentEventType.ASSISTANT_TEXT, text="hello")
-        yield AgentEvent(event_type=AgentEventType.ASSISTANT_TEXT, text=" world")
+        yield "hello"
+        yield " world"
 
     holder = _ResultHolder()
     holder.result = AgentResult(
@@ -321,8 +314,8 @@ def test_stream_result_basic():
 
     async def _consume():
         texts = []
-        async for event in stream:
-            texts.append(event.text)
+        async for message in stream:
+            texts.append(message)
         return texts
 
     texts = asyncio.run(_consume())
@@ -339,8 +332,8 @@ def test_stream_result_identity():
     from cckit.types import _ResultHolder
 
     async def _no_events():
-        return
-        yield  # noqa: unreachable — makes it an async generator
+        if False:
+            yield None
 
     holder = _ResultHolder()
     result_obj = AgentResult(
@@ -366,8 +359,8 @@ def test_stream_result_none_before_consumption():
     from cckit.types import _ResultHolder
 
     async def _no_events():
-        return
-        yield  # noqa: unreachable
+        if False:
+            yield None
 
     holder = _ResultHolder()
     stream = StreamResult(_no_events(), holder)

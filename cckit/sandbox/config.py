@@ -29,8 +29,8 @@ from __future__ import annotations
 
 import json
 import logging
-from pathlib import Path
 import re
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -270,8 +270,11 @@ class SandboxConfigBuilder:
             deny_read=deny_read, deny_write=deny_write,
         )
         raw_deny = (
-                self._permission_rules(filtered_deny_read, all_tools)  # deny_read → block all tools
-                + self._permission_rules(filtered_deny_write, write_only_tools)  # deny_write → block Edit/Write only
+                self._permission_rules(filtered_deny_read, all_tools)
+                + self._permission_rules(
+                    filtered_deny_write,
+                    write_only_tools,
+                )
         )
         permission_deny = list(dict.fromkeys(raw_deny))
         if permission_allow:

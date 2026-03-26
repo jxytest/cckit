@@ -12,10 +12,11 @@ Run:
 
 import asyncio
 
-from cckit import Agent, Runner, RunContext, GitConfig, WorkspaceConfig
+from claude_agent_sdk import AssistantMessage, ResultMessage, SystemMessage, TextBlock
+
+from cckit import Agent, GitConfig, RunContext, Runner, WorkspaceConfig
 from cckit.git import operations as git_ops
 from cckit.git.gitlab_client import GitLabClient
-from cckit.tools.platform import get_platform_mcp_server
 
 
 def build_modify_instruction(ctx):
@@ -103,15 +104,12 @@ code_modify_agent = Agent(
     tools=["Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep"],
     sub_agents=[code_reviewer],
     required_params=["modification_request", "target_path"],
-    mcp_tools=["report_progress"],
     on_after=on_modify_complete,
 )
 
 
 async def main():
-    runner = Runner(
-        mcp_servers={"platform": get_platform_mcp_server},
-    )
+    runner = Runner()
 
     ctx = RunContext(
         prompt="Apply the following code modification.",
@@ -127,11 +125,17 @@ async def main():
         },
     )
 
-    async for event in runner.run_stream(code_modify_agent, ctx):
-        if event.text:
-            print(f"[{event.event_type}] {event.text[:200]}")
-        else:
-            print(f"[{event.event_type}] {event.data}")
+    async for message in runner.run_stream(code_modify_agent, ctx):
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    print(block.text, end="", flush=True)
+        elif isinstance(message, SystemMessage):
+            print(f"\n[system:{message.subtype}] {message.data}")
+        elif isinstance(message, ResultMessage) and message.is_error:
+            print(f"\n[error] {message.result or 'unknown error'}")
+
+    print()
 
 
 if __name__ == "__main__":

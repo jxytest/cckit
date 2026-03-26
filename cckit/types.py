@@ -1,7 +1,7 @@
 """Data types for cckit.
 
 Contains all data containers: ModelConfig, LiteLlm, GitConfig, WorkspaceConfig,
-RunContext, AgentResult, AgentEvent, RunnerConfig, SandboxOptions, etc.
+RunContext, AgentResult, RunnerConfig, SandboxOptions, etc.
 
 These are pure data — no SDK dependency, no I/O.
 """
@@ -10,15 +10,23 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from contextlib import suppress
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 
-from claude_agent_sdk import PermissionMode
 from pydantic import Field, PrivateAttr
 
 from cckit._models import CustomModel
+
+PermissionMode = Literal["default", "acceptEdits", "plan", "bypassPermissions"]
+
+if TYPE_CHECKING:
+    from claude_agent_sdk import Message as SDKMessage
+    from claude_agent_sdk import ResultMessage as SDKResultMessage
+else:
+    SDKMessage = Any
+    SDKResultMessage = Any
 
 # ---------------------------------------------------------------------------
 # Model configuration
@@ -157,10 +165,8 @@ class GitConfig(CustomModel):
         if self._askpass_script is not None:
             import os
 
-            try:
+            with suppress(OSError):
                 os.unlink(self._askpass_script)
-            except OSError:
-                pass
             self._askpass_script = None
 
     @staticmethod
@@ -267,6 +273,7 @@ class RunContext(CustomModel):
     params: dict[str, Any] = Field(default_factory=dict)
     env: dict[str, str] = Field(default_factory=dict)
     user: str | None = None
+    include_partial_messages: bool = False
     # Workspace
     workspace: WorkspaceConfig = Field(default_factory=WorkspaceConfig)
     workspace_dir: Path | None = None  # injected by Runner, or manually specified
@@ -330,40 +337,17 @@ class AgentResult(CustomModel):
     task_id: str
     agent_type: str
     status: TaskStatus = TaskStatus.COMPLETED
-    result_text: str = ""
+    output_text: str = ""
     cost_usd: float = 0.0
     duration_seconds: float = 0.0
     is_error: bool = False
     error_message: str = ""
     session_id: str = ""
+    stop_reason: str = ""
+    usage: dict[str, Any] | None = None
+    structured_output: Any = None
+    final_message: SDKResultMessage | None = Field(default=None, exclude=True)
     extra: dict[str, Any] = Field(default_factory=dict)
-
-
-# ---------------------------------------------------------------------------
-# Streaming events
-# ---------------------------------------------------------------------------
-
-
-class AgentEventType(StrEnum):
-    ASSISTANT_TEXT = "assistant_text"
-    TOOL_USE = "tool_use"
-    TOOL_RESULT = "tool_result"
-    THINKING = "thinking"
-    SUB_AGENT_START = "sub_agent_start"
-    SUB_AGENT_PROGRESS = "sub_agent_progress"
-    SUB_AGENT_END = "sub_agent_end"
-    RESULT = "result"
-    ERROR = "error"
-
-
-class AgentEvent(CustomModel):
-    """A single event emitted during agent execution (for streaming)."""
-
-    event_type: AgentEventType
-    task_id: str = ""
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    data: dict[str, Any] = Field(default_factory=dict)
-    text: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -389,22 +373,22 @@ class StreamResult:
     """Async-iterable wrapper around an agent execution stream.
 
     Returned by :meth:`Runner.run_stream`.  Implements ``__aiter__`` so
-    it is a drop-in replacement for ``AsyncIterator[AgentEvent]``::
+    it is a drop-in replacement for the SDK's ``AsyncIterator[Message]``::
 
         # Existing usage (unchanged):
-        async for event in runner.run_stream(agent, ctx):
-            print(event.text)
+        async for message in runner.run_stream(agent, ctx):
+            print(message)
 
         # New usage — access the final result after iteration:
         stream = runner.run_stream(agent, ctx)
-        async for event in stream:
-            print(event.text)
+        async for message in stream:
+            print(message)
         final = stream.result  # same object the on_after callback received
     """
 
     def __init__(
         self,
-        aiter: AsyncIterator[AgentEvent],
+        aiter: AsyncIterator[SDKMessage],
         holder: _ResultHolder,
     ) -> None:
         self._aiter = aiter
@@ -413,7 +397,7 @@ class StreamResult:
     def __aiter__(self) -> StreamResult:
         return self
 
-    async def __anext__(self) -> AgentEvent:
+    async def __anext__(self) -> SDKMessage:
         return await self._aiter.__anext__()
 
     @property

@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator
 from typing import Any
 
-from cckit.types import AgentEvent, RunContext
+from cckit.types import RunContext
 
 # Type alias for the inner async generator that middleware wraps.
-# Signature: (prompt, options, collector) -> AsyncIterator[AgentEvent]
-SdkQueryFunc = Any  # Callable[[str, Any, Any], AsyncIterator[AgentEvent]]
+# Signature: (prompt, options, state) -> AsyncIterator[SDK Message]
+SdkQueryFunc = Any  # Callable[[str, Any, Any], AsyncIterator[Any]]
 
 
 class Middleware(ABC):
@@ -31,9 +31,9 @@ class Middleware(ABC):
         next_call: SdkQueryFunc,
         prompt: str,
         options: Any,
-        collector: Any,
+        state: Any,
         ctx: RunContext,
-    ) -> AsyncGenerator[AgentEvent, None]:
+    ) -> AsyncGenerator[Any, None]:
         """Wrap the next callable in the middleware chain.
 
         Parameters
@@ -44,14 +44,14 @@ class Middleware(ABC):
             The prompt to send to the SDK.
         options:
             ``ClaudeAgentOptions`` instance.
-        collector:
-            ``StreamCollector`` instance.
+        state:
+            Mutable run state shared across the execution.
         ctx:
             The current run context.
 
         Yields
         ------
-        AgentEvent
+        SDK message object
         """
         yield  # pragma: no cover — abstract
         ...

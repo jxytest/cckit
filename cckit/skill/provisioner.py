@@ -196,20 +196,20 @@ class SkillProvisioner:
             # Not a git repo (e.g. plain workspace without clone) — skip.
             return
 
-        _MARKER = "# cckit: platform-managed — do not commit\n"
-        _RULE = ".claude/\n"
+        marker = "# cckit: platform-managed — do not commit\n"
+        rule = ".claude/\n"
 
         loop = asyncio.get_running_loop()
 
         def _append() -> None:
             existing = exclude_file.read_text(encoding="utf-8") if exclude_file.exists() else ""
-            if _RULE in existing:
+            if rule in existing:
                 return  # already present, nothing to do
             with exclude_file.open("a", encoding="utf-8") as fh:
                 if existing and not existing.endswith("\n"):
                     fh.write("\n")
-                fh.write(_MARKER)
-                fh.write(_RULE)
+                fh.write(marker)
+                fh.write(rule)
 
         try:
             await loop.run_in_executor(None, _append)

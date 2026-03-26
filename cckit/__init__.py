@@ -18,8 +18,8 @@ Quick start::
     import asyncio
 
     async def main():
-        async for event in runner.run_stream(agent, ctx):
-            print(event.text, end="", flush=True)
+        async for message in runner.run_stream(agent, ctx):
+            print(message)
 
     asyncio.run(main())
 """
@@ -53,8 +53,6 @@ from cckit.runner import Runner
 
 # Data types
 from cckit.types import (
-    AgentEvent,
-    AgentEventType,
     AgentResult,
     GitConfig,
     LiteLlm,
@@ -73,8 +71,6 @@ __all__ = [
     "Runner",
     "check_api_connectivity",
     # Types
-    "AgentEvent",
-    "AgentEventType",
     "AgentResult",
     "GitConfig",
     "LiteLlm",

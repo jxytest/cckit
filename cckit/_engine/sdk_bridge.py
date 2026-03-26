@@ -1,8 +1,8 @@
 """SDK bridge — the only module that directly interacts with the claude-agent-sdk.
 
 Extracted from the old ``executor.py``.  Provides a standalone async generator
-that calls ``query()``, streams messages through a ``StreamCollector``, and
-yields ``AgentEvent`` objects.
+that calls ``query()``, updates ``RunState``, and yields the SDK's native
+message objects unchanged.
 
 Session resume / fork is handled transparently via ``ClaudeAgentOptions.resume``
 and ``ClaudeAgentOptions.fork_session`` — no special logic needed here.
@@ -14,9 +14,8 @@ import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
-from cckit._engine.collector import StreamCollector
+from cckit._engine.state import RunState
 from cckit.exceptions import AgentExecutionError
-from cckit.types import AgentEvent
 
 logger = logging.getLogger(__name__)
 
@@ -24,9 +23,9 @@ logger = logging.getLogger(__name__)
 async def run_sdk_query(
     prompt: str,
     options: Any,
-    collector: StreamCollector,
-) -> AsyncIterator[AgentEvent]:
-    """Call ``query(prompt, options=options)`` and yield events via collector.
+    state: RunState,
+) -> AsyncIterator[Any]:
+    """Call ``query(prompt, options=options)`` and yield SDK messages.
 
     Uses the top-level ``query()`` async generator from ``claude_agent_sdk``
     instead of the stateful ``query`` context-manager approach.
@@ -42,9 +41,8 @@ async def run_sdk_query(
 
     try:
         async for message in query(prompt=prompt, options=options):
-            events = collector.process_message(message)
-            for event in events:
-                yield event
+            state.observe(message)
+            yield message
     except Exception as exc:
         raise AgentExecutionError(
             f"SDK query failed: {exc}",

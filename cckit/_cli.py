@@ -135,7 +135,7 @@ def check_api_connectivity(
             raise ConnectivityError(
                 f"API key lacks permission (HTTP 403).\n"
                 f"Detail: {detail}" if detail else
-                f"API key lacks permission (HTTP 403)."
+                "API key lacks permission (HTTP 403)."
             ) from exc
         # Other HTTP errors — still connected, just unexpected
         raise ConnectivityError(

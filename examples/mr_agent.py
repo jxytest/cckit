@@ -11,9 +11,11 @@ import asyncio
 import logging
 import os
 import sys
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 
+from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 from dotenv import load_dotenv
 
 from cckit import Agent, GitConfig, ModelConfig, RunContext, Runner, RunnerConfig, WorkspaceConfig
@@ -56,10 +58,8 @@ async def create_mr(ctx: RunContext, result: AgentResult) -> None:
     # 配置 git 用户（忽略失败）
     for args in [("config", "user.email", "mr-agent@cckit.local"),
                  ("config", "user.name",  "MR Agent")]:
-        try:
+        with suppress(Exception):
             await git_ops.run_git(*args, cwd=repo_dir)
-        except Exception:
-            pass
 
     if not await git_ops.status(cwd=repo_dir, short=True):
         logger.info("没有检测到文件改动，跳过 MR 创建")
@@ -83,7 +83,7 @@ async def create_mr(ctx: RunContext, result: AgentResult) -> None:
         description=(
             f"由 MR Agent 自动生成。\n\n"
             f"**需求**：\n{ctx.prompt}\n\n"
-            f"**Agent 摘要**：\n{result.result_text[:2000]}"
+            f"**Agent 摘要**：\n{result.output_text[:2000]}"
         ),
     )
 
@@ -150,9 +150,13 @@ async def main() -> None:
     )
 
     stream = runner.run_stream(mr_agent, ctx)
-    async for event in stream:
-        if event.text:
-            print(event.text, end="", flush=True)
+    async for message in stream:
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    print(block.text, end="", flush=True)
+        elif isinstance(message, ResultMessage) and message.is_error and message.result:
+            print(message.result, end="", flush=True)
 
     result = stream.result
     print()

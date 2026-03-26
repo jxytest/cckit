@@ -13,7 +13,6 @@ Lifecycle states::
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import shutil
 import tempfile
@@ -60,12 +59,7 @@ class WorkspaceManager:
         """Remove a workspace directory tree."""
         if not workspace.exists():
             return
-
-        def _rm() -> None:
-            shutil.rmtree(workspace, ignore_errors=True)
-
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, _rm)
+        shutil.rmtree(workspace, ignore_errors=True)
         logger.info("Cleaned up workspace: %s", workspace)
 
     async def suspend(self, workspace: Path) -> None:
