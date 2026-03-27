@@ -1,6 +1,6 @@
 """Data types for cckit.
 
-Contains all data containers: ModelConfig, LiteLlm, GitConfig, WorkspaceConfig,
+Contains all data containers: ModelConfig, GitConfig, WorkspaceConfig,
 RunContext, AgentResult, RunnerConfig, SandboxOptions, etc.
 
 These are pure data — no SDK dependency, no I/O.
@@ -15,7 +15,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import Field, PrivateAttr
+from pydantic import Field, PrivateAttr, field_validator
 
 from cckit._models import CustomModel
 
@@ -33,58 +33,61 @@ else:
 # ---------------------------------------------------------------------------
 
 
+def _normalize_model_base_url(value: str) -> str:
+    """Normalize a provider API base URL.
+
+    Users often paste a full endpoint path instead of an API base. Keep the
+    normalization conservative and only trim well-known suffixes that Claude /
+    LiteLLM callers commonly provide by mistake.
+    """
+    normalized = value.strip().rstrip("/")
+    if not normalized:
+        return ""
+    suffix_rewrites = (
+        ("/v1/messages", ""),
+        ("/v1/chat/completions", "/v1"),
+        ("/chat/completions", ""),
+        ("/v1/responses", "/v1"),
+        ("/responses", ""),
+    )
+    for suffix, replacement in suffix_rewrites:
+        if normalized.endswith(suffix):
+            normalized = f"{normalized[: -len(suffix)]}{replacement}"
+            break
+    return normalized.rstrip("/")
+
+
+def _normalize_anthropic_base_url(value: str) -> str:
+    """Backward-compatible alias for older internal imports."""
+    return _normalize_model_base_url(value)
+
+
 class ModelConfig(CustomModel):
-    """Direct Anthropic API model configuration.
+    """Unified model configuration interpreted with LiteLLM semantics.
 
     Usage::
 
         ModelConfig(model="claude-sonnet-4-6")
-        ModelConfig(model="claude-sonnet-4-6", api_key="sk-...", base_url="https://...")
+        ModelConfig(model="openai/gpt-4o-mini", api_key="sk-...", base_url="https://api.openai.com/v1")
+        ModelConfig(model="openai/claude-sonnet-4-6", api_key="sk-...", base_url="https://gateway.example.com/v1")
+
+    Notes::
+
+        ``base_url`` is intentionally kept as the public field name, but it is
+        passed to LiteLLM as ``api_base``.
     """
 
     model: str = "claude-sonnet-4-6"
-    api_key: str = ""  # empty = use ANTHROPIC_API_KEY env var
-    base_url: str = ""  # empty = use ANTHROPIC_BASE_URL env var or default
+    api_key: str = ""  # empty = let provider-specific env/defaults resolve it
+    base_url: str = ""  # provider or gateway API base
     max_tokens: int = 16384
     max_turns: int = 50
     timeout_seconds: int = 300
 
-
-class LiteLlm(CustomModel):
-    """Bridge to any model via LiteLLM proxy.
-
-    LiteLLM runs as an OpenAI-compatible proxy server, accepting OpenAI-format
-    requests and routing to 100+ model providers.
-
-    Usage::
-
-        # 1. Start LiteLLM proxy: litellm --model openai/gemini-3-pro
-        # 2. Reference in Agent:
-        Agent(model=LiteLlm(model="openai/gemini-3-pro", api_base="http://localhost:4000"))
-
-    How it works:
-    - LiteLlm is converted to ModelConfig, with base_url pointing to LiteLLM proxy
-    - claude-agent-sdk connects to LiteLLM proxy via ANTHROPIC_BASE_URL
-    - LiteLLM routes the request to the actual model provider
-    """
-
-    model: str  # LiteLLM model identifier, e.g. "openai/gemini-3-pro"
-    api_base: str = "http://localhost:4000"  # LiteLLM proxy address
-    api_key: str = ""  # LiteLLM proxy API key
-    max_tokens: int = 16384
-    max_turns: int = 50
-    timeout_seconds: int = 300
-
-    def to_model_config(self) -> ModelConfig:
-        """Convert to ModelConfig for internal use by Runner."""
-        return ModelConfig(
-            model=self.model,
-            api_key=self.api_key,
-            base_url=self.api_base,
-            max_tokens=self.max_tokens,
-            max_turns=self.max_turns,
-            timeout_seconds=self.timeout_seconds,
-        )
+    @field_validator("base_url", mode="before")
+    @classmethod
+    def _validate_base_url(cls, value: str) -> str:
+        return _normalize_model_base_url(value)
 
 
 # ---------------------------------------------------------------------------

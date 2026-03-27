@@ -15,6 +15,7 @@ import urllib.error
 import urllib.request
 
 from cckit.exceptions import CckitError, ConnectivityError
+from cckit.types import _normalize_anthropic_base_url
 
 logger = logging.getLogger(__name__)
 _checked = False
@@ -59,7 +60,7 @@ def check_api_connectivity(
     model: str = "",
     timeout: int = 10,
 ) -> None:
-    """Verify API key and network connectivity to Anthropic API.
+    """Verify API key and network connectivity to an Anthropic-compatible API.
 
     Sends a minimal ``/v1/messages`` request with ``max_tokens=1``
     to validate the API key with negligible cost.
@@ -69,7 +70,8 @@ def check_api_connectivity(
     api_key:
         Anthropic API key.  Falls back to ``ANTHROPIC_API_KEY`` env var.
     base_url:
-        API base URL.  Falls back to ``ANTHROPIC_BASE_URL`` env var or default.
+        Anthropic-compatible API base URL. Falls back to
+        ``ANTHROPIC_BASE_URL`` env var or default.
     model:
         Model name for the check request.  Falls back to ``"claude-sonnet-4-20250514"``.
     timeout:
@@ -88,7 +90,9 @@ def check_api_connectivity(
             "Set it via environment variable or pass api_key in ModelConfig."
         )
 
-    base = (base_url or os.environ.get("ANTHROPIC_BASE_URL", "") or _DEFAULT_API_BASE).rstrip("/")
+    base = _normalize_anthropic_base_url(
+        base_url or os.environ.get("ANTHROPIC_BASE_URL", "") or _DEFAULT_API_BASE
+    )
     url = f"{base}{_CONNECTIVITY_PATH}"
 
     # Minimal messages request — max_tokens=1 to minimize cost

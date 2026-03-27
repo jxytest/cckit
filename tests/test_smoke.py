@@ -2,7 +2,7 @@
 
 Verifies:
 1. All public imports work
-2. Agent instantiation (simple + LiteLlm + sub-agents)
+2. Agent instantiation (simple + gateway ModelConfig + sub-agents)
 3. Type construction (ModelConfig, RunContext, RunnerConfig, etc.)
 4. Middleware instantiation
 5. WorkspaceManager lifecycle
@@ -13,6 +13,7 @@ Verifies:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 from pathlib import Path
@@ -28,7 +29,6 @@ from cckit import (  # noqa: F401 — test_imports verifies all public API symbo
     GitConfig,
     GitLabAPIError,
     GitOperationError,
-    LiteLlm,
     LoggingMiddleware,
     Middleware,
     ModelConfig,
@@ -43,6 +43,8 @@ from cckit import (  # noqa: F401 — test_imports verifies all public API symbo
     WorkspaceConfig,
     WorkspaceError,
 )
+from cckit._engine.model_bridge import PreparedModelEndpoint, prepare_model_endpoint
+from cckit._engine.state import RunState
 from cckit.git.gitlab_client import GitLabClient
 from cckit.sandbox.config import SandboxConfigBuilder
 from cckit.sandbox.workspace import WorkspaceManager
@@ -105,21 +107,109 @@ def test_agent_with_string_model():
     assert agent.model_config.model == "claude-opus-4-6"
 
 
-def test_agent_with_litellm():
-    """Agent with LiteLlm bridge."""
+def test_agent_with_gateway_model_config():
+    """Agent can target a gateway-backed third-party model via ModelConfig."""
     agent = Agent(
-        name="litellm-test",
-        model=LiteLlm(
+        name="gateway-test",
+        model=ModelConfig(
             model="openai/gemini-3-pro",
-            api_base="http://localhost:4000",
-            api_key="sk-litellm",
+            base_url="http://localhost:4000",
+            api_key="sk-gateway",
         ),
         tools=["Read"],
     )
     assert agent.model_config is not None
     assert agent.model_config.model == "openai/gemini-3-pro"
     assert agent.model_config.base_url == "http://localhost:4000"
-    assert agent.model_config.api_key == "sk-litellm"
+    assert agent.model_config.api_key == "sk-gateway"
+
+
+def test_model_config_normalizes_messages_endpoint():
+    """ModelConfig strips pasted endpoint suffixes down to the API base."""
+    cfg = ModelConfig(
+        model="claude-sonnet-4-6",
+        base_url="http://localhost:4000/v1/messages",
+    )
+    assert cfg.base_url == "http://localhost:4000"
+
+
+def test_model_config_normalizes_chat_completions_endpoint():
+    """ModelConfig strips a pasted /chat/completions suffix."""
+    cfg = ModelConfig(
+        model="openai/gpt-4o-mini",
+        base_url="https://api.openai.com/v1/chat/completions",
+    )
+    assert cfg.base_url == "https://api.openai.com/v1"
+
+
+def test_model_config_normalizes_responses_endpoint():
+    """ModelConfig strips a pasted /responses suffix."""
+    cfg = ModelConfig(
+        model="openai/gpt-4o-mini",
+        base_url="https://api.openai.com/v1/responses",
+    )
+    assert cfg.base_url == "https://api.openai.com/v1"
+
+
+def test_prepare_model_endpoint_uses_litellm_bridge_for_plain_model(monkeypatch):
+    """Unprefixed models should still route through the local LiteLLM bridge."""
+    async def fake_start(self):
+        self.base_url = "http://127.0.0.1:41001"
+        return self
+
+    monkeypatch.setattr("cckit._engine.model_bridge.LiteLLMAnthropicBridge.start", fake_start)
+
+    prepared = asyncio.run(
+        prepare_model_endpoint(
+            ModelConfig(
+                model="claude-sonnet-4-6",
+                api_key="sk-test",
+            )
+        )
+    )
+    assert prepared.model == "claude-sonnet-4-6"
+    assert prepared.api_key == "cckit-bridge"
+    assert prepared.base_url == "http://127.0.0.1:41001"
+    assert prepared.bridge is not None
+    assert prepared.bridge._model.model == "claude-sonnet-4-6"
+
+
+def test_prepare_model_endpoint_missing_litellm_is_clear(monkeypatch):
+    """Any model should fail clearly if LiteLLM bridge dependencies are missing."""
+    def fake_build_app(self):
+        raise AgentExecutionError("cckit model execution requires LiteLLM bridge dependencies")
+
+    monkeypatch.setattr(
+        "cckit._engine.model_bridge.LiteLLMAnthropicBridge._build_app",
+        fake_build_app,
+    )
+
+    with pytest.raises(AgentExecutionError, match="LiteLLM bridge dependencies"):
+        asyncio.run(prepare_model_endpoint(ModelConfig(model="claude-sonnet-4-6")))
+
+
+def test_prepare_model_endpoint_prefixed_model_uses_bridge(monkeypatch):
+    """Prefixed models should pass through to LiteLLM unchanged."""
+    async def fake_start(self):
+        self.base_url = "http://127.0.0.1:41001"
+        return self
+
+    monkeypatch.setattr("cckit._engine.model_bridge.LiteLLMAnthropicBridge.start", fake_start)
+
+    prepared = asyncio.run(
+        prepare_model_endpoint(
+            ModelConfig(
+                model="openai/gpt-4o-mini",
+                api_key="sk-openai",
+                base_url="https://api.openai.com/v1",
+            )
+        )
+    )
+    assert prepared.model == "openai/gpt-4o-mini"
+    assert prepared.api_key == "cckit-bridge"
+    assert prepared.base_url == "http://127.0.0.1:41001"
+    assert prepared.bridge is not None
+    assert prepared.bridge._model.model == "openai/gpt-4o-mini"
 
 
 def test_agent_with_sub_agents():
@@ -225,6 +315,50 @@ def test_run_context_model_overrides_runner_default():
     assert resolved.model == "claude-opus-4-6"
     assert resolved.api_key == "sk-test"
     assert resolved.base_url == "https://proxy.test"
+
+
+def test_build_options_bridge_env_overrides_ctx_env():
+    """Bridge transport settings must win over conflicting ctx.env Anthropic vars."""
+    runner = Runner(
+        config=RunnerConfig(
+            default_model=ModelConfig(model="claude-sonnet-4-6"),
+        )
+    )
+    agent = Agent(name="bridge-env", tools=["Read"])
+    ctx = RunContext(
+        env={
+            "ANTHROPIC_API_KEY": "sk-wrong",
+            "ANTHROPIC_AUTH_TOKEN": "sk-wrong",
+            "ANTHROPIC_BASE_URL": "https://wrong.example.com",
+            "OTHER_ENV": "ok",
+        }
+    )
+    model = ModelConfig(
+        model="openai/gpt-4o-mini",
+        api_key="sk-openai",
+        base_url="https://api.openai.com/v1",
+    )
+    prepared = PreparedModelEndpoint(
+        model="openai/gpt-4o-mini",
+        api_key="cckit-bridge",
+        base_url="http://127.0.0.1:41001",
+    )
+
+    opts = runner._build_options(
+        agent,
+        ctx,
+        model,
+        prepared,
+        SandboxOptions(),
+        None,
+        "",
+        RunState("bridgeenv"),
+    )
+
+    assert opts.env["ANTHROPIC_API_KEY"] == "cckit-bridge"
+    assert opts.env["ANTHROPIC_AUTH_TOKEN"] == "cckit-bridge"
+    assert opts.env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:41001"
+    assert opts.env["OTHER_ENV"] == "ok"
 
 
 def test_middleware():

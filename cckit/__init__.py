@@ -55,7 +55,6 @@ from cckit.runner import Runner
 from cckit.types import (
     AgentResult,
     GitConfig,
-    LiteLlm,
     ModelConfig,
     RunContext,
     RunnerConfig,
@@ -73,7 +72,6 @@ __all__ = [
     # Types
     "AgentResult",
     "GitConfig",
-    "LiteLlm",
     "ModelConfig",
     "RunContext",
     "RunnerConfig",

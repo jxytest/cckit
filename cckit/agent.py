@@ -15,7 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from cckit.types import AgentResult, LiteLlm, ModelConfig, RunContext, SandboxOptions
+from cckit.types import AgentResult, ModelConfig, RunContext, SandboxOptions
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +35,8 @@ class Agent:
         Unique identifier for this agent (used in logs, sub-agent references).
     model:
         Model configuration. Accepts:
-        - A string like ``"claude-sonnet-4-6"`` (uses defaults for api_key/base_url)
-        - A ``ModelConfig`` instance for full control over Anthropic API
-        - A ``LiteLlm`` instance to bridge any model via LiteLLM proxy
+        - A string like ``"claude-sonnet-4-6"`` or ``"openai/gpt-4o-mini"``
+        - A ``ModelConfig`` instance for full control over LiteLLM-style model, auth, and base URL
         - ``None`` to inherit from Runner defaults
     description:
         Human-readable description (used when this agent is a sub-agent).
@@ -82,7 +81,7 @@ class Agent:
         self,
         *,
         name: str,
-        model: str | ModelConfig | LiteLlm | None = None,
+        model: str | ModelConfig | None = None,
         description: str = "",
         instruction: str | InstructionFn = "",
         tools: list[str] | None = None,
@@ -114,8 +113,6 @@ class Agent:
             self._model_config: ModelConfig | None = None
         elif isinstance(model, str):
             self._model_config = ModelConfig(model=model)
-        elif isinstance(model, LiteLlm):
-            self._model_config = model.to_model_config()
         else:
             self._model_config = model
 

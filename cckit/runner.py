@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 from cckit._cli import check_api_connectivity, check_claude_cli
+from cckit._engine.model_bridge import PreparedModelEndpoint, prepare_model_endpoint
 from cckit._engine.sdk_bridge import run_sdk_query
 from cckit._engine.state import RunState
 from cckit.agent import Agent
@@ -193,6 +194,7 @@ class Runner:
         start = time.monotonic()
         git_cfg = ctx.resolved_git()
         effective_sandbox = self._resolve_sandbox(agent)
+        prepared_model: PreparedModelEndpoint | None = None
 
         try:
             # --- validate context ---
@@ -228,15 +230,6 @@ class Runner:
                         "'default' or 'acceptEdits', or enable sandbox so cckit "
                         "switches to 'dontAsk'."
                     ),
-                )
-
-            # --- preflight: API connectivity check ---
-            if self._preflight_check:
-                model = self._resolve_model(agent, ctx)
-                api_key = model.api_key or ctx.env.get("ANTHROPIC_API_KEY", "")
-                base_url = model.base_url or ctx.env.get("ANTHROPIC_BASE_URL", "")
-                check_api_connectivity(
-                    api_key=api_key, base_url=base_url, model=model.model,
                 )
 
             if effective_sandbox.enabled and _is_windows():
@@ -284,8 +277,22 @@ class Runner:
             state = RunState(ctx.task_id)
             # --- build SDK options ---
             model = self._resolve_model(agent, ctx)
+            prepared_model = await prepare_model_endpoint(model)
+            if self._preflight_check:
+                check_api_connectivity(
+                    api_key="cckit-bridge",
+                    base_url=prepared_model.base_url,
+                    model=model.model,
+                )
             options = self._build_options(
-                agent, ctx, model, effective_sandbox, holder.workspace_dir, instruction, state,
+                agent,
+                ctx,
+                model,
+                prepared_model,
+                effective_sandbox,
+                holder.workspace_dir,
+                instruction,
+                state,
             )
 
             # --- stream from SDK (through middleware chain) ---
@@ -391,6 +398,8 @@ class Runner:
                     await self._workspace.suspend(holder.workspace_dir)
                 else:
                     await self._workspace.cleanup(holder.workspace_dir)
+            if prepared_model is not None:
+                await prepared_model.aclose()
 
     # ------------------------------------------------------------------
     # Model resolution
@@ -497,6 +506,7 @@ class Runner:
         agent: Agent,
         ctx: RunContext,
         model: ModelConfig,
+        prepared_model: PreparedModelEndpoint,
         sandbox: SandboxOptions,
         workspace_dir: Path | None,
         instruction: str,
@@ -546,25 +556,25 @@ class Runner:
         ).build(workspace_dir)
 
         # -- environment (Agent subprocess only — NO git credentials) --
-        env: dict[str, str] = {}
-        if model.api_key:
+        # Start from caller-provided env, then let the resolved model endpoint
+        # override Anthropic transport settings. Bridge mode relies on this to
+        # force the CLI through the local compatibility server.
+        env: dict[str, str] = dict(ctx.env)
+        if prepared_model.api_key:
             # ANTHROPIC_API_KEY  → sent as X-Api-Key header (direct Anthropic API)
             # ANTHROPIC_AUTH_TOKEN → sent as Authorization: Bearer header (LLM gateway / proxy)
             # Both are injected so the CLI authenticates correctly regardless of
             # whether the endpoint is a first-party Anthropic host or a third-party proxy.
-            env["ANTHROPIC_API_KEY"] = model.api_key
-            env["ANTHROPIC_AUTH_TOKEN"] = model.api_key
-        if model.base_url:
-            env["ANTHROPIC_BASE_URL"] = model.base_url
+            env["ANTHROPIC_API_KEY"] = prepared_model.api_key
+            env["ANTHROPIC_AUTH_TOKEN"] = prepared_model.api_key
+        if prepared_model.base_url:
+            env["ANTHROPIC_BASE_URL"] = prepared_model.base_url
             # Third-party proxies often reject Anthropic-specific beta headers
             # and non-essential traffic (telemetry, autoupdater, etc.)
             env.setdefault("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "1")
             env.setdefault("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
             # Disable extended thinking — many proxies don't support it
             env.setdefault("MAX_THINKING_TOKENS", "0")
-        # ctx.env is for the Agent subprocess (API keys, feature flags, etc.)
-        # Git credentials live in ctx.git / GitConfig and are NEVER injected here.
-        env.update(ctx.env)
 
         # -- configurable SDK params --
         max_turns = agent.max_turns if agent.max_turns > 0 else model.max_turns
@@ -584,7 +594,7 @@ class Runner:
         opts = ClaudeAgentOptions(
             system_prompt=system_prompt,
             max_turns=max_turns,
-            model=model.model,
+            model=prepared_model.model,
             # When sandbox is enabled, switch to dontAsk so that permissions.deny
             # rules are enforced. bypassPermissions skips all permission checks
             # (including deny rules) and is only safe inside pre-isolated envs.
