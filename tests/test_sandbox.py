@@ -525,11 +525,10 @@ class TestSandboxOptionsDefaults:
         opts = SandboxOptions()
         assert opts.denied_domains == []
 
-    def test_from_env_includes_denied_domains(self):
-        """RunnerConfig.from_env() should include denied_domains."""
+    def test_from_env_includes_workspace_root(self):
+        """RunnerConfig.from_env() should expose workspace_root."""
         cfg = RunnerConfig.from_env()
-        assert hasattr(cfg.sandbox, "denied_domains")
-        assert cfg.sandbox.denied_domains == []
+        assert isinstance(cfg.workspace_root, Path)
 
 
 # =====================================================================
@@ -610,13 +609,12 @@ class TestDangerouslyDisableSandboxPrevention:
         opts = SandboxOptions(enabled=True)
         assert opts.allow_unsandboxed_commands is False
 
-    def test_runner_config_propagates_default(self):
-        """RunnerConfig → SandboxConfigBuilder should propagate the False default."""
-        cfg = RunnerConfig(sandbox=SandboxOptions(enabled=True))
-        # Simulate what Runner.__init__ does
+    def test_sandbox_options_propagate_default(self):
+        """SandboxOptions → SandboxConfigBuilder should propagate the False default."""
+        opts = SandboxOptions(enabled=True)
         builder = SandboxConfigBuilder(
-            enabled=cfg.sandbox.enabled,
-            allow_unsandboxed_commands=cfg.sandbox.allow_unsandboxed_commands,
+            enabled=opts.enabled,
+            allow_unsandboxed_commands=opts.allow_unsandboxed_commands,
         )
         sandbox = _parse(builder.build())["sandbox"]
         assert sandbox["allowUnsandboxedCommands"] is False

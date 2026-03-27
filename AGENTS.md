@@ -71,9 +71,9 @@ tests/
 ## 4. 核心三层设计
 
 ```
-Agent = "我是谁" → name, instruction, tools, sub_agents, skills, model
+Agent = "我是谁" → name, instruction, tools, sub_agents, skills, model, sandbox
 RunContext = "怎么跑" → workspace, git(GitConfig), prompt, params, env
-Runner = "执行引擎" → 中间件、并发控制、SDK 桥接
+Runner = "执行引擎" → default_model、workspace_root、中间件、并发控制、SDK 桥接
 ```
 
 ### 4.1 Agent — 声明式定义
@@ -210,16 +210,17 @@ Runner.run(agent, ctx) → AgentResult:
 ## 7. 配置系统
 
 **无全局单例** — 配置通过构造函数向下传递。
+沙箱策略定义在 `Agent(..., sandbox=...)`；`RunnerConfig` 只负责运行器级配置，例如 `workspace_root`。
 
 ```python
 # 方式 1: 显式配置
 config = RunnerConfig(
     default_model=ModelConfig(model="claude-sonnet-4-6", api_key="sk-..."),
-    sandbox=SandboxOptions(enabled=True, workspace_root=Path("/data/ws")),
+    workspace_root=Path("/data/ws"),
 )
 
-# 方式 2: 从环境变量读取（兼容旧部署）
-config = RunnerConfig.from_env()  # 读 ANTHROPIC_*、SANDBOX_*、PLATFORM_*
+# 方式 2: 从环境变量读取
+config = RunnerConfig.from_env()  # 读 ANTHROPIC_*、PLATFORM_*
 ```
 
 ## 8. 模型配置

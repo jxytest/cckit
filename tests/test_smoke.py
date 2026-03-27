@@ -83,6 +83,21 @@ def test_agent_with_model():
     assert agent.model_config.api_key == "sk-test"
 
 
+def test_agent_with_sandbox():
+    """Agent can carry its own sandbox policy."""
+    sandbox = SandboxOptions(enabled=True, allowed_domains=["example.com"])
+    agent = Agent(
+        name="with-sandbox",
+        instruction="Hello",
+        tools=["Bash"],
+        sandbox=sandbox,
+    )
+    assert agent.sandbox_config is sandbox
+    assert agent.sandbox_config is not None
+    assert agent.sandbox_config.enabled is True
+    assert agent.sandbox_config.allowed_domains == ["example.com"]
+
+
 def test_agent_with_string_model():
     """Agent with string model shorthand."""
     agent = Agent(name="string-model", model="claude-opus-4-6", tools=["Read"])
@@ -155,6 +170,7 @@ def test_types():
     """Type construction."""
     ctx = RunContext(
         prompt="Test",
+        model="claude-opus-4-6",
         params={"key": "value"},
         workspace=WorkspaceConfig(enabled=True),
         git=GitConfig(
@@ -163,6 +179,7 @@ def test_types():
         ),
     )
     assert ctx.prompt == "Test"
+    assert ctx.model == "claude-opus-4-6"
     assert ctx.git.clone is True
     assert ctx.git.repo_url == "https://example.com/repo.git"
     assert len(ctx.task_id) == 12
@@ -179,14 +196,35 @@ def test_types():
     assert model.max_tokens == 16384
 
     sandbox = SandboxOptions(enabled=True)
-    assert sandbox.workspace_root == Path("/tmp/cckit_workspaces")
+    assert sandbox.enabled is True
+    assert sandbox.deny_read == ["~/"]
 
 
-def test_runner_config_from_env():
+def test_runner_config_from_env(monkeypatch):
     """RunnerConfig.from_env()."""
+    monkeypatch.setenv("PLATFORM_WORKSPACE_ROOT", "/tmp/cckit-env-workspaces")
     cfg = RunnerConfig.from_env()
     assert cfg.default_model.model  # should have a default
+    assert cfg.workspace_root == Path("/tmp/cckit-env-workspaces")
     assert cfg.max_concurrent_agents > 0
+
+
+def test_run_context_model_overrides_runner_default():
+    """RunContext.model overrides only the model name for a single run."""
+    runner = Runner(
+        config=RunnerConfig(
+            default_model=ModelConfig(
+                model="claude-sonnet-4-6",
+                api_key="sk-test",
+                base_url="https://proxy.test",
+            ),
+        )
+    )
+    agent = Agent(name="override-model", tools=["Read"])
+    resolved = runner._resolve_model(agent, RunContext(model="claude-opus-4-6"))
+    assert resolved.model == "claude-opus-4-6"
+    assert resolved.api_key == "sk-test"
+    assert resolved.base_url == "https://proxy.test"
 
 
 def test_middleware():
@@ -248,7 +286,7 @@ def test_exceptions():
     ]:
         exc = exc_cls("test message", detail="detail info")
         assert isinstance(exc, CckitError)
-        assert str(exc) == "test message"
+        assert str(exc) == "test message\ndetail info"
         assert exc.detail == "detail info"
 
 

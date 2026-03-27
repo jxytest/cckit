@@ -15,7 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from cckit.types import AgentResult, LiteLlm, ModelConfig, RunContext
+from cckit.types import AgentResult, LiteLlm, ModelConfig, RunContext, SandboxOptions
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +64,10 @@ class Agent:
         List of keys that must be present in ``RunContext.params``.
     max_turns:
         Max conversation turns. 0 = use model config default.
+    sandbox:
+        Optional sandbox policy for this agent. Workspace root remains a
+        Runner-level infrastructure concern; per-agent sandbox rules such as
+        enabled/read-write/network policy belong here.
 
     Lifecycle callbacks (optional):
     on_before:
@@ -88,6 +92,7 @@ class Agent:
         mcp_servers: dict[str, Any] | None = None,
         required_params: list[str] | None = None,
         max_turns: int = 0,
+        sandbox: SandboxOptions | None = None,
         # Lifecycle callbacks
         on_before: LifecycleBeforeFn | None = None,
         on_after: LifecycleAfterFn | None = None,
@@ -102,6 +107,7 @@ class Agent:
         self.mcp_servers: dict[str, Any] = mcp_servers or {}
         self.required_params = required_params or []
         self.max_turns = max_turns
+        self._sandbox = sandbox
 
         # Normalize model → ModelConfig | None
         if model is None:
@@ -139,6 +145,11 @@ class Agent:
     def model_config(self) -> ModelConfig | None:
         """Return the model config, or None if inheriting from Runner."""
         return self._model_config
+
+    @property
+    def sandbox_config(self) -> SandboxOptions | None:
+        """Return the agent sandbox policy, or ``None`` when sandbox is not configured."""
+        return self._sandbox
 
     # ------------------------------------------------------------------
     # Lifecycle hook invocation (used by Runner, overridable by subclass)

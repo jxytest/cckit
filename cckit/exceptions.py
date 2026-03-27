@@ -15,7 +15,15 @@ class CckitError(Exception):
         super().__init__(message)
 
     def __str__(self) -> str:
-        return super().__str__()
+        message = super().__str__().strip()
+        detail = self.detail.strip()
+
+        if detail and detail != message and detail not in message:
+            if message:
+                return f"{message}\n{detail}"
+            return detail
+
+        return message
 
 
 # -- Agent ------------------------------------------------------------------

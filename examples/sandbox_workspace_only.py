@@ -16,27 +16,24 @@ import asyncio
 
 from claude_agent_sdk import AssistantMessage, TextBlock
 
-from cckit import Agent, RunContext, Runner, RunnerConfig, SandboxOptions, WorkspaceConfig
+from cckit import Agent, RunContext, Runner, SandboxOptions, WorkspaceConfig
 
 agent = Agent(
     name="sandbox-demo",
     instruction="You are a sandboxed assistant. Only read/write inside your workspace.",
     tools=["Bash", "Read", "Write", "Edit"],
+    sandbox=SandboxOptions(
+        enabled=True,
+        deny_read=["~/"],       # block home dir reads
+        allowed_domains=[],     # block all outbound network
+        # allow_unsandboxed_commands defaults to False —
+        # the Agent cannot use dangerouslyDisableSandbox to escape.
+    ),
 )
 
 
 async def main() -> None:
-    runner = Runner(
-        config=RunnerConfig(
-            sandbox=SandboxOptions(
-                enabled=True,
-                deny_read=["~/"],       # block home dir reads
-                allowed_domains=[],     # block all outbound network
-                # allow_unsandboxed_commands defaults to False —
-                # the Agent cannot use dangerouslyDisableSandbox to escape.
-            ),
-        ),
-    )
+    runner = Runner()
 
     ctx = RunContext(
         prompt=(

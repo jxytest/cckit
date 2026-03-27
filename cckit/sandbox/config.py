@@ -45,13 +45,8 @@ class SandboxConfigBuilder:
     ----------
     enabled:
         Master switch.  When ``False``, ``build()`` returns ``None``.
-    workspace_root:
-        Root directory under which per-task workspaces are created.
-        Added to ``allowWrite`` automatically so the agent can write to its
-        own workspace; kept out of ``allowRead`` overrides (it is readable by
-        default).
     allow_write:
-        Extra paths the sandbox may write to beyond ``workspace_root``.
+        Extra paths the sandbox may write to beyond the task workspace.
     deny_write:
         Paths explicitly blocked from writes.  Defaults to ``[]`` because
         writes are already deny-all by default in sandbox-runtime.
@@ -84,7 +79,6 @@ class SandboxConfigBuilder:
             self,
             *,
             enabled: bool = False,
-            workspace_root: Path = Path("/tmp/cckit_workspaces"),
             allow_write: list[str] | None = None,
             deny_write: list[str] | None = None,
             allow_read: list[str] | None = None,
@@ -97,7 +91,6 @@ class SandboxConfigBuilder:
             enable_weaker_nested_sandbox: bool = False,
     ) -> None:
         self.enabled = enabled
-        self.workspace_root = workspace_root
         self.allow_write = allow_write or []
         # deny_write defaults to [] — writes are already deny-all by default
         self.deny_write = deny_write or []

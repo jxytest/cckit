@@ -270,9 +270,11 @@ class RunContext(CustomModel):
 
     task_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
     prompt: str = ""
+    # Optional per-run model override; credentials still come from Runner/Agent config.
+    model: str = ""
     params: dict[str, Any] = Field(default_factory=dict)
     env: dict[str, str] = Field(default_factory=dict)
-    user: str | None = None
+    user: str | None = None  # OS username for the Claude CLI subprocess, not business user id
     include_partial_messages: bool = False
     # Workspace
     workspace: WorkspaceConfig = Field(default_factory=WorkspaceConfig)
@@ -415,22 +417,22 @@ class StreamResult:
 
 
 # ---------------------------------------------------------------------------
-# Sandbox options (for RunnerConfig)
+# Sandbox options
 # ---------------------------------------------------------------------------
 
 
 class SandboxOptions(CustomModel):
-    """Sandbox isolation configuration (macOS / Linux / WSL2 only).
+    """Sandbox isolation policy for a single Agent (macOS / Linux / WSL2 only).
 
-    Maps to two SDK injection points:
-    - ``ClaudeAgentOptions.sandbox``  — SandboxSettings TypedDict (bash process behaviour)
-    - ``ClaudeAgentOptions.settings`` — JSON with ``sandbox.filesystem`` / ``sandbox.network``
-      keys (OS-level path & domain rules, enforced by Seatbelt / bubblewrap)
+    cckit translates this policy into a unified settings JSON passed through
+    ``ClaudeAgentOptions.settings``. ``ClaudeAgentOptions.sandbox`` stays
+    ``None`` so the SDK does not overwrite filesystem/network rules.
 
     Filesystem rules
     ----------------
-    workspace_root is **always** added to ``allowWrite`` automatically at runtime,
-    so the agent can only write inside its own workspace directory.
+    The concrete task workspace directory is **always** added to ``allowWrite``
+    automatically at runtime, so the agent can only write inside its own
+    workspace directory.
 
     ``deny_read`` defaults to ``["~/"]`` to prevent reading the home directory
     (e.g. ~/.ssh).  Set to ``[]`` to disable.
@@ -451,10 +453,9 @@ class SandboxOptions(CustomModel):
 
     # --- core ---
     enabled: bool = False
-    workspace_root: Path = Path("/tmp/cckit_workspaces")
 
     # --- sandbox.filesystem (settings JSON) ---
-    # workspace_root is appended to allow_write automatically at runtime
+    # the concrete workspace_dir is appended to allow_write automatically at runtime
     # 写默认全部禁止，仅在allow_write可写
     allow_write: list[str] = Field(default_factory=list)   # extra write-allowed paths
     deny_write:  list[str] = Field(default_factory=list)   # write-blocked paths
@@ -482,11 +483,11 @@ class RunnerConfig(CustomModel):
     """Runner execution configuration — replaces the old global singletons.
 
     Users can either construct explicitly or use ``from_env()`` to read
-    environment variables (same vars as the old Settings classes).
+    environment variables for runner-level infrastructure concerns.
     """
 
     default_model: ModelConfig = Field(default_factory=ModelConfig)
-    sandbox: SandboxOptions = Field(default_factory=SandboxOptions)
+    workspace_root: Path = Path("/tmp/cckit_workspaces")
     skills_dir: Path = Path("/opt/agent-platform/skills")
     max_concurrent_agents: int = 5
     debug: bool = False
@@ -497,10 +498,9 @@ class RunnerConfig(CustomModel):
     def from_env(cls) -> RunnerConfig:
         """Create a RunnerConfig by reading environment variables.
 
-        Reads ANTHROPIC_*, SANDBOX_*, PLATFORM_* env vars the same way
-        the old singleton Settings classes did.  This is a convenience for
-        existing deployments — users who want full control should construct
-        RunnerConfig directly.
+        Reads ANTHROPIC_* and PLATFORM_* env vars. Sandbox policy belongs on
+        ``Agent(..., sandbox=...)``; RunnerConfig only owns runner-level
+        infrastructure such as workspace root and concurrency.
         """
         from pydantic_settings import BaseSettings
 
@@ -513,34 +513,16 @@ class RunnerConfig(CustomModel):
             max_turns: int = 50
             timeout_seconds: int = 300
 
-        class _EnvSandbox(BaseSettings):
-            model_config = {"env_prefix": "SANDBOX_", "case_sensitive": False}
-            enabled: bool = False
-            workspace_root: Path = Path("/tmp/cckit_workspaces")
-            # filesystem
-            allow_write: list[str] = []   # SANDBOX_ALLOW_WRITE
-            deny_write:  list[str] = []   # SANDBOX_DENY_WRITE
-            allow_read:  list[str] = []   # SANDBOX_ALLOW_READ
-            deny_read:   list[str] = ["~/"]  # SANDBOX_DENY_READ
-            # network
-            allowed_domains: list[str] = []  # SANDBOX_ALLOWED_DOMAINS
-            denied_domains: list[str] = []   # SANDBOX_DENIED_DOMAINS
-            # bash behaviour
-            auto_allow_bash: bool = True             # SANDBOX_AUTO_ALLOW_BASH
-            excluded_commands: list[str] = []        # SANDBOX_EXCLUDED_COMMANDS
-            allow_unsandboxed_commands: bool = False  # SANDBOX_ALLOW_UNSANDBOXED_COMMANDS
-            enable_weaker_nested_sandbox: bool = False  # SANDBOX_ENABLE_WEAKER_NESTED_SANDBOX
-
         class _EnvPlatform(BaseSettings):
             model_config = {"env_prefix": "PLATFORM_", "case_sensitive": False}
             debug: bool = False
             log_level: str = "INFO"
             max_concurrent_agents: int = 5
             skills_dir: Path = Path("/opt/agent-platform/skills")
+            workspace_root: Path = Path("/tmp/cckit_workspaces")
             permission_mode: PermissionMode = "bypassPermissions"
 
         env_m = _EnvModel()
-        env_s = _EnvSandbox()
         env_p = _EnvPlatform()
 
         return cls(
@@ -552,20 +534,7 @@ class RunnerConfig(CustomModel):
                 max_turns=env_m.max_turns,
                 timeout_seconds=env_m.timeout_seconds,
             ),
-            sandbox=SandboxOptions(
-                enabled=env_s.enabled,
-                workspace_root=env_s.workspace_root,
-                allow_write=env_s.allow_write,
-                deny_write=env_s.deny_write,
-                allow_read=env_s.allow_read,
-                deny_read=env_s.deny_read,
-                allowed_domains=env_s.allowed_domains,
-                denied_domains=env_s.denied_domains,
-                auto_allow_bash=env_s.auto_allow_bash,
-                excluded_commands=env_s.excluded_commands,
-                allow_unsandboxed_commands=env_s.allow_unsandboxed_commands,
-                enable_weaker_nested_sandbox=env_s.enable_weaker_nested_sandbox,
-            ),
+            workspace_root=env_p.workspace_root,
             skills_dir=env_p.skills_dir,
             max_concurrent_agents=env_p.max_concurrent_agents,
             debug=env_p.debug,

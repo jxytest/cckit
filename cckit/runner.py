@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -18,7 +19,7 @@ from cckit._cli import check_api_connectivity, check_claude_cli
 from cckit._engine.sdk_bridge import run_sdk_query
 from cckit._engine.state import RunState
 from cckit.agent import Agent
-from cckit.exceptions import HookError
+from cckit.exceptions import AgentExecutionError, HookError
 from cckit.git import operations as git_ops
 from cckit.middleware.base import Middleware
 from cckit.sandbox.config import SandboxConfigBuilder
@@ -29,6 +30,7 @@ from cckit.types import (
     ModelConfig,
     RunContext,
     RunnerConfig,
+    SandboxOptions,
     StreamResult,
     TaskStatus,
     _ResultHolder,
@@ -40,6 +42,13 @@ logger = logging.getLogger(__name__)
 def _is_windows() -> bool:
     import sys
     return sys.platform == "win32"
+
+
+def _is_root_user() -> bool:
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None:
+        return False
+    return geteuid() == 0
 
 
 class Runner:
@@ -90,32 +99,11 @@ class Runner:
         self._preflight_check = preflight_check
 
         self._workspace = workspace_manager or WorkspaceManager(
-            root=self._config.sandbox.workspace_root
+            root=self._config.workspace_root
         )
         self._skill_provisioner = skill_provisioner or SkillProvisioner(
             skills_dir=self._config.skills_dir
         )
-        self._sandbox_builder = SandboxConfigBuilder(
-            enabled=self._config.sandbox.enabled,
-            workspace_root=self._config.sandbox.workspace_root,
-            allow_write=list(self._config.sandbox.allow_write),
-            deny_write=list(self._config.sandbox.deny_write),
-            allow_read=list(self._config.sandbox.allow_read),
-            deny_read=list(self._config.sandbox.deny_read),
-            allowed_domains=list(self._config.sandbox.allowed_domains),
-            denied_domains=list(self._config.sandbox.denied_domains),
-            auto_allow_bash=self._config.sandbox.auto_allow_bash,
-            excluded_commands=list(self._config.sandbox.excluded_commands),
-            allow_unsandboxed_commands=self._config.sandbox.allow_unsandboxed_commands,
-            enable_weaker_nested_sandbox=self._config.sandbox.enable_weaker_nested_sandbox,
-        )
-        if self._config.sandbox.enabled and _is_windows():
-            logger.warning(
-                "Sandbox is enabled but the current platform is Windows. "
-                "OS-level filesystem/network isolation (Seatbelt/bubblewrap) is "
-                "not supported on native Windows — sandbox settings will have no effect. "
-                "Use macOS, Linux, or WSL2 for full sandbox enforcement."
-            )
         self._clone_semaphore = asyncio.Semaphore(
             self._config.max_concurrent_agents
         )
@@ -204,6 +192,7 @@ class Runner:
         """
         start = time.monotonic()
         git_cfg = ctx.resolved_git()
+        effective_sandbox = self._resolve_sandbox(agent)
 
         try:
             # --- validate context ---
@@ -224,13 +213,37 @@ class Runner:
             # --- lifecycle: before ---
             await agent.before_execute(ctx)
 
+            # Claude Code rejects --dangerously-skip-permissions under root/sudo.
+            # Fail fast here so callers get a clear error without needing debug logs.
+            if (
+                not effective_sandbox.enabled
+                and self._config.permission_mode == "bypassPermissions"
+                and _is_root_user()
+            ):
+                raise AgentExecutionError(
+                    "Root execution does not support permission_mode='bypassPermissions'",
+                    detail=(
+                        "Claude Code rejects --dangerously-skip-permissions when "
+                        "running as root/sudo. Set RunnerConfig.permission_mode to "
+                        "'default' or 'acceptEdits', or enable sandbox so cckit "
+                        "switches to 'dontAsk'."
+                    ),
+                )
+
             # --- preflight: API connectivity check ---
             if self._preflight_check:
-                model = self._resolve_model(agent)
+                model = self._resolve_model(agent, ctx)
                 api_key = model.api_key or ctx.env.get("ANTHROPIC_API_KEY", "")
                 base_url = model.base_url or ctx.env.get("ANTHROPIC_BASE_URL", "")
                 check_api_connectivity(
                     api_key=api_key, base_url=base_url, model=model.model,
+                )
+
+            if effective_sandbox.enabled and _is_windows():
+                logger.warning(
+                    "Sandbox is enabled for agent %s, but native Windows does not support "
+                    "OS-level sandbox enforcement. Use macOS, Linux, or WSL2 for full isolation.",
+                    agent.name,
                 )
 
             # --- workspace ---
@@ -268,14 +281,14 @@ class Runner:
             # --- prompt ---
             prompt = ctx.prompt or ""
 
+            state = RunState(ctx.task_id)
             # --- build SDK options ---
-            model = self._resolve_model(agent)
+            model = self._resolve_model(agent, ctx)
             options = self._build_options(
-                agent, ctx, model, holder.workspace_dir, instruction,
+                agent, ctx, model, effective_sandbox, holder.workspace_dir, instruction, state,
             )
 
             # --- stream from SDK (through middleware chain) ---
-            state = RunState(ctx.task_id)
             query_fn = self._build_middleware_chain(ctx)
 
             async for message in query_fn(prompt, options, state):
@@ -383,22 +396,29 @@ class Runner:
     # Model resolution
     # ------------------------------------------------------------------
 
-    def _resolve_model(self, agent: Agent) -> ModelConfig:
+    def _resolve_model(self, agent: Agent, ctx: RunContext | None = None) -> ModelConfig:
         """Merge agent model_config with runner defaults."""
         agent_model = agent.model_config
         base = self._config.default_model
+        override_model = (ctx.model if ctx is not None else "").strip()
 
         if agent_model is None:
-            return base
+            if not override_model:
+                return base
+            return base.model_copy(update={"model": override_model})
 
         return ModelConfig(
-            model=agent_model.model or base.model,
+            model=override_model or agent_model.model or base.model,
             api_key=agent_model.api_key or base.api_key,
             base_url=agent_model.base_url or base.base_url,
             max_tokens=agent_model.max_tokens,
             max_turns=agent_model.max_turns if agent_model.max_turns > 0 else base.max_turns,
             timeout_seconds=agent_model.timeout_seconds or base.timeout_seconds,
         )
+
+    def _resolve_sandbox(self, agent: Agent) -> SandboxOptions:
+        """Return the sandbox policy for this run."""
+        return agent.sandbox_config or SandboxOptions()
 
     # ------------------------------------------------------------------
     # Context validation
@@ -477,8 +497,10 @@ class Runner:
         agent: Agent,
         ctx: RunContext,
         model: ModelConfig,
+        sandbox: SandboxOptions,
         workspace_dir: Path | None,
         instruction: str,
+        state: RunState,
     ) -> Any:
         """Construct ``ClaudeAgentOptions`` from Agent + RunContext + resolved model."""
         from claude_agent_sdk import (  # noqa: WPS433
@@ -509,7 +531,19 @@ class Runner:
         # build() returns a unified settings JSON string (or None when disabled).
         # ClaudeAgentOptions.sandbox must be None to avoid the SDK overwriting
         # the sandbox section in settings JSON with a SandboxSettings TypedDict.
-        settings_json = self._sandbox_builder.build(workspace_dir)
+        settings_json = SandboxConfigBuilder(
+            enabled=sandbox.enabled,
+            allow_write=list(sandbox.allow_write),
+            deny_write=list(sandbox.deny_write),
+            allow_read=list(sandbox.allow_read),
+            deny_read=list(sandbox.deny_read),
+            allowed_domains=list(sandbox.allowed_domains),
+            denied_domains=list(sandbox.denied_domains),
+            auto_allow_bash=sandbox.auto_allow_bash,
+            excluded_commands=list(sandbox.excluded_commands),
+            allow_unsandboxed_commands=sandbox.allow_unsandboxed_commands,
+            enable_weaker_nested_sandbox=sandbox.enable_weaker_nested_sandbox,
+        ).build(workspace_dir)
 
         # -- environment (Agent subprocess only — NO git credentials) --
         env: dict[str, str] = {}
@@ -537,6 +571,7 @@ class Runner:
 
         # -- assemble --
         def _stderr_cb(line: str) -> None:
+            state.observe_stderr(line)
             logger.debug("[CLI stderr] %s", line.rstrip())
 
         system_prompt: dict[str, str] = {
@@ -555,7 +590,7 @@ class Runner:
             # (including deny rules) and is only safe inside pre-isolated envs.
             permission_mode=(
                 "dontAsk"
-                if self._config.sandbox.enabled
+                if sandbox.enabled
                 else self._config.permission_mode
             ),
             env=env,

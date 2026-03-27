@@ -44,7 +44,11 @@ async def run_sdk_query(
             state.observe(message)
             yield message
     except Exception as exc:
+        stderr_text = state.stderr_text
+        detail = str(exc)
+        if stderr_text:
+            detail = f"{detail}\nClaude stderr:\n{stderr_text}"
         raise AgentExecutionError(
             f"SDK query failed: {exc}",
-            detail=str(exc),
+            detail=detail,
         ) from exc
