@@ -280,9 +280,9 @@ class Runner:
             prepared_model = await prepare_model_endpoint(model)
             if self._preflight_check:
                 check_api_connectivity(
-                    api_key="cckit-bridge",
+                    api_key=prepared_model.api_key or model.api_key,
                     base_url=prepared_model.base_url,
-                    model=model.model,
+                    model=prepared_model.model,
                 )
             options = self._build_options(
                 agent,

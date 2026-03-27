@@ -35,7 +35,7 @@ class Agent:
         Unique identifier for this agent (used in logs, sub-agent references).
     model:
         Model configuration. Accepts:
-        - A string like ``"claude-sonnet-4-6"`` or ``"openai/gpt-4o-mini"``
+        - A string like ``"anthropic/claude-sonnet-4-6"`` or ``"openai/gpt-4o-mini"``
         - A ``ModelConfig`` instance for full control over LiteLLM-style model, auth, and base URL
         - ``None`` to inherit from Runner defaults
     description:

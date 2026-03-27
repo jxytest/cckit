@@ -33,7 +33,7 @@ from cckit import Agent, Runner, RunContext, ModelConfig
 # 1. 定义 Agent
 assistant = Agent(
     name="assistant",
-    model=ModelConfig(model="claude-sonnet-4-6", api_key="sk-..."),
+    model=ModelConfig(model="anthropic/claude-sonnet-4-6", api_key="sk-..."),
     instruction="You are a helpful assistant.",
     tools=["Bash", "Read", "Write"],
 )
@@ -83,7 +83,7 @@ from cckit import Agent, ModelConfig
 # 最简用法
 assistant = Agent(
     name="assistant",
-    model=ModelConfig(model="claude-sonnet-4-6", api_key="sk-..."),
+    model=ModelConfig(model="anthropic/claude-sonnet-4-6", api_key="sk-..."),
     instruction="You are a helpful assistant.",
     tools=["Bash", "Read", "Write"],
 )
@@ -110,33 +110,54 @@ fix_agent = Agent(
 
 只用三个字段：`model`、`base_url`、`api_key`。
 
-- Anthropic 默认：只填 `api_key`
-- Anthropic 指定模型：`model="claude-sonnet-4-6"`
-- OpenAI：`model="openai/gpt-4o-mini"`，`base_url="https://api.openai.com/v1"`
-- OpenAI 兼容网关上的 Claude：`model="openai/claude-sonnet-4-6"`，`base_url="https://gateway.example.com/v1"`
-- Anthropic 兼容网关上的 Claude：`model="claude-sonnet-4-6"`，`base_url="https://gateway.example.com"`
+协议解析规则按以下优先级执行：
+
+- `model` 前缀优先：`anthropic/<model>` 走 Anthropic `messages`
+- `model` 前缀优先：`openai/<model>` 走 OpenAI `responses`
+- 其它有前缀模型：默认走 `chat/completions`
+- `model` 无前缀时：默认走 `chat/completions`
+- `model` 无前缀且 `base_url` 是全路径时：`.../v1/chat/completions`、`.../v1/responses`、`.../v1/messages` 会分别匹配到对应协议
+
+其中：
+
+- Anthropic 协议会直接透传给 Claude SDK
+- 非 Anthropic 协议会通过本地 Anthropic-compatible bridge 转换后再交给 Claude SDK
+- `chat/completions` 目标协议不支持的 Anthropic 顶层字段（例如 `output_config`、`context_management`）会在桥接前丢弃，避免透传到 OpenAI 风格 SDK 时报参数错误
+- `chat/completions` 若收到 Claude SDK 默认的较大 `max_tokens`（例如 32000），会按 `ModelConfig.max_tokens` 自动钳制，避免低上限模型直接报错
 
 示例：
+
+- Anthropic 默认：只填 `api_key`，默认模型为 `anthropic/claude-sonnet-4-6`
+- Anthropic 指定模型：`model="anthropic/claude-sonnet-4-6"`
+- OpenAI Responses：`model="openai/gpt-4o-mini"`，`base_url="https://api.openai.com/v1"`
+- OpenAI Chat：`model="gpt-4o-mini"`，`base_url="https://api.openai.com/v1/chat/completions"`
+- Anthropic gateway：`model="anthropic/claude-sonnet-4-6"`，`base_url="https://gateway.example.com"`
+- 三方 OpenAI-compatible Chat：`model="qwen-plus"`，`base_url="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"`
 
 ```python
 from cckit import ModelConfig
 
 anthropic_default = ModelConfig(api_key="sk-ant-...")
-anthropic_model = ModelConfig(model="claude-sonnet-4-6", api_key="sk-ant-...")
-openai_model = ModelConfig(
+anthropic_model = ModelConfig(model="anthropic/claude-sonnet-4-6", api_key="sk-ant-...")
+openai_responses_model = ModelConfig(
     model="openai/gpt-4o-mini",
     base_url="https://api.openai.com/v1",
     api_key="sk-openai",
 )
-claude_via_openai = ModelConfig(
-    model="openai/claude-sonnet-4-6",
-    base_url="https://gateway.example.com/v1",
-    api_key="sk-gateway",
+openai_chat_model = ModelConfig(
+    model="gpt-4o-mini",
+    base_url="https://api.openai.com/v1/chat/completions",
+    api_key="sk-openai",
 )
 claude_via_anthropic_gateway = ModelConfig(
-    model="claude-sonnet-4-6",
+    model="anthropic/claude-sonnet-4-6",
     base_url="https://gateway.example.com",
     api_key="sk-gateway",
+)
+qwen_via_dashscope_chat = ModelConfig(
+    model="qwen-plus",
+    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+    api_key="sk-dashscope",
 )
 ```
 
@@ -176,7 +197,7 @@ from cckit.middleware import ConcurrencyMiddleware, RetryMiddleware, LoggingMidd
 
 runner = Runner(
     config=RunnerConfig(
-        default_model=ModelConfig(model="claude-sonnet-4-6", api_key="sk-..."),
+        default_model=ModelConfig(model="anthropic/claude-sonnet-4-6", api_key="sk-..."),
     ),
     middlewares=[
         ConcurrencyMiddleware(max_concurrent=5),   # Semaphore 限流

@@ -1,9 +1,10 @@
-"""Internal LiteLLM-backed Anthropic bridge.
+"""Internal model endpoint preparation for Claude SDK execution.
 
 ``cckit`` exposes a single user-facing model type: ``ModelConfig``.
 All model strings, API bases, and credentials are interpreted with LiteLLM
-semantics, and the Claude SDK always talks to a temporary local
-Anthropic-compatible bridge.
+semantics. Non-Anthropic protocols are bridged through a temporary local
+Anthropic-compatible server; Anthropic protocol models are passed directly
+to the Claude SDK.
 """
 
 from __future__ import annotations
@@ -11,13 +12,32 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import logging
 import socket
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
 from cckit.exceptions import AgentExecutionError
-from cckit.types import ModelConfig
+from cckit.types import ModelConfig, TransportProtocol
+
+logger = logging.getLogger(__name__)
+
+_CHAT_DROPPED_ANTHROPIC_FIELDS = frozenset(
+    {
+        "context_management",
+        "output_config",
+    }
+)
+
+
+def _coerce_positive_int(value: Any) -> int | None:
+    """Best-effort coercion for positive integer request fields."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _jsonable(value: Any) -> Any:
@@ -67,11 +87,132 @@ class PreparedModelEndpoint:
             await self.bridge.aclose()
 
 
+@dataclass(slots=True)
+class ResolvedTransport:
+    """Concrete transport settings used for a single LiteLLM request."""
+
+    protocol: TransportProtocol
+    custom_llm_provider: str
+    model: str
+    api_base: str
+
+
+def _split_model_prefix(model: str) -> tuple[str | None, str]:
+    """Split the first provider prefix from a LiteLLM model string."""
+    if "/" not in model:
+        return None, model
+    prefix, bare_model = model.split("/", 1)
+    if not prefix or not bare_model:
+        return None, model
+    return prefix, bare_model
+
+
+def resolve_model_transport(model: ModelConfig) -> ResolvedTransport:
+    """Resolve the outgoing protocol from model prefix and full-path base URL hints."""
+    prefix, bare_model = _split_model_prefix(model.model)
+
+    if prefix == "openai":
+        return ResolvedTransport(
+            protocol="responses",
+            custom_llm_provider="openai",
+            model=bare_model,
+            api_base=model.base_url,
+        )
+    if prefix == "anthropic":
+        return ResolvedTransport(
+            protocol="anthropic",
+            custom_llm_provider="anthropic",
+            model=bare_model,
+            api_base=model.base_url,
+        )
+    if prefix:
+        return ResolvedTransport(
+            protocol="chat",
+            custom_llm_provider=prefix,
+            model=bare_model,
+            api_base=model.base_url,
+        )
+
+    if model.endpoint_protocol == "responses":
+        return ResolvedTransport(
+            protocol="responses",
+            custom_llm_provider="openai",
+            model=model.model,
+            api_base=model.base_url,
+        )
+    if model.endpoint_protocol == "anthropic":
+        return ResolvedTransport(
+            protocol="anthropic",
+            custom_llm_provider="anthropic",
+            model=model.model,
+            api_base=model.base_url,
+        )
+
+    return ResolvedTransport(
+        protocol="chat",
+        custom_llm_provider="custom_openai",
+        model=model.model,
+        api_base=model.base_url,
+    )
+
+
+def _sanitize_payload_for_transport(
+    payload: dict[str, Any],
+    transport: ResolvedTransport,
+) -> dict[str, Any]:
+    """Drop protocol-incompatible Anthropic params before calling LiteLLM."""
+    kwargs = dict(payload)
+    if transport.protocol != "chat":
+        return kwargs
+
+    dropped = sorted(
+        key for key in _CHAT_DROPPED_ANTHROPIC_FIELDS if key in kwargs
+    )
+    for key in dropped:
+        kwargs.pop(key, None)
+
+    if dropped:
+        logger.debug(
+            "Dropping Anthropic-only params for chat/completions transport: %s",
+            ", ".join(dropped),
+        )
+    return kwargs
+
+
+def _apply_max_tokens_policy(
+    payload: dict[str, Any],
+    transport: ResolvedTransport,
+    configured_max_tokens: int,
+) -> dict[str, Any]:
+    """Clamp Claude SDK defaults to the transport-safe model max_tokens."""
+    kwargs = dict(payload)
+    if transport.protocol != "chat":
+        return kwargs
+
+    configured = _coerce_positive_int(configured_max_tokens)
+    if configured is None:
+        return kwargs
+
+    requested = _coerce_positive_int(kwargs.get("max_tokens"))
+    if requested is None:
+        kwargs["max_tokens"] = configured
+        return kwargs
+    if requested > configured:
+        logger.debug(
+            "Clamping max_tokens for chat/completions transport: requested=%s configured=%s",
+            requested,
+            configured,
+        )
+        kwargs["max_tokens"] = configured
+    return kwargs
+
+
 class LiteLLMAnthropicBridge:
     """Temporary local Anthropic-compatible HTTP bridge backed by LiteLLM."""
 
     def __init__(self, model: ModelConfig) -> None:
         self._model = model
+        self._transport = resolve_model_transport(model)
         self._server: Any | None = None
         self._task: asyncio.Task[None] | None = None
         self._socket: socket.socket | None = None
@@ -242,14 +383,20 @@ class LiteLLMAnthropicBridge:
 
     def _build_litellm_kwargs(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Merge Anthropic request payload with provider credentials."""
-        kwargs = dict(payload)
-        kwargs["model"] = self._model.model
+        kwargs = _sanitize_payload_for_transport(payload, self._transport)
+        kwargs = _apply_max_tokens_policy(
+            kwargs,
+            self._transport,
+            self._model.max_tokens,
+        )
+        kwargs["model"] = self._transport.model
+        kwargs["custom_llm_provider"] = self._transport.custom_llm_provider
         kwargs.setdefault("max_tokens", self._model.max_tokens)
 
         if self._model.api_key:
             kwargs["api_key"] = self._model.api_key
-        if self._model.base_url:
-            kwargs["api_base"] = self._model.base_url
+        if self._transport.api_base:
+            kwargs["api_base"] = self._transport.api_base
 
         kwargs["timeout"] = self._model.timeout_seconds
         return kwargs
@@ -309,7 +456,16 @@ class LiteLLMAnthropicBridge:
 
 
 async def prepare_model_endpoint(model: ModelConfig) -> PreparedModelEndpoint:
-    """Resolve the SDK-facing endpoint for this run via the local LiteLLM bridge."""
+    """Resolve the SDK-facing endpoint for this run."""
+    transport = resolve_model_transport(model)
+    if transport.protocol == "anthropic":
+        return PreparedModelEndpoint(
+            model=transport.model,
+            api_key=model.api_key,
+            base_url=transport.api_base,
+            bridge=None,
+        )
+
     bridge = await LiteLLMAnthropicBridge(model).start()
     return PreparedModelEndpoint(
         model=model.model,

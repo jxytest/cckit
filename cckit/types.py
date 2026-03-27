@@ -15,7 +15,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import Field, PrivateAttr, field_validator
+from pydantic import Field, PrivateAttr, field_validator, model_validator
 
 from cckit._models import CustomModel
 
@@ -33,6 +33,23 @@ else:
 # ---------------------------------------------------------------------------
 
 
+TransportProtocol = Literal["chat", "responses", "anthropic"]
+
+
+def _detect_model_base_url_protocol(value: str) -> TransportProtocol | None:
+    """Infer the target protocol from a full endpoint URL, if present."""
+    normalized = value.strip().rstrip("/")
+    if not normalized:
+        return None
+    if normalized.endswith("/v1/chat/completions") or normalized.endswith("/chat/completions"):
+        return "chat"
+    if normalized.endswith("/v1/responses") or normalized.endswith("/responses"):
+        return "responses"
+    if normalized.endswith("/v1/messages") or normalized.endswith("/messages"):
+        return "anthropic"
+    return None
+
+
 def _normalize_model_base_url(value: str) -> str:
     """Normalize a provider API base URL.
 
@@ -45,6 +62,7 @@ def _normalize_model_base_url(value: str) -> str:
         return ""
     suffix_rewrites = (
         ("/v1/messages", ""),
+        ("/messages", ""),
         ("/v1/chat/completions", "/v1"),
         ("/chat/completions", ""),
         ("/v1/responses", "/v1"),
@@ -67,9 +85,9 @@ class ModelConfig(CustomModel):
 
     Usage::
 
-        ModelConfig(model="claude-sonnet-4-6")
+        ModelConfig(model="anthropic/claude-sonnet-4-6")
         ModelConfig(model="openai/gpt-4o-mini", api_key="sk-...", base_url="https://api.openai.com/v1")
-        ModelConfig(model="openai/claude-sonnet-4-6", api_key="sk-...", base_url="https://gateway.example.com/v1")
+        ModelConfig(model="anthropic/claude-sonnet-4-6", api_key="sk-...", base_url="https://gateway.example.com")
 
     Notes::
 
@@ -77,12 +95,26 @@ class ModelConfig(CustomModel):
         passed to LiteLLM as ``api_base``.
     """
 
-    model: str = "claude-sonnet-4-6"
+    model: str = "anthropic/claude-sonnet-4-6"
     api_key: str = ""  # empty = let provider-specific env/defaults resolve it
     base_url: str = ""  # provider or gateway API base
+    endpoint_protocol: TransportProtocol | None = Field(default=None, exclude=True)
     max_tokens: int = 16384
     max_turns: int = 50
     timeout_seconds: int = 300
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_base_url_fields(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+
+        data = dict(value)
+        raw_base_url = str(data.get("base_url", "") or "")
+        if raw_base_url:
+            data["endpoint_protocol"] = _detect_model_base_url_protocol(raw_base_url)
+            data["base_url"] = _normalize_model_base_url(raw_base_url)
+        return data
 
     @field_validator("base_url", mode="before")
     @classmethod
@@ -511,7 +543,7 @@ class RunnerConfig(CustomModel):
             model_config = {"env_prefix": "ANTHROPIC_", "case_sensitive": False}
             api_key: str = ""
             base_url: str = ""
-            model: str = "claude-sonnet-4-6"
+            model: str = "anthropic/claude-sonnet-4-6"
             max_tokens: int = 16384
             max_turns: int = 50
             timeout_seconds: int = 300

@@ -43,7 +43,12 @@ from cckit import (  # noqa: F401 — test_imports verifies all public API symbo
     WorkspaceConfig,
     WorkspaceError,
 )
-from cckit._engine.model_bridge import PreparedModelEndpoint, prepare_model_endpoint
+from cckit._engine.model_bridge import (
+    LiteLLMAnthropicBridge,
+    PreparedModelEndpoint,
+    prepare_model_endpoint,
+    resolve_model_transport,
+)
 from cckit._engine.state import RunState
 from cckit.git.gitlab_client import GitLabClient
 from cckit.sandbox.config import SandboxConfigBuilder
@@ -76,12 +81,12 @@ def test_agent_with_model():
     """Agent with ModelConfig."""
     agent = Agent(
         name="with-model",
-        model=ModelConfig(model="claude-sonnet-4-6", api_key="sk-test"),
+        model=ModelConfig(model="anthropic/claude-sonnet-4-6", api_key="sk-test"),
         instruction="Hello",
         tools=["Bash"],
     )
     assert agent.model_config is not None
-    assert agent.model_config.model == "claude-sonnet-4-6"
+    assert agent.model_config.model == "anthropic/claude-sonnet-4-6"
     assert agent.model_config.api_key == "sk-test"
 
 
@@ -131,28 +136,95 @@ def test_model_config_normalizes_messages_endpoint():
         base_url="http://localhost:4000/v1/messages",
     )
     assert cfg.base_url == "http://localhost:4000"
+    assert cfg.endpoint_protocol == "anthropic"
 
 
 def test_model_config_normalizes_chat_completions_endpoint():
     """ModelConfig strips a pasted /chat/completions suffix."""
     cfg = ModelConfig(
-        model="openai/gpt-4o-mini",
+        model="gpt-4o-mini",
         base_url="https://api.openai.com/v1/chat/completions",
     )
     assert cfg.base_url == "https://api.openai.com/v1"
+    assert cfg.endpoint_protocol == "chat"
 
 
 def test_model_config_normalizes_responses_endpoint():
     """ModelConfig strips a pasted /responses suffix."""
     cfg = ModelConfig(
-        model="openai/gpt-4o-mini",
+        model="gpt-4o-mini",
         base_url="https://api.openai.com/v1/responses",
     )
     assert cfg.base_url == "https://api.openai.com/v1"
+    assert cfg.endpoint_protocol == "responses"
+
+
+def test_resolve_model_transport_defaults_unprefixed_models_to_chat():
+    """Unprefixed models default to chat/completions."""
+    transport = resolve_model_transport(
+        ModelConfig(
+            model="gpt-4o-mini",
+            base_url="https://api.openai.com/v1",
+        )
+    )
+    assert transport.protocol == "chat"
+    assert transport.custom_llm_provider == "custom_openai"
+    assert transport.model == "gpt-4o-mini"
+    assert transport.api_base == "https://api.openai.com/v1"
+
+
+def test_resolve_model_transport_uses_prefix_before_base_url_hint():
+    """Explicit model prefixes win over any full-path base URL hint."""
+    transport = resolve_model_transport(
+        ModelConfig(
+            model="openai/gpt-4o-mini",
+            base_url="https://api.openai.com/v1/chat/completions",
+        )
+    )
+    assert transport.protocol == "responses"
+    assert transport.custom_llm_provider == "openai"
+    assert transport.model == "gpt-4o-mini"
+    assert transport.api_base == "https://api.openai.com/v1"
+
+
+def test_resolve_model_transport_uses_base_url_hint_for_unprefixed_models():
+    """A full-path base URL selects the matching protocol when the model has no prefix."""
+    anthropic_transport = resolve_model_transport(
+        ModelConfig(
+            model="claude-sonnet-4-6",
+            base_url="https://gateway.example.com/v1/messages",
+        )
+    )
+    assert anthropic_transport.protocol == "anthropic"
+    assert anthropic_transport.custom_llm_provider == "anthropic"
+    assert anthropic_transport.model == "claude-sonnet-4-6"
+    assert anthropic_transport.api_base == "https://gateway.example.com"
+
+    responses_transport = resolve_model_transport(
+        ModelConfig(
+            model="gpt-4o-mini",
+            base_url="https://api.openai.com/v1/responses",
+        )
+    )
+    assert responses_transport.protocol == "responses"
+    assert responses_transport.custom_llm_provider == "openai"
+    assert responses_transport.model == "gpt-4o-mini"
+    assert responses_transport.api_base == "https://api.openai.com/v1"
+
+    chat_transport = resolve_model_transport(
+        ModelConfig(
+            model="qwen-plus",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        )
+    )
+    assert chat_transport.protocol == "chat"
+    assert chat_transport.custom_llm_provider == "custom_openai"
+    assert chat_transport.model == "qwen-plus"
+    assert chat_transport.api_base == "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 
 def test_prepare_model_endpoint_uses_litellm_bridge_for_plain_model(monkeypatch):
-    """Unprefixed models should still route through the local LiteLLM bridge."""
+    """Unprefixed models still use the local bridge, defaulting to chat semantics."""
     async def fake_start(self):
         self.base_url = "http://127.0.0.1:41001"
         return self
@@ -172,10 +244,12 @@ def test_prepare_model_endpoint_uses_litellm_bridge_for_plain_model(monkeypatch)
     assert prepared.base_url == "http://127.0.0.1:41001"
     assert prepared.bridge is not None
     assert prepared.bridge._model.model == "claude-sonnet-4-6"
+    assert prepared.bridge._transport.protocol == "chat"
+    assert prepared.bridge._transport.custom_llm_provider == "custom_openai"
 
 
 def test_prepare_model_endpoint_missing_litellm_is_clear(monkeypatch):
-    """Any model should fail clearly if LiteLLM bridge dependencies are missing."""
+    """Bridge-backed models should fail clearly if LiteLLM bridge deps are missing."""
     def fake_build_app(self):
         raise AgentExecutionError("cckit model execution requires LiteLLM bridge dependencies")
 
@@ -188,8 +262,44 @@ def test_prepare_model_endpoint_missing_litellm_is_clear(monkeypatch):
         asyncio.run(prepare_model_endpoint(ModelConfig(model="claude-sonnet-4-6")))
 
 
+def test_prepare_model_endpoint_passes_anthropic_models_directly_to_sdk():
+    """Anthropic-prefixed models bypass the local bridge and use direct SDK settings."""
+    prepared = asyncio.run(
+        prepare_model_endpoint(
+            ModelConfig(
+                model="anthropic/claude-sonnet-4-6",
+                api_key="sk-anthropic",
+                base_url="https://api.anthropic.example.com",
+            )
+        )
+    )
+
+    assert prepared.model == "claude-sonnet-4-6"
+    assert prepared.api_key == "sk-anthropic"
+    assert prepared.base_url == "https://api.anthropic.example.com"
+    assert prepared.bridge is None
+
+
+def test_prepare_model_endpoint_uses_base_url_hint_for_direct_anthropic_sdk_path():
+    """Unprefixed models with an Anthropic endpoint hint should bypass the bridge."""
+    prepared = asyncio.run(
+        prepare_model_endpoint(
+            ModelConfig(
+                model="claude-sonnet-4-6",
+                api_key="sk-anthropic",
+                base_url="https://gateway.example.com/v1/messages",
+            )
+        )
+    )
+
+    assert prepared.model == "claude-sonnet-4-6"
+    assert prepared.api_key == "sk-anthropic"
+    assert prepared.base_url == "https://gateway.example.com"
+    assert prepared.bridge is None
+
+
 def test_prepare_model_endpoint_prefixed_model_uses_bridge(monkeypatch):
-    """Prefixed models should pass through to LiteLLM unchanged."""
+    """OpenAI-prefixed models should force Responses API routing through the bridge."""
     async def fake_start(self):
         self.base_url = "http://127.0.0.1:41001"
         return self
@@ -210,6 +320,100 @@ def test_prepare_model_endpoint_prefixed_model_uses_bridge(monkeypatch):
     assert prepared.base_url == "http://127.0.0.1:41001"
     assert prepared.bridge is not None
     assert prepared.bridge._model.model == "openai/gpt-4o-mini"
+    assert prepared.bridge._transport.protocol == "responses"
+    assert prepared.bridge._transport.custom_llm_provider == "openai"
+
+
+def test_bridge_chat_transport_drops_anthropic_only_fields():
+    """Chat/completions transport must not forward Anthropic-only top-level params."""
+    bridge = LiteLLMAnthropicBridge(
+        ModelConfig(
+            model="qwen-plus",
+            api_key="sk-chat",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        )
+    )
+
+    kwargs = bridge._build_litellm_kwargs(
+        {
+            "messages": [{"role": "user", "content": "hello"}],
+            "output_config": {"format": "json_schema"},
+            "context_management": {"edits": []},
+        }
+    )
+
+    assert "output_config" not in kwargs
+    assert "context_management" not in kwargs
+    assert kwargs["custom_llm_provider"] == "custom_openai"
+    assert kwargs["model"] == "qwen-plus"
+    assert kwargs["api_base"] == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+
+def test_bridge_chat_transport_clamps_max_tokens_to_model_config():
+    """Chat/completions transport should cap Claude's larger default max_tokens."""
+    bridge = LiteLLMAnthropicBridge(
+        ModelConfig(
+            model="qwen-plus",
+            api_key="sk-chat",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+            max_tokens=16384,
+        )
+    )
+
+    kwargs = bridge._build_litellm_kwargs(
+        {
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 32000,
+        }
+    )
+
+    assert kwargs["max_tokens"] == 16384
+
+
+def test_bridge_responses_transport_preserves_anthropic_only_fields():
+    """Responses transport keeps Anthropic pass-through fields for LiteLLM to handle."""
+    bridge = LiteLLMAnthropicBridge(
+        ModelConfig(
+            model="openai/gpt-4o-mini",
+            api_key="sk-openai",
+            base_url="https://api.openai.com/v1",
+        )
+    )
+
+    kwargs = bridge._build_litellm_kwargs(
+        {
+            "messages": [{"role": "user", "content": "hello"}],
+            "output_config": {"format": "json_schema"},
+            "context_management": {"edits": []},
+        }
+    )
+
+    assert kwargs["output_config"] == {"format": "json_schema"}
+    assert kwargs["context_management"] == {"edits": []}
+    assert kwargs["custom_llm_provider"] == "openai"
+    assert kwargs["model"] == "gpt-4o-mini"
+    assert kwargs["api_base"] == "https://api.openai.com/v1"
+
+
+def test_bridge_responses_transport_does_not_clamp_max_tokens():
+    """Responses transport should preserve the SDK-requested max_tokens."""
+    bridge = LiteLLMAnthropicBridge(
+        ModelConfig(
+            model="openai/gpt-4o-mini",
+            api_key="sk-openai",
+            base_url="https://api.openai.com/v1",
+            max_tokens=16384,
+        )
+    )
+
+    kwargs = bridge._build_litellm_kwargs(
+        {
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 32000,
+        }
+    )
+
+    assert kwargs["max_tokens"] == 32000
 
 
 def test_agent_with_sub_agents():
@@ -282,7 +486,7 @@ def test_types():
     assert result.status == "completed"
     assert result.output_text == ""
 
-    model = ModelConfig(model="claude-sonnet-4-6", api_key="sk-test")
+    model = ModelConfig(model="anthropic/claude-sonnet-4-6", api_key="sk-test")
     assert model.max_tokens == 16384
 
     sandbox = SandboxOptions(enabled=True)
@@ -304,7 +508,7 @@ def test_run_context_model_overrides_runner_default():
     runner = Runner(
         config=RunnerConfig(
             default_model=ModelConfig(
-                model="claude-sonnet-4-6",
+                model="anthropic/claude-sonnet-4-6",
                 api_key="sk-test",
                 base_url="https://proxy.test",
             ),
@@ -321,7 +525,7 @@ def test_build_options_bridge_env_overrides_ctx_env():
     """Bridge transport settings must win over conflicting ctx.env Anthropic vars."""
     runner = Runner(
         config=RunnerConfig(
-            default_model=ModelConfig(model="claude-sonnet-4-6"),
+            default_model=ModelConfig(model="anthropic/claude-sonnet-4-6"),
         )
     )
     agent = Agent(name="bridge-env", tools=["Read"])
