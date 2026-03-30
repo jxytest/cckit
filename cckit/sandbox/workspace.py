@@ -71,12 +71,46 @@ class WorkspaceManager:
         """
         logger.info("Suspended workspace (preserved for resume): %s", workspace)
 
-    async def resume(self, workspace: Path) -> Path:
+    async def resume(
+        self, workspace: Path, *, recreate: bool = False
+    ) -> tuple[Path, bool]:
         """Validate and return an existing workspace for a resumed session.
 
-        Raises :class:`WorkspaceError` if the directory no longer exists.
+        Parameters
+        ----------
+        workspace:
+            The workspace directory to resume.
+        recreate:
+            If ``True`` and the directory no longer exists, recreate it at
+            the same path instead of raising.  The caller is responsible for
+            re-cloning / re-provisioning as needed.
+
+        Returns
+        -------
+        tuple[Path, bool]
+            ``(workspace_path, was_recreated)`` — the second element is
+            ``True`` when the directory was missing and had to be recreated.
+
+        Raises
+        ------
+        WorkspaceError
+            If the directory does not exist and *recreate* is ``False``, or
+            if the path exists but is not a directory.
         """
         if not workspace.exists():
+            if recreate:
+                try:
+                    workspace.mkdir(parents=True, exist_ok=True)
+                except OSError as exc:
+                    raise WorkspaceError(
+                        f"Failed to recreate workspace: {workspace}",
+                        detail=str(exc),
+                    ) from exc
+                logger.warning(
+                    "Workspace recreated at original path (was missing): %s",
+                    workspace,
+                )
+                return workspace, True
             raise WorkspaceError(
                 f"Cannot resume — workspace not found: {workspace}",
             )
@@ -85,4 +119,4 @@ class WorkspaceManager:
                 f"Cannot resume — path is not a directory: {workspace}",
             )
         logger.info("Resumed workspace: %s", workspace)
-        return workspace
+        return workspace, False

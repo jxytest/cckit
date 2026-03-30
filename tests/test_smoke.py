@@ -591,8 +591,9 @@ async def test_workspace():
         assert ws.exists()
 
         # Resume
-        resumed = await mgr.resume(ws)
+        resumed, was_recreated = await mgr.resume(ws)
         assert resumed == ws
+        assert not was_recreated
 
         # Cleanup
         await mgr.cleanup(ws)

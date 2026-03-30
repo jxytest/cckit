@@ -241,14 +241,23 @@ class Runner:
 
             # --- workspace ---
             if ctx.workspace.enabled:
+                needs_init = False
                 if ctx.resume_session_id and ctx.workspace_dir:
-                    # Resume: reuse existing workspace
-                    holder.workspace_dir = await self._workspace.resume(ctx.workspace_dir)
+                    # Resume: reuse existing workspace, or recreate at the
+                    # same path when the directory was cleaned up.
+                    holder.workspace_dir, was_recreated = (
+                        await self._workspace.resume(
+                            ctx.workspace_dir, recreate=True
+                        )
+                    )
+                    needs_init = was_recreated
                 else:
                     # First execution: create a fresh workspace
                     holder.workspace_dir = await self._workspace.create(ctx.task_id)
                     ctx.workspace_dir = holder.workspace_dir
+                    needs_init = True
 
+                if needs_init:
                     if git_cfg.clone and git_cfg.repo_url:
                         git_env = git_cfg.build_git_env() or None
                         async with self._clone_semaphore:
