@@ -185,11 +185,12 @@ class Runner:
             4. Create/resume workspace
             5. Git clone (if needed, skipped on resume)
             6. Provision skills (if needed, skipped on resume)
-            7. Resolve instruction (string or callable)
-            8. Build SDK options (model, tools, sub-agents, MCP, sandbox)
-            9. [Middleware chain] → SDK bridge → yield SDK messages
-            10. agent.after_execute(ctx, result) or agent.error_execute(ctx, error)
-            11. Cleanup/suspend workspace
+            7. agent.prepare_workspace(ctx) — seed files (skipped on resume)
+            8. Resolve instruction (string or callable)
+            9. Build SDK options (model, tools, sub-agents, MCP, sandbox)
+            10. [Middleware chain] → SDK bridge → yield SDK messages
+            11. agent.after_execute(ctx, result) or agent.error_execute(ctx, error)
+            12. Cleanup/suspend workspace
         """
         start = time.monotonic()
         git_cfg = ctx.resolved_git()
@@ -276,6 +277,9 @@ class Runner:
                         if agent.skills_dir:
                             provisioner = SkillProvisioner(skills_dir=agent.skills_dir)
                         await provisioner.provision(agent.skills, holder.workspace_dir)
+
+                    # --- lifecycle: prepare_workspace ---
+                    await agent.prepare_workspace(ctx)
 
             # --- instruction ---
             instruction = agent.resolve_instruction(ctx)

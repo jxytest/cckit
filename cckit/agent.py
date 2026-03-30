@@ -71,6 +71,10 @@ class Agent:
     Lifecycle callbacks (optional):
     on_before:
         ``async def (ctx: RunContext) -> None`` — called before execution.
+    on_prepare_workspace:
+        ``async def (ctx: RunContext) -> None`` — called after workspace creation
+        and git clone, but before the agent starts.  ``ctx.workspace_dir`` is
+        guaranteed to be set.  Use this to seed files into the workspace.
     on_after:
         ``async def (ctx: RunContext, result: AgentResult) -> None`` — called after.
     on_error:
@@ -94,6 +98,7 @@ class Agent:
         sandbox: SandboxOptions | None = None,
         # Lifecycle callbacks
         on_before: LifecycleBeforeFn | None = None,
+        on_prepare_workspace: LifecycleBeforeFn | None = None,
         on_after: LifecycleAfterFn | None = None,
         on_error: LifecycleErrorFn | None = None,
     ) -> None:
@@ -121,6 +126,7 @@ class Agent:
 
         # Lifecycle hooks
         self._on_before = on_before
+        self._on_prepare_workspace = on_prepare_workspace
         self._on_after = on_after
         self._on_error = on_error
 
@@ -156,6 +162,18 @@ class Agent:
         """Called before agent execution. Override or pass ``on_before`` callback."""
         if self._on_before:
             await self._on_before(ctx)
+
+    async def prepare_workspace(self, ctx: RunContext) -> None:
+        """Called after workspace creation and git clone, before agent starts.
+
+        ``ctx.workspace_dir`` is guaranteed to be set at this point.
+        Use this hook to seed files into the workspace (e.g. download
+        requirement documents, write configuration files).
+
+        Override or pass ``on_prepare_workspace`` callback.
+        """
+        if self._on_prepare_workspace:
+            await self._on_prepare_workspace(ctx)
 
     async def after_execute(self, ctx: RunContext, result: AgentResult) -> None:
         """Called after agent execution. Override or pass ``on_after`` callback."""
