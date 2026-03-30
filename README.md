@@ -347,11 +347,10 @@ playwright_mcp_server(extra_args=["--timeout", "30000"])   # 追加 CLI 参数
 
 ### 自定义 SDK MCP 工具
 
-使用 `@tool` 装饰器定义进程内工具，返回 `McpSdkServerConfig`：
+使用 `@tool` 装饰器定义进程内工具，`create_sdk_mcp_server` 直接返回 `McpSdkServerConfig`：
 
 ```python
 from claude_agent_sdk import create_sdk_mcp_server, tool
-from claude_agent_sdk.types import McpSdkServerConfig
 from cckit import Agent
 
 @tool("fetch_data", "Fetch data from the platform", {"id": str})
@@ -359,11 +358,12 @@ async def fetch_data(args: dict) -> dict:
     result = await my_api.get(args["id"])
     return {"content": [{"type": "text", "text": result}]}
 
-server = create_sdk_mcp_server("my-tools", tools=[fetch_data])
+# create_sdk_mcp_server already returns McpSdkServerConfig, no need to wrap again
+mcp_server = create_sdk_mcp_server("my-tools", tools=[fetch_data])
 
 agent = Agent(
     name="my-agent",
-    mcp_servers={"my-tools": McpSdkServerConfig(type="sdk", name="my-tools", instance=server)},
+    mcp_servers={"my-tools": mcp_server},
 )
 ```
 

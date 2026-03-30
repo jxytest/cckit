@@ -55,18 +55,16 @@ def sdk_mcp_server() -> Any:
     To define your own tools, adapt the pattern below::
 
         from claude_agent_sdk import create_sdk_mcp_server, tool
-        from claude_agent_sdk.types import McpSdkServerConfig
 
         @tool("fetch_data", "Fetch data from the platform", {"id": str})
         async def fetch_data(args: dict) -> dict:
             result = await my_api.get(args["id"])
             return {"content": [{"type": "text", "text": result}]}
 
-        server = create_sdk_mcp_server("my-tools", tools=[fetch_data])
-        config = McpSdkServerConfig(type="sdk", name="my-tools", instance=server)
+        # create_sdk_mcp_server already returns McpSdkServerConfig
+        config = create_sdk_mcp_server("my-tools", tools=[fetch_data])
     """
     from claude_agent_sdk import create_sdk_mcp_server, tool  # noqa: WPS433
-    from claude_agent_sdk.types import McpSdkServerConfig  # noqa: WPS433
 
     @tool(
         "echo",
@@ -76,8 +74,7 @@ def sdk_mcp_server() -> Any:
     async def echo(args: dict[str, Any]) -> dict[str, Any]:
         return {"content": [{"type": "text", "text": args.get("message", "")}]}
 
-    server = create_sdk_mcp_server("example-tools", tools=[echo])
-    return McpSdkServerConfig(type="sdk", name="example-tools", instance=server)
+    return create_sdk_mcp_server("example-tools", tools=[echo])
 
 
 # ---------------------------------------------------------------------------
