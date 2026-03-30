@@ -386,6 +386,22 @@ class AgentResult(CustomModel):
     final_message: SDKResultMessage | None = Field(default=None, exclude=True)
     extra: dict[str, Any] = Field(default_factory=dict)
 
+    def to_summary_dict(self) -> dict[str, Any]:
+        """Return a dict suitable for persisting execution results to a database.
+
+        Maps AgentResult fields to common column names used by turn/task models.
+        """
+        return {
+            'status': self.status.value if hasattr(self.status, 'value') else str(self.status),
+            'output_text': self.output_text or None,
+            'error_message': self.error_message or None,
+            'stop_reason': self.stop_reason or None,
+            'cost_usd': self.cost_usd,
+            'usage_payload': self.usage,
+            'is_error': self.is_error,
+            'session_id': self.session_id or None,
+        }
+
 
 # ---------------------------------------------------------------------------
 # Stream result wrapper

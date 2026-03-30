@@ -312,6 +312,11 @@ class Runner:
             query_fn = self._build_middleware_chain(ctx)
 
             async for message in query_fn(prompt, options, state):
+                # Lifecycle: on_message
+                try:
+                    await agent.on_message_received(ctx, message)
+                except Exception:
+                    logger.debug("on_message callback failed", exc_info=True)
                 yield message
 
             # --- build result ---
@@ -413,6 +418,45 @@ class Runner:
                     await self._workspace.cleanup(holder.workspace_dir)
             if prepared_model is not None:
                 await prepared_model.aclose()
+
+    # ------------------------------------------------------------------
+    # Session persistence helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def read_session(session_id: str, workspace_dir: Path) -> str | None:
+        """Read a Claude Code session JSONL from ~/.claude/projects/."""
+        try:
+            from claude_agent_sdk._internal.sessions import (
+                _canonicalize_path,
+                _find_project_dir,
+            )
+            project_dir = _find_project_dir(_canonicalize_path(str(workspace_dir)))
+            if project_dir is None:
+                return None
+            session_file = project_dir / f'{session_id}.jsonl'
+            if session_file.exists():
+                return session_file.read_text(encoding='utf-8')
+        except Exception:
+            logger.debug('Failed to read session JSONL for %s', session_id, exc_info=True)
+        return None
+
+    @staticmethod
+    def restore_session(session_id: str, workspace_dir: Path, content: str) -> None:
+        """Restore a persisted session JSONL so --resume works."""
+        try:
+            from claude_agent_sdk._internal.sessions import (
+                _canonicalize_path,
+                _get_project_dir,
+            )
+            project_dir = _get_project_dir(_canonicalize_path(str(workspace_dir)))
+            project_dir.mkdir(parents=True, exist_ok=True)
+            session_file = project_dir / f'{session_id}.jsonl'
+            if not session_file.exists():
+                session_file.write_text(content, encoding='utf-8')
+                logger.info('Restored session JSONL for %s to %s', session_id, session_file)
+        except Exception:
+            logger.warning('Failed to restore session JSONL for %s', session_id, exc_info=True)
 
     # ------------------------------------------------------------------
     # Model resolution

@@ -24,6 +24,7 @@ InstructionFn = Callable[[RunContext], str]
 LifecycleBeforeFn = Callable[[RunContext], Any]  # async def (ctx) -> None
 LifecycleAfterFn = Callable[[RunContext, AgentResult], Any]  # async def (ctx, result) -> None
 LifecycleErrorFn = Callable[[RunContext, Exception], Any]  # async def (ctx, error) -> None
+LifecycleMessageFn = Callable[[RunContext, Any], Any]  # async def (ctx, message) -> None
 
 
 class Agent:
@@ -101,6 +102,7 @@ class Agent:
         on_prepare_workspace: LifecycleBeforeFn | None = None,
         on_after: LifecycleAfterFn | None = None,
         on_error: LifecycleErrorFn | None = None,
+        on_message: LifecycleMessageFn | None = None,
     ) -> None:
         self.name = name
         self.description = description
@@ -129,6 +131,7 @@ class Agent:
         self._on_prepare_workspace = on_prepare_workspace
         self._on_after = on_after
         self._on_error = on_error
+        self._on_message = on_message
 
     # ------------------------------------------------------------------
     # Resolve instruction at runtime
@@ -184,6 +187,11 @@ class Agent:
         """Called on execution failure. Override or pass ``on_error`` callback."""
         if self._on_error:
             await self._on_error(ctx, error)
+
+    async def on_message_received(self, ctx: RunContext, message: Any) -> None:
+        """Called for each streaming message. Override or pass ``on_message`` callback."""
+        if self._on_message:
+            await self._on_message(ctx, message)
 
     # ------------------------------------------------------------------
     # Display
