@@ -8,6 +8,7 @@ These are pure data — no SDK dependency, no I/O.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import suppress
@@ -437,6 +438,9 @@ class StreamResult:
         async for message in stream:
             print(message)
         final = stream.result  # same object the on_after callback received
+
+        # Abort from another coroutine:
+        stream.abort()  # cancels the consumer task, triggers cleanup
     """
 
     def __init__(
@@ -446,12 +450,35 @@ class StreamResult:
     ) -> None:
         self._aiter = aiter
         self._holder = holder
+        self._aborted = False
+        self._consumer_task: Any | None = None  # asyncio.Task set during iteration
 
     def __aiter__(self) -> StreamResult:
         return self
 
     async def __anext__(self) -> SDKMessage:
+        if self._aborted:
+            raise asyncio.CancelledError("Stream aborted")
+        self._consumer_task = asyncio.current_task()
         return await self._aiter.__anext__()
+
+    def abort(self) -> None:
+        """Abort the running stream. Safe to call from any coroutine. Idempotent.
+
+        Sets the aborted flag and cancels the consumer's asyncio task,
+        causing ``CancelledError`` to propagate through the generator chain
+        and trigger proper cleanup (including killing subprocesses).
+        """
+        if self._aborted:
+            return
+        self._aborted = True
+        if self._consumer_task is not None and not self._consumer_task.done():
+            self._consumer_task.cancel()
+
+    @property
+    def is_aborted(self) -> bool:
+        """Whether :meth:`abort` has been called."""
+        return self._aborted
 
     @property
     def result(self) -> AgentResult | None:
