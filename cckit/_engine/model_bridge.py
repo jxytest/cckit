@@ -14,6 +14,8 @@ import importlib
 import json
 import logging
 import socket
+import uuid as _uuid
+from collections.abc import AsyncIterator
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
@@ -305,13 +307,12 @@ class LiteLLMAnthropicBridge:
 
         async def create_message(request: Any) -> Any:
             payload = await request.json()
-            kwargs = self._build_litellm_kwargs(payload)
 
             try:
                 if bool(payload.get("stream")):
-                    stream = await self._call_litellm_messages(
+                    stream = await self._call_litellm_streaming(
                         litellm,
-                        kwargs,
+                        payload,
                     )
                     return streaming_response(
                         self._stream_events(stream),
@@ -322,6 +323,7 @@ class LiteLLMAnthropicBridge:
                         },
                     )
 
+                kwargs = self._build_litellm_kwargs(payload)
                 response = await self._call_litellm_messages(
                     litellm,
                     kwargs,
@@ -401,12 +403,271 @@ class LiteLLMAnthropicBridge:
         kwargs["timeout"] = self._model.timeout_seconds
         return kwargs
 
+    async def _call_litellm_streaming(
+        self,
+        litellm_mod: Any,
+        payload: dict[str, Any],
+    ) -> AsyncIterator[bytes]:
+        """Stream via ``litellm.acompletion`` with cckit's own SSE conversion.
+
+        LiteLLM's ``AnthropicStreamWrapper`` discards the trigger chunk's
+        ``processed_chunk`` during text→tool_use content-block transitions.
+        Some OpenAI-compatible providers (e.g. 网易 aigc-api) batch all
+        tool_call arguments into a single chunk instead of streaming them
+        incrementally — causing the entire ``input`` (``file_path``,
+        ``content``, …) to be silently lost.
+
+        This method bypasses the buggy wrapper: it reuses LiteLLM's
+        Anthropic→OpenAI *request* conversion but implements its own
+        OpenAI→Anthropic *response* SSE conversion that correctly
+        preserves all tool_call arguments regardless of chunk granularity.
+        """
+        try:
+            from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
+                LiteLLMMessagesToCompletionTransformationHandler as _Handler,
+            )
+        except ImportError:
+            logger.warning(
+                "LiteLLM internal adapter API unavailable; "
+                "falling back to litellm.anthropic.messages.acreate"
+            )
+            kwargs = self._build_litellm_kwargs(payload)
+            return await litellm_mod.anthropic.messages.acreate(**kwargs)
+
+        # Apply the same max_tokens clamping as _build_litellm_kwargs.
+        max_tokens = payload.get("max_tokens", self._model.max_tokens)
+        if self._transport.protocol == "chat":
+            configured = _coerce_positive_int(self._model.max_tokens)
+            requested = _coerce_positive_int(max_tokens)
+            if configured and requested and requested > configured:
+                logger.debug(
+                    "Clamping max_tokens for streaming: requested=%s configured=%s",
+                    requested,
+                    configured,
+                )
+                max_tokens = configured
+
+        # Provider credentials forwarded via extra_kwargs.
+        extra: dict[str, Any] = {
+            "custom_llm_provider": self._transport.custom_llm_provider,
+            "timeout": self._model.timeout_seconds,
+        }
+        if self._model.api_key:
+            extra["api_key"] = self._model.api_key
+        if self._transport.api_base:
+            extra["api_base"] = self._transport.api_base
+
+        # Anthropic→OpenAI request conversion (reuse LiteLLM's own adapter).
+        completion_kwargs, tool_name_mapping = _Handler._prepare_completion_kwargs(
+            max_tokens=max_tokens,
+            messages=payload["messages"],
+            model=self._transport.model,
+            stream=True,
+            system=payload.get("system"),
+            temperature=payload.get("temperature"),
+            tools=payload.get("tools"),
+            tool_choice=payload.get("tool_choice"),
+            thinking=payload.get("thinking"),
+            top_k=payload.get("top_k"),
+            top_p=payload.get("top_p"),
+            metadata=payload.get("metadata"),
+            stop_sequences=payload.get("stop_sequences"),
+            output_format=payload.get("output_format"),
+            extra_kwargs=extra,
+        )
+
+        openai_stream = await litellm_mod.acompletion(**completion_kwargs)
+
+        return self._openai_stream_to_anthropic_sse(
+            openai_stream,
+            tool_name_mapping=tool_name_mapping,
+        )
+
+    async def _openai_stream_to_anthropic_sse(
+        self,
+        stream: Any,
+        *,
+        tool_name_mapping: dict[str, str] | None = None,
+    ) -> AsyncIterator[bytes]:
+        """Convert OpenAI streaming chunks to Anthropic SSE bytes.
+
+        Unlike LiteLLM's ``AnthropicStreamWrapper``, this generator
+        **never** discards tool_call arguments — the trigger chunk's
+        ``function.arguments`` is emitted as an ``input_json_delta``
+        immediately after the ``content_block_start``.
+        """
+        sent_start = False
+        block_index = -1
+        block_open = False
+        last_usage: Any = None
+
+        async for chunk in stream:
+            choices = getattr(chunk, "choices", None) or []
+
+            # Track usage (some providers send it in a separate chunk).
+            chunk_usage = getattr(chunk, "usage", None)
+            if chunk_usage:
+                last_usage = chunk_usage
+
+            if not choices:
+                continue
+
+            choice = choices[0]
+            delta = choice.delta
+            finish_reason = choice.finish_reason
+
+            # ── message_start (once) ──────────────────────────────
+            if not sent_start:
+                sent_start = True
+                yield _sse_frame("message_start", {
+                    "type": "message_start",
+                    "message": {
+                        "id": f"msg_{_uuid.uuid4().hex[:24]}",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "model": self._model.model,
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 0,
+                        },
+                    },
+                })
+
+            # ── finish ────────────────────────────────────────────
+            if finish_reason is not None:
+                if block_open:
+                    yield _sse_frame("content_block_stop", {
+                        "type": "content_block_stop",
+                        "index": block_index,
+                    })
+                    block_open = False
+
+                stop_map = {
+                    "stop": "end_turn",
+                    "length": "max_tokens",
+                    "tool_calls": "tool_use",
+                }
+                usage = self._extract_usage(chunk_usage or last_usage)
+                yield _sse_frame("message_delta", {
+                    "type": "message_delta",
+                    "delta": {
+                        "stop_reason": stop_map.get(finish_reason, "end_turn"),
+                    },
+                    "usage": usage,
+                })
+                yield _sse_frame("message_stop", {"type": "message_stop"})
+                return
+
+            # ── text content ──────────────────────────────────────
+            text = getattr(delta, "content", None)
+            if text:
+                if not block_open or block_index < 0:
+                    block_index += 1
+                    block_open = True
+                    yield _sse_frame("content_block_start", {
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {"type": "text", "text": ""},
+                    })
+                yield _sse_frame("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {"type": "text_delta", "text": text},
+                })
+
+            # ── tool calls ────────────────────────────────────────
+            tool_calls = getattr(delta, "tool_calls", None)
+            if tool_calls:
+                for tc in tool_calls:
+                    tc_id = getattr(tc, "id", None)
+                    tc_func = getattr(tc, "function", None)
+
+                    if tc_id:
+                        # New tool call → close previous block, open new one.
+                        if block_open:
+                            yield _sse_frame("content_block_stop", {
+                                "type": "content_block_stop",
+                                "index": block_index,
+                            })
+                        block_index += 1
+                        block_open = True
+
+                        name = getattr(tc_func, "name", "") or ""
+                        if tool_name_mapping:
+                            name = tool_name_mapping.get(name, name)
+
+                        yield _sse_frame("content_block_start", {
+                            "type": "content_block_start",
+                            "index": block_index,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": tc_id,
+                                "name": name,
+                                "input": {},
+                            },
+                        })
+
+                    # Arguments — including from the very first chunk.
+                    args = (
+                        getattr(tc_func, "arguments", None)
+                        if tc_func
+                        else None
+                    )
+                    if args:
+                        yield _sse_frame("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": args,
+                            },
+                        })
+
+        # ── stream ended without explicit finish_reason ───────────
+        if block_open:
+            yield _sse_frame("content_block_stop", {
+                "type": "content_block_stop",
+                "index": block_index,
+            })
+        if sent_start:
+            usage = self._extract_usage(last_usage)
+            yield _sse_frame("message_delta", {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": usage,
+            })
+            yield _sse_frame("message_stop", {"type": "message_stop"})
+
+    @staticmethod
+    def _extract_usage(usage_obj: Any) -> dict[str, int]:
+        """Build an Anthropic-style usage dict from a LiteLLM usage object."""
+        if usage_obj is None:
+            return {"input_tokens": 0, "output_tokens": 0}
+        input_tokens = getattr(usage_obj, "prompt_tokens", 0) or 0
+        output_tokens = getattr(usage_obj, "completion_tokens", 0) or 0
+        cached = 0
+        details = getattr(usage_obj, "prompt_tokens_details", None)
+        if details:
+            cached = getattr(details, "cached_tokens", 0) or 0
+        result: dict[str, int] = {
+            "input_tokens": max(input_tokens - cached, 0),
+            "output_tokens": output_tokens,
+        }
+        if cached:
+            result["cache_read_input_tokens"] = cached
+        return result
+
     async def _call_litellm_messages(
         self,
         litellm: Any,
         kwargs: dict[str, Any],
     ) -> Any:
-        """Call LiteLLM's Anthropic pass-through endpoint."""
+        """Call LiteLLM's Anthropic pass-through endpoint (non-streaming)."""
         return await litellm.anthropic.messages.acreate(**kwargs)
 
     def _count_tokens(self, payload: dict[str, Any]) -> int:
