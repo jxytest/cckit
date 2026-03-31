@@ -73,6 +73,11 @@ _run_git = run_git
 # High-level operations
 # ---------------------------------------------------------------------------
 
+def _looks_like_commit_sha(ref: str) -> bool:
+    """Return True if *ref* looks like a full or abbreviated commit SHA."""
+    return len(ref) >= 7 and all(c in "0123456789abcdefABCDEF" for c in ref)
+
+
 async def clone(
     repo_url: str,
     target: Path,
@@ -83,6 +88,10 @@ async def clone(
 ) -> Path:
     """Clone a repository.  Returns *target*.
 
+    Supports branch names, tags, **and** commit SHAs.  When *branch*
+    looks like a commit hash, the repository is cloned first (without
+    ``--branch``) and then checked out to the exact commit.
+
     Parameters
     ----------
     extra_env:
@@ -90,12 +99,23 @@ async def clone(
         Example: inject a helper script via ``GIT_ASKPASS`` so each
         concurrent clone authenticates with its own token.
     """
-    args = ["clone", f"--depth={depth}"]
-    if branch:
-        args.extend(["--branch", branch])
-    args.extend([repo_url, str(target)])
-    await run_git(*args, extra_env=extra_env)
-    logger.info("Cloned %s → %s", repo_url, target)
+    if branch and _looks_like_commit_sha(branch):
+        # Commit SHAs cannot be used with --branch.
+        # Clone without --branch (full history needed to reach the commit),
+        # then checkout the specific SHA.
+        args = ["clone", repo_url, str(target)]
+        await run_git(*args, extra_env=extra_env)
+        await run_git("checkout", branch, cwd=target, extra_env=extra_env)
+        logger.info("Cloned %s → %s (commit %s)", repo_url, target, branch[:8])
+    else:
+        args = ["clone"]
+        if depth:
+            args.append(f"--depth={depth}")
+        if branch:
+            args.extend(["--branch", branch])
+        args.extend([repo_url, str(target)])
+        await run_git(*args, extra_env=extra_env)
+        logger.info("Cloned %s → %s", repo_url, target)
     return target
 
 
