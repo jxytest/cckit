@@ -632,6 +632,8 @@ class Runner:
             env.setdefault("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
             # Disable extended thinking — many proxies don't support it
             env.setdefault("MAX_THINKING_TOKENS", "0")
+            # 打开agent team功能
+            env.setdefault("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1")
 
         # -- configurable SDK params --
         max_turns = agent.max_turns if agent.max_turns > 0 else model.max_turns
