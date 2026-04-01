@@ -35,6 +35,44 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Claude Code's internal harness directory.  Must remain readable even
+# when ``deny_read`` covers ``~/``, because Claude Code stores tool-results,
+# session-memory, plans, and scratchpad files under this path.
+#
+# Claude Code's permission system evaluates deny rules (step 3) *before*
+# the internal-path allow check (step 7) in ``checkReadPermissionForTool``.
+# A blanket ``Read(~/**)`` permission deny rule therefore blocks reads to
+# ``~/.claude/projects/.../tool-results/`` — breaking sub-agent output
+# retrieval and other internal operations.
+#
+# The OS-level sandbox (``filesystem.denyRead`` / ``filesystem.allowRead``)
+# uses "most-specific-wins" semantics, so ``allowRead: ["~/.claude/"]``
+# correctly carves out an exception within ``denyRead: ["~/"]``.
+# But the permissions layer has no such override — deny is absolute.
+#
+# Solution: keep ``~/`` in OS sandbox denyRead + add ``~/.claude/`` to
+# OS sandbox allowRead (most-specific-wins handles it).  For the
+# permissions layer, replace the broad ``~/`` deny with granular
+# sensitive-directory denies that skip ``~/.claude/``.
+_CLAUDE_HARNESS_DIR = "~/.claude/"
+
+# Well-known sensitive directories under ``~/`` that should remain
+# denied for reading when the original intent is to block ``~/``.
+# ``~/.claude/`` is intentionally absent — it must stay readable.
+_SENSITIVE_HOME_DIRS = [
+    "~/.ssh",
+    "~/.aws",
+    "~/.gnupg",
+    "~/.config",
+    "~/.local",
+    "~/.kube",
+    "~/.docker",
+    "~/.npmrc",
+    "~/.netrc",
+    "~/.bash_history",
+    "~/.zsh_history",
+]
+
 
 class SandboxConfigBuilder:
     """Build the unified sandbox settings JSON consumed by the SDK.
@@ -137,6 +175,12 @@ class SandboxConfigBuilder:
 
         allow_read, allow_write, deny_read, deny_write = self._collect_paths(workspace_dir)
 
+        # For the permissions layer, replace broad deny_read entries that
+        # cover ~/.claude/ with granular sensitive-dir denies.  The OS
+        # sandbox keeps the original deny_read (most-specific-wins handles
+        # the ~/.claude/ allowRead carve-out).
+        perm_deny_read = self._permissions_deny_read(deny_read)
+
         settings_obj: dict[str, Any] = {}
 
         # Build unified sandbox section: behaviour flags + filesystem + network
@@ -151,7 +195,7 @@ class SandboxConfigBuilder:
             settings_obj,
             allow_read=allow_read,
             allow_write=allow_write,
-            deny_read=deny_read,
+            deny_read=perm_deny_read,
             deny_write=deny_write,
         )
 
@@ -219,13 +263,65 @@ class SandboxConfigBuilder:
     def _collect_paths(
             self, workspace_dir: Path | None
     ) -> tuple[list[str], list[str], list[str], list[str]]:
-        """Collect effective allow/deny paths with workspace overrides."""
+        """Collect effective allow/deny paths with workspace overrides.
+
+        When any ``deny_read`` entry covers ``~/.claude/``, the harness
+        directory is automatically added to ``allow_read`` so the OS
+        sandbox layer (which uses most-specific-wins semantics) permits
+        reads to Claude Code's internal files (tool-results, session-memory,
+        plans, scratchpad).
+        """
         ws = str(workspace_dir) if workspace_dir else None
         allow_read = ([ws] if ws else []) + list(self.allow_read)
         allow_write = ([ws] if ws else []) + list(self.allow_write)
         deny_read = list(self.deny_read)
         deny_write = list(self.deny_write)
+
+        # Ensure ~/.claude/ is in allowRead when deny_read covers it.
+        # The OS sandbox uses most-specific-wins, so this carve-out works.
+        if self._any_deny_covers_harness(deny_read):
+            if _CLAUDE_HARNESS_DIR not in allow_read:
+                allow_read.append(_CLAUDE_HARNESS_DIR)
+
         return allow_read, allow_write, deny_read, deny_write
+
+    @classmethod
+    def _permissions_deny_read(cls, deny_read: list[str]) -> list[str]:
+        """Return deny_read list adjusted for the permissions layer.
+
+        Claude Code's permission system checks deny rules *before* its
+        internal-path allow list (step 3 vs step 7), and deny is absolute
+        — there is no "most-specific-wins" override.  A blanket
+        ``Read(~/**)`` deny therefore blocks reads to
+        ``~/.claude/projects/.../tool-results/``.
+
+        This method replaces any deny_read entry that covers ``~/.claude/``
+        with an explicit list of well-known sensitive directories,
+        preserving the security intent without blocking the harness.
+        """
+        if not cls._any_deny_covers_harness(deny_read):
+            return deny_read
+
+        result: list[str] = []
+        for entry in deny_read:
+            norm = str(Path(cls._normalize_path(entry)))
+            harness_str = str(Path(_CLAUDE_HARNESS_DIR).expanduser()).rstrip("/\\")
+            if harness_str == norm or harness_str.startswith(norm + "/"):
+                result.extend(_SENSITIVE_HOME_DIRS)
+            else:
+                result.append(entry)
+        return result
+
+    @staticmethod
+    def _any_deny_covers_harness(deny_read: list[str]) -> bool:
+        """Check whether any deny_read entry is a parent of ``~/.claude/``."""
+        harness = Path(_CLAUDE_HARNESS_DIR).expanduser()
+        harness_str = str(harness).rstrip("/\\")
+        for entry in deny_read:
+            norm = str(Path(SandboxConfigBuilder._normalize_path(entry)))
+            if harness_str == norm or harness_str.startswith(norm + "/"):
+                return True
+        return False
 
     def _attach_permissions(
             self,

@@ -561,7 +561,9 @@ class TestWorkspaceOnlySandbox:
             assert fs["allowWrite"] == [ws_str]
             # Workspace is re-allowed for reading within denied home
             assert ws_str in fs["allowRead"]
-            # Home is blocked for reading
+            # ~/.claude/ is auto-added to allowRead (OS sandbox carve-out)
+            assert "~/.claude/" in fs["allowRead"]
+            # Home is blocked for reading (OS sandbox keeps original deny)
             assert "~/" in fs["denyRead"]
 
             # Network: empty = block all
@@ -574,6 +576,16 @@ class TestWorkspaceOnlySandbox:
             assert f"Read({ws_rule}/**)" in perms["allow"]
             assert f"Edit({ws_rule}/**)" in perms["allow"]
             assert f"Write({ws_rule}/**)" in perms["allow"]
+
+            # Permissions deny uses granular sensitive dirs, NOT blanket ~/
+            deny_rules = perms.get("deny", [])
+            home_str = str(Path.home())
+            home_rule = SandboxConfigBuilder._to_permission_path_specifier(home_str)
+            assert f"Read({home_rule}/**)" not in deny_rules, \
+                "blanket ~/ deny must be replaced with granular sensitive-dir denies"
+            # Spot-check: ~/.ssh should be denied
+            ssh_rule = SandboxConfigBuilder._to_permission_path_specifier(str(Path.home() / ".ssh"))
+            assert f"Read({ssh_rule}/**)" in deny_rules
 
 
 # =====================================================================
@@ -618,3 +630,85 @@ class TestDangerouslyDisableSandboxPrevention:
         )
         sandbox = _parse(builder.build())["sandbox"]
         assert sandbox["allowUnsandboxedCommands"] is False
+
+
+# =====================================================================
+# 14. Claude Code harness directory protection
+# =====================================================================
+
+
+class TestClaudeHarnessProtection:
+    """~/.claude/ must remain readable even when deny_read covers ~/.
+
+    Claude Code stores tool-results, session-memory, plans, and scratchpad
+    files under ~/.claude/.  Its permission system checks deny rules (step 3)
+    before the internal-path allow list (step 7), so a blanket Read(~/**)
+    deny blocks sub-agent output retrieval.
+
+    The fix:
+    - OS sandbox: keep denyRead=["~/"], add allowRead=["~/.claude/"]
+      (most-specific-wins handles the carve-out)
+    - Permissions: replace ~/→ granular sensitive-dir denies that skip ~/.claude/
+    """
+
+    def test_os_sandbox_keeps_original_deny(self):
+        """filesystem.denyRead must still contain ~/ for OS-level protection."""
+        builder = SandboxConfigBuilder(enabled=True, deny_read=["~/"])
+        parsed = _parse(builder.build())
+        assert "~/" in parsed["sandbox"]["filesystem"]["denyRead"]
+
+    def test_os_sandbox_adds_harness_allow(self):
+        """filesystem.allowRead must include ~/.claude/ as a carve-out."""
+        builder = SandboxConfigBuilder(enabled=True, deny_read=["~/"])
+        parsed = _parse(builder.build())
+        assert "~/.claude/" in parsed["sandbox"]["filesystem"]["allowRead"]
+
+    def test_permissions_no_blanket_home_deny(self):
+        """Permission deny must NOT contain Read(~/**) — would block tool-results."""
+        builder = SandboxConfigBuilder(enabled=True, deny_read=["~/"])
+        parsed = _parse(builder.build())
+        deny_rules = parsed["permissions"].get("deny", [])
+        home_str = str(Path.home())
+        home_rule = SandboxConfigBuilder._to_permission_path_specifier(home_str)
+        assert f"Read({home_rule}/**)" not in deny_rules
+
+    def test_permissions_denies_sensitive_dirs(self):
+        """Permission deny must include granular sensitive dirs like ~/.ssh."""
+        builder = SandboxConfigBuilder(enabled=True, deny_read=["~/"])
+        parsed = _parse(builder.build())
+        deny_rules = parsed["permissions"].get("deny", [])
+        ssh_rule = SandboxConfigBuilder._to_permission_path_specifier(
+            str(Path.home() / ".ssh")
+        )
+        assert f"Read({ssh_rule}/**)" in deny_rules
+
+    def test_no_effect_when_deny_does_not_cover_harness(self):
+        """When deny_read doesn't cover ~/, no special handling needed."""
+        builder = SandboxConfigBuilder(enabled=True, deny_read=["/secret"])
+        parsed = _parse(builder.build())
+        deny_rules = parsed["permissions"].get("deny", [])
+        assert "Read(//secret/**)" in deny_rules
+        fs = parsed["sandbox"]["filesystem"]
+        assert "~/.claude/" not in fs.get("allowRead", [])
+
+    def test_harness_allow_not_duplicated(self):
+        """If user already has ~/.claude/ in allow_read, don't add it twice."""
+        builder = SandboxConfigBuilder(
+            enabled=True,
+            deny_read=["~/"],
+            allow_read=["~/.claude/"],
+        )
+        parsed = _parse(builder.build())
+        allow_read = parsed["sandbox"]["filesystem"].get("allowRead", [])
+        assert allow_read.count("~/.claude/") == 1
+
+    def test_custom_deny_read_without_home(self):
+        """Custom deny_read that doesn't cover ~/ is passed through unchanged."""
+        builder = SandboxConfigBuilder(
+            enabled=True,
+            deny_read=["/data/private", "/var/secrets"],
+        )
+        parsed = _parse(builder.build())
+        deny_rules = parsed["permissions"].get("deny", [])
+        assert "Read(//data/private/**)" in deny_rules
+        assert "Read(//var/secrets/**)" in deny_rules
