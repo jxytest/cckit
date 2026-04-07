@@ -462,6 +462,16 @@ class StreamResult:
         self._consumer_task = asyncio.current_task()
         return await self._aiter.__anext__()
 
+    async def aclose(self) -> None:
+        """Close the underlying async generator, triggering its finally block.
+
+        Called automatically by ``async for`` on early exit (exception or
+        break).  Also safe to call manually for explicit cleanup.
+        """
+        aclose_fn = getattr(self._aiter, 'aclose', None)
+        if aclose_fn is not None:
+            await aclose_fn()
+
     def abort(self) -> None:
         """Abort the running stream. Safe to call from any coroutine. Idempotent.
 
