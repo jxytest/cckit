@@ -196,6 +196,7 @@ class Runner:
         git_cfg = ctx.resolved_git()
         effective_sandbox = self._resolve_sandbox(agent)
         prepared_model: PreparedModelEndpoint | None = None
+        sdk_stream: AsyncIterator[Any] | None = None
 
         try:
             # --- validate context ---
@@ -310,8 +311,9 @@ class Runner:
 
             # --- stream from SDK (through middleware chain) ---
             query_fn = self._build_middleware_chain(ctx)
+            sdk_stream = query_fn(prompt, options, state)
 
-            async for message in query_fn(prompt, options, state):
+            async for message in sdk_stream:
                 # Lifecycle: on_message
                 try:
                     await agent.on_message_received(ctx, message)
@@ -371,6 +373,20 @@ class Runner:
                 raise HookError("error_execute", hook_exc) from hook_exc
 
         finally:
+            # --- close SDK stream first (kills CLI subprocess) ---
+            # When this generator is closed early (e.g. via aclose()),
+            # async generator cleanup does NOT guarantee inner generators
+            # are finalized before the outer finally runs.  Explicitly
+            # close the SDK stream so the subprocess is terminated before
+            # we shut down the model bridge it connects to.
+            if sdk_stream is not None:
+                aclose_fn = getattr(sdk_stream, 'aclose', None)
+                if aclose_fn is not None:
+                    try:
+                        await aclose_fn()
+                    except Exception:
+                        logger.debug("sdk_stream aclose failed", exc_info=True)
+
             # --- lifecycle: after ---
             if holder.result is not None:
                 try:
