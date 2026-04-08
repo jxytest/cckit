@@ -62,8 +62,12 @@ class Agent:
         registry needed.
     required_params:
         List of keys that must be present in ``RunContext.params``.
+    disallowed_tools:
+        List of tool names to disallow for this agent.
     max_turns:
         Max conversation turns. 0 = use model config default.
+    effort:
+        Thinking effort level: ``"low"``, ``"medium"``, ``"high"``, or ``"max"``.
     sandbox:
         Optional sandbox policy for this agent. Workspace root remains a
         Runner-level infrastructure concern; per-agent sandbox rules such as
@@ -90,12 +94,14 @@ class Agent:
         description: str = "",
         instruction: str | InstructionFn = "",
         tools: list[str] | None = None,
+        disallowed_tools: list[str] | None = None,
         sub_agents: list[Agent] | None = None,
         skills: list[str] | None = None,
         skills_dir: str | Path | None = None,
         mcp_servers: dict[str, Any] | None = None,
         required_params: list[str] | None = None,
         max_turns: int = 0,
+        effort: str | None = None,
         sandbox: SandboxOptions | None = None,
         # Lifecycle callbacks
         on_before: LifecycleBeforeFn | None = None,
@@ -107,12 +113,14 @@ class Agent:
         self.name = name
         self.description = description
         self.tools = tools or []
+        self.disallowed_tools = disallowed_tools or []
         self.sub_agents = sub_agents or []
         self.skills = skills or []
         self.skills_dir = Path(skills_dir) if skills_dir else None
         self.mcp_servers: dict[str, Any] = mcp_servers or {}
         self.required_params = required_params or []
         self.max_turns = max_turns
+        self.effort = effort
         self._sandbox = sandbox
 
         # Normalize model → ModelConfig | None

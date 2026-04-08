@@ -606,11 +606,26 @@ class Runner:
         # -- sub-agents → SDK AgentDefinition --
         agents: dict[str, AgentDefinition] = {}
         for sub in agent.sub_agents:
-            agents[sub.name] = AgentDefinition(
+            sub_model = sub.model_config
+            sub_def = AgentDefinition(
                 description=sub.description,
                 prompt=sub.resolve_instruction(ctx),
-                tools=list(sub.tools),
+                tools=list(sub.tools) if sub.tools else None,
+                disallowedTools=list(sub.disallowed_tools) if sub.disallowed_tools else None,
+                model=sub_model.model if sub_model else None,
+                skills=list(sub.skills) if sub.skills else None,
+                mcpServers=(
+                    [
+                        {name: cfg} if isinstance(cfg, dict) else name
+                        for name, cfg in sub.mcp_servers.items()
+                    ]
+                    if sub.mcp_servers
+                    else None
+                ),
+                maxTurns=sub.max_turns if sub.max_turns > 0 else None,
+                effort=sub.effort,
             )
+            agents[sub.name] = sub_def
 
         # -- MCP servers --
         mcp_servers = agent.mcp_servers
