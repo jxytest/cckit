@@ -398,10 +398,12 @@ class Runner:
                     raise HookError("after_execute", hook_exc) from hook_exc
 
                 # --- log final summary ---
+                usage = holder.result.usage or {}
                 logger.info(
                     (
                         "Agent %s completed: task_id=%s session_id=%s "
-                        "status=%s cost=$%.4f duration=%.2fs"
+                        "status=%s cost=$%.4f duration=%.2fs "
+                        "input_tokens=%d output_tokens=%d total_tokens=%d"
                     ),
                     agent.name,
                     holder.result.task_id,
@@ -409,6 +411,9 @@ class Runner:
                     holder.result.status,
                     holder.result.cost_usd,
                     holder.result.duration_seconds,
+                    usage.get("input_tokens", 0),
+                    usage.get("output_tokens", 0),
+                    usage.get("total_tokens", 0),
                 )
 
             # --- cleanup temporary askpass script ---
