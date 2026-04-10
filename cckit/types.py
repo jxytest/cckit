@@ -66,8 +66,6 @@ def _normalize_model_base_url(value: str) -> str:
         ("/messages", ""),
         ("/v1/chat/completions", "/v1"),
         ("/chat/completions", ""),
-        ("/v1/responses", "/v1"),
-        ("/responses", ""),
     )
     for suffix, replacement in suffix_rewrites:
         if normalized.endswith(suffix):

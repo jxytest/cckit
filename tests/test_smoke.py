@@ -168,7 +168,7 @@ def test_resolve_model_transport_defaults_unprefixed_models_to_chat():
         )
     )
     assert transport.protocol == "chat"
-    assert transport.custom_llm_provider == "custom_openai"
+    assert transport.custom_llm_provider == "openai"
     assert transport.model == "gpt-4o-mini"
     assert transport.api_base == "https://api.openai.com/v1"
 
@@ -208,8 +208,8 @@ def test_resolve_model_transport_uses_base_url_hint_for_unprefixed_models():
     )
     assert responses_transport.protocol == "responses"
     assert responses_transport.custom_llm_provider == "openai"
-    assert responses_transport.model == "gpt-4o-mini"
-    assert responses_transport.api_base == "https://api.openai.com/v1"
+    assert responses_transport.model == "responses/gpt-4o-mini"
+    assert responses_transport.api_base == "https://api.openai.com/v1/responses"
 
     chat_transport = resolve_model_transport(
         ModelConfig(
@@ -218,7 +218,7 @@ def test_resolve_model_transport_uses_base_url_hint_for_unprefixed_models():
         )
     )
     assert chat_transport.protocol == "chat"
-    assert chat_transport.custom_llm_provider == "custom_openai"
+    assert chat_transport.custom_llm_provider == "openai"
     assert chat_transport.model == "qwen-plus"
     assert chat_transport.api_base == "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
@@ -245,7 +245,7 @@ def test_prepare_model_endpoint_uses_litellm_bridge_for_plain_model(monkeypatch)
     assert prepared.bridge is not None
     assert prepared.bridge._model.model == "claude-sonnet-4-6"
     assert prepared.bridge._transport.protocol == "chat"
-    assert prepared.bridge._transport.custom_llm_provider == "custom_openai"
+    assert prepared.bridge._transport.custom_llm_provider == "openai"
 
 
 def test_prepare_model_endpoint_missing_litellm_is_clear(monkeypatch):
@@ -344,7 +344,7 @@ def test_bridge_chat_transport_drops_anthropic_only_fields():
 
     assert "output_config" not in kwargs
     assert "context_management" not in kwargs
-    assert kwargs["custom_llm_provider"] == "custom_openai"
+    assert kwargs["custom_llm_provider"] == "openai"
     assert kwargs["model"] == "qwen-plus"
     assert kwargs["api_base"] == "https://dashscope.aliyuncs.com/compatible-mode/v1"
 

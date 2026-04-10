@@ -11,53 +11,27 @@ from __future__ import annotations
 
 import asyncio
 import importlib
-import json
 import logging
 import socket
-import uuid as _uuid
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
+from cckit._engine.model_transport import (
+    ResolvedTransport,  # noqa: F401 – used internally
+    clamp_max_tokens,
+    resolve_model_transport,  # noqa: F401 – re-exported for backward compat
+    sanitize_payload,
+)
+from cckit._engine.sse_converter import (
+    _jsonable,
+    sse_frame,
+)
 from cckit.exceptions import AgentExecutionError
-from cckit.types import ModelConfig, TransportProtocol
+from cckit.types import ModelConfig
 
 logger = logging.getLogger(__name__)
-
-_CHAT_DROPPED_ANTHROPIC_FIELDS = frozenset(
-    {
-        "context_management",
-        "output_config",
-    }
-)
-
-
-def _coerce_positive_int(value: Any) -> int | None:
-    """Best-effort coercion for positive integer request fields."""
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed > 0 else None
-
-
-def _jsonable(value: Any) -> Any:
-    """Convert LiteLLM / Pydantic payloads to plain JSON-compatible objects."""
-    if hasattr(value, "model_dump"):
-        return value.model_dump(mode="json", exclude_none=True)
-    if hasattr(value, "dict"):
-        return value.dict()
-    if hasattr(value, "json"):
-        raw = value.json()
-        return json.loads(raw) if isinstance(raw, str) else raw
-    return value
-
-
-def _sse_frame(event_type: str, payload: Any) -> bytes:
-    """Encode a single Anthropic-style SSE frame."""
-    body = json.dumps(_jsonable(payload), ensure_ascii=True, separators=(",", ":"))
-    return f"event: {event_type}\ndata: {body}\n\n".encode()
 
 
 def _load_litellm() -> Any:
@@ -67,11 +41,22 @@ def _load_litellm() -> Any:
     except ImportError as exc:
         raise AgentExecutionError(
             "cckit model execution requires LiteLLM bridge dependencies",
-            detail=(
-                "Install `litellm`, `starlette`, and `uvicorn`, then configure "
-                "the model with LiteLLM-style provider semantics."
-            ),
+            detail="Install `litellm`, `starlette`, and `uvicorn`.",
         ) from exc
+
+
+def _load_module(name: str) -> Any:
+    """Import an optional runtime dependency with a good error."""
+    try:
+        return importlib.import_module(name)
+    except ImportError as exc:
+        raise AgentExecutionError(
+            "cckit model execution requires bridge runtime dependencies",
+            detail=f"Missing import: {name}",
+        ) from exc
+
+
+# ── public data classes ──────────────────────────────────────────
 
 
 @dataclass(slots=True)
@@ -84,130 +69,11 @@ class PreparedModelEndpoint:
     bridge: LiteLLMAnthropicBridge | None = None
 
     async def aclose(self) -> None:
-        """Stop the temporary bridge, if any."""
         if self.bridge is not None:
             await self.bridge.aclose()
 
 
-@dataclass(slots=True)
-class ResolvedTransport:
-    """Concrete transport settings used for a single LiteLLM request."""
-
-    protocol: TransportProtocol
-    custom_llm_provider: str
-    model: str
-    api_base: str
-
-
-def _split_model_prefix(model: str) -> tuple[str | None, str]:
-    """Split the first provider prefix from a LiteLLM model string."""
-    if "/" not in model:
-        return None, model
-    prefix, bare_model = model.split("/", 1)
-    if not prefix or not bare_model:
-        return None, model
-    return prefix, bare_model
-
-
-def resolve_model_transport(model: ModelConfig) -> ResolvedTransport:
-    """Resolve the outgoing protocol from model prefix and full-path base URL hints."""
-    prefix, bare_model = _split_model_prefix(model.model)
-
-    if prefix == "openai":
-        return ResolvedTransport(
-            protocol="responses",
-            custom_llm_provider="openai",
-            model=bare_model,
-            api_base=model.base_url,
-        )
-    if prefix == "anthropic":
-        return ResolvedTransport(
-            protocol="anthropic",
-            custom_llm_provider="anthropic",
-            model=bare_model,
-            api_base=model.base_url,
-        )
-    if prefix:
-        return ResolvedTransport(
-            protocol="chat",
-            custom_llm_provider=prefix,
-            model=bare_model,
-            api_base=model.base_url,
-        )
-
-    if model.endpoint_protocol == "responses":
-        return ResolvedTransport(
-            protocol="responses",
-            custom_llm_provider="openai",
-            model=model.model,
-            api_base=model.base_url,
-        )
-    if model.endpoint_protocol == "anthropic":
-        return ResolvedTransport(
-            protocol="anthropic",
-            custom_llm_provider="anthropic",
-            model=model.model,
-            api_base=model.base_url,
-        )
-
-    return ResolvedTransport(
-        protocol="chat",
-        custom_llm_provider="custom_openai",
-        model=model.model,
-        api_base=model.base_url,
-    )
-
-
-def _sanitize_payload_for_transport(
-    payload: dict[str, Any],
-    transport: ResolvedTransport,
-) -> dict[str, Any]:
-    """Drop protocol-incompatible Anthropic params before calling LiteLLM."""
-    kwargs = dict(payload)
-    if transport.protocol != "chat":
-        return kwargs
-
-    dropped = sorted(
-        key for key in _CHAT_DROPPED_ANTHROPIC_FIELDS if key in kwargs
-    )
-    for key in dropped:
-        kwargs.pop(key, None)
-
-    if dropped:
-        logger.debug(
-            "Dropping Anthropic-only params for chat/completions transport: %s",
-            ", ".join(dropped),
-        )
-    return kwargs
-
-
-def _apply_max_tokens_policy(
-    payload: dict[str, Any],
-    transport: ResolvedTransport,
-    configured_max_tokens: int,
-) -> dict[str, Any]:
-    """Clamp Claude SDK defaults to the transport-safe model max_tokens."""
-    kwargs = dict(payload)
-    if transport.protocol == "anthropic":
-        return kwargs
-
-    configured = _coerce_positive_int(configured_max_tokens)
-    if configured is None:
-        return kwargs
-
-    requested = _coerce_positive_int(kwargs.get("max_tokens"))
-    if requested is None:
-        kwargs["max_tokens"] = configured
-        return kwargs
-    if requested > configured:
-        logger.debug(
-            "Clamping max_tokens for %s transport: requested=%s configured=%s",
-            transport.protocol,
-            requested,
-            configured,
-        )
-        kwargs["max_tokens"] = configured
-    return kwargs
+# ── bridge server ────────────────────────────────────────────────
 
 
 class LiteLLMAnthropicBridge:
@@ -221,18 +87,22 @@ class LiteLLMAnthropicBridge:
         self._socket: socket.socket | None = None
         self.base_url: str = ""
 
+    # ── lifecycle ─────────────────────────────────────────────────
+
     async def start(self) -> LiteLLMAnthropicBridge:
         """Boot the local bridge server and wait until it is ready."""
-        app = self._build_app()
+        logger.debug(
+            "Starting bridge: protocol=%s provider=%s model=%s api_base=%s",
+            self._transport.protocol,
+            self._transport.custom_llm_provider,
+            self._transport.model,
+            self._transport.api_base,
+        )
 
-        uvicorn = self._load_module("uvicorn")
+        uvicorn = _load_module("uvicorn")
         config = uvicorn.Config(
-            app,
-            host="127.0.0.1",
-            port=0,
-            log_level="warning",
-            access_log=False,
-            lifespan="off",
+            self._build_app(), host="127.0.0.1", port=0,
+            log_level="warning", access_log=False, lifespan="off",
         )
         self._server = uvicorn.Server(config)
         self._server.install_signal_handlers = lambda: None
@@ -244,8 +114,7 @@ class LiteLLMAnthropicBridge:
         sock.setblocking(False)
         self._socket = sock
 
-        port = sock.getsockname()[1]
-        self.base_url = f"http://127.0.0.1:{port}"
+        self.base_url = f"http://127.0.0.1:{sock.getsockname()[1]}"
         self._task = asyncio.create_task(self._server.serve(sockets=[sock]))
 
         for _ in range(100):
@@ -253,16 +122,9 @@ class LiteLLMAnthropicBridge:
                 return self
             if self._task.done():
                 error = self._task.exception()
-                detail = (
-                    str(error) if error is not None else "Bridge server exited unexpectedly."
-                )
-                exc = AgentExecutionError(
-                    "Failed to start the LiteLLM Anthropic bridge",
-                    detail=detail,
-                )
-                if error is not None:
-                    raise exc from error
-                raise exc
+                detail = str(error) if error else "Bridge server exited unexpectedly."
+                exc = AgentExecutionError("Failed to start the LiteLLM Anthropic bridge", detail=detail)
+                raise exc from error if error else exc
             await asyncio.sleep(0.05)
 
         await self.aclose()
@@ -272,7 +134,6 @@ class LiteLLMAnthropicBridge:
         )
 
     async def aclose(self) -> None:
-        """Shut down the temporary bridge server."""
         if self._server is not None:
             self._server.should_exit = True
         if self._task is not None:
@@ -280,175 +141,74 @@ class LiteLLMAnthropicBridge:
                 await self._task
         if self._socket is not None:
             self._socket.close()
-
-        self._task = None
-        self._server = None
-        self._socket = None
+        self._task = self._server = self._socket = None
         self.base_url = ""
 
-    def _build_app(self) -> Any:
-        """Create a minimal Anthropic-compatible ASGI app."""
-        starlette_app = self._load_module("starlette.applications")
-        starlette_responses = self._load_module("starlette.responses")
-        starlette_routing = self._load_module("starlette.routing")
-        litellm = _load_litellm()
+    # ── ASGI app ──────────────────────────────────────────────────
 
-        # Anthropic-compatibility is the entire point of this bridge: be
-        # permissive with provider-specific unsupported params by default.
+    def _build_app(self) -> Any:
+        starlette_app = _load_module("starlette.applications")
+        starlette_resp = _load_module("starlette.responses")
+        starlette_rt = _load_module("starlette.routing")
+        litellm = _load_litellm()
         litellm.drop_params = True
 
-        json_response = starlette_responses.JSONResponse
-        response_cls = starlette_responses.Response
-        streaming_response = starlette_responses.StreamingResponse
-        route = starlette_routing.Route
-        starlette = starlette_app.Starlette
+        Route = starlette_rt.Route
+        JSONResponse = starlette_resp.JSONResponse
+        StreamingResponse = starlette_resp.StreamingResponse
+        Response = starlette_resp.Response
 
         async def health(_: Any) -> Any:
-            return json_response({"ok": True})
+            return JSONResponse({"ok": True})
 
         async def create_message(request: Any) -> Any:
             payload = await request.json()
-
             try:
-                if bool(payload.get("stream")):
-                    stream = await self._call_litellm_streaming(
-                        litellm,
-                        payload,
-                    )
-                    return streaming_response(
-                        self._stream_events(stream),
+                if payload.get("stream"):
+                    stream = await self._handle_streaming(litellm, payload)
+                    return StreamingResponse(
+                        self._wrap_stream(stream),
                         media_type="text/event-stream",
-                        headers={
-                            "cache-control": "no-cache",
-                            "x-accel-buffering": "no",
-                        },
+                        headers={"cache-control": "no-cache", "x-accel-buffering": "no"},
                     )
-
-                kwargs = self._build_litellm_kwargs(payload)
-                response = await self._call_litellm_messages(
-                    litellm,
-                    kwargs,
-                )
-                return json_response(_jsonable(response))
+                kwargs = self._build_kwargs(payload)
+                resp = await litellm.anthropic.messages.acreate(**kwargs)
+                return JSONResponse(_jsonable(resp))
             except Exception as exc:
-                return json_response(
-                    {
-                        "type": "error",
-                        "error": {
-                            "type": "api_error",
-                            "message": str(exc),
-                        },
-                    },
+                return JSONResponse(
+                    {"type": "error", "error": {"type": "api_error", "message": str(exc)}},
                     status_code=500,
                 )
 
         async def count_tokens(request: Any) -> Any:
             payload = await request.json()
-            response = {"input_tokens": self._count_tokens(payload)}
-            return json_response(response)
+            return JSONResponse({"input_tokens": self._count_tokens(payload)})
 
-        async def not_found(_: Any) -> Any:
-            return response_cls(status_code=404)
+        return starlette_app.Starlette(routes=[
+            Route("/health", health, methods=["GET"]),
+            Route("/v1/messages", create_message, methods=["POST"]),
+            Route("/v1/messages/count_tokens", count_tokens, methods=["POST"]),
+            Route("/{path:path}", lambda _: Response(status_code=404), methods=["GET", "POST"]),
+        ])
 
-        return starlette(
-            routes=[
-                route("/health", health, methods=["GET"]),
-                route("/v1/messages", create_message, methods=["POST"]),
-                route("/v1/messages/count_tokens", count_tokens, methods=["POST"]),
-                route("/{path:path}", not_found, methods=["GET", "POST"]),
-            ]
-        )
+    # ── request building ─────────────────────────────────────────
 
-    async def _stream_events(self, stream: Any) -> Any:
-        """Convert LiteLLM streaming chunks into Anthropic-style SSE frames."""
-        try:
-            async for chunk in stream:
-                payload = _jsonable(chunk)
-                if isinstance(payload, (bytes, bytearray)):
-                    yield bytes(payload)
-                    continue
-                if isinstance(payload, str):
-                    yield payload.encode("utf-8")
-                    continue
-                event_type = str(payload.get("type", "message_delta"))
-                yield _sse_frame(event_type, payload)
-        except Exception as exc:
-            yield _sse_frame(
-                "error",
-                {
-                    "type": "error",
-                    "error": {
-                        "type": "api_error",
-                        "message": str(exc),
-                    },
-                },
-            )
-
-    def _build_litellm_kwargs(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Merge Anthropic request payload with provider credentials."""
-        kwargs = _sanitize_payload_for_transport(payload, self._transport)
-        kwargs = _apply_max_tokens_policy(
-            kwargs,
-            self._transport,
-            self._model.max_tokens,
-        )
+    def _build_kwargs(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Build kwargs for ``litellm.anthropic.messages.acreate``."""
+        kwargs = sanitize_payload(payload, self._transport)
+        kwargs = clamp_max_tokens(kwargs, self._transport, self._model.max_tokens)
         kwargs["model"] = self._transport.model
         kwargs["custom_llm_provider"] = self._transport.custom_llm_provider
         kwargs.setdefault("max_tokens", self._model.max_tokens)
-
+        kwargs["timeout"] = self._model.timeout_seconds
         if self._model.api_key:
             kwargs["api_key"] = self._model.api_key
         if self._transport.api_base:
             kwargs["api_base"] = self._transport.api_base
-
-        kwargs["timeout"] = self._model.timeout_seconds
         return kwargs
 
-    async def _call_litellm_streaming(
-        self,
-        litellm_mod: Any,
-        payload: dict[str, Any],
-    ) -> AsyncIterator[bytes]:
-        """Stream via ``litellm.acompletion`` with cckit's own SSE conversion.
-
-        LiteLLM's ``AnthropicStreamWrapper`` discards the trigger chunk's
-        ``processed_chunk`` during text→tool_use content-block transitions.
-        Some OpenAI-compatible providers (e.g. 网易 aigc-api) batch all
-        tool_call arguments into a single chunk instead of streaming them
-        incrementally — causing the entire ``input`` (``file_path``,
-        ``content``, …) to be silently lost.
-
-        This method bypasses the buggy wrapper: it reuses LiteLLM's
-        Anthropic→OpenAI *request* conversion but implements its own
-        OpenAI→Anthropic *response* SSE conversion that correctly
-        preserves all tool_call arguments regardless of chunk granularity.
-        """
-        try:
-            from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
-                LiteLLMMessagesToCompletionTransformationHandler as _Handler,
-            )
-        except ImportError:
-            logger.warning(
-                "LiteLLM internal adapter API unavailable; "
-                "falling back to litellm.anthropic.messages.acreate"
-            )
-            kwargs = self._build_litellm_kwargs(payload)
-            return await litellm_mod.anthropic.messages.acreate(**kwargs)
-
-        # Apply the same max_tokens clamping as _build_litellm_kwargs.
-        max_tokens = payload.get("max_tokens", self._model.max_tokens)
-        if self._transport.protocol != "anthropic":
-            configured = _coerce_positive_int(self._model.max_tokens)
-            requested = _coerce_positive_int(max_tokens)
-            if configured and requested and requested > configured:
-                logger.debug(
-                    "Clamping max_tokens for streaming: requested=%s configured=%s",
-                    requested,
-                    configured,
-                )
-                max_tokens = configured
-
-        # Provider credentials forwarded via extra_kwargs.
+    def _build_extra_kwargs(self) -> dict[str, Any]:
+        """Build provider credentials dict for ``_prepare_completion_kwargs``."""
         extra: dict[str, Any] = {
             "custom_llm_provider": self._transport.custom_llm_provider,
             "timeout": self._model.timeout_seconds,
@@ -457,8 +217,54 @@ class LiteLLMAnthropicBridge:
             extra["api_key"] = self._model.api_key
         if self._transport.api_base:
             extra["api_base"] = self._transport.api_base
+        return extra
 
-        # Anthropic→OpenAI request conversion (reuse LiteLLM's own adapter).
+    # ── streaming ─────────────────────────────────────────────────
+
+    async def _handle_streaming(
+        self, litellm_mod: Any, payload: dict[str, Any],
+    ) -> AsyncIterator[bytes]:
+        """Route streaming to the correct backend based on protocol.
+
+        * **responses** – delegates to ``litellm.anthropic.messages.acreate``
+          which internally routes ``openai`` provider to the Responses API.
+        * **chat** – uses ``litellm.acompletion`` with our own SSE converter
+          to work around LiteLLM's tool_call argument loss bug.
+        """
+        if self._transport.protocol == "responses":
+            kwargs = self._build_kwargs(payload)
+            kwargs["stream"] = True
+            return await litellm_mod.anthropic.messages.acreate(**kwargs)
+
+        return await self._stream_via_chat_completions(litellm_mod, payload)
+
+    async def _stream_via_chat_completions(
+        self, litellm_mod: Any, payload: dict[str, Any],
+    ) -> AsyncIterator[bytes]:
+        """Stream via ``litellm.acompletion`` with custom SSE conversion.
+
+        Uses our own OpenAI→Anthropic SSE converter instead of LiteLLM's
+        ``AnthropicStreamWrapper`` to avoid its trigger-chunk argument
+        loss bug (see ``sse_converter.py`` module docstring for details).
+        """
+        try:
+            from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
+                LiteLLMMessagesToCompletionTransformationHandler as _Handler,
+            )
+        except ImportError:
+            logger.warning("LiteLLM adapter API unavailable; falling back to acreate")
+            kwargs = self._build_kwargs(payload)
+            kwargs["stream"] = True
+            return await litellm_mod.anthropic.messages.acreate(**kwargs)
+
+        from cckit._engine.model_transport import _coerce_positive_int
+
+        max_tokens = payload.get("max_tokens", self._model.max_tokens)
+        limit = _coerce_positive_int(self._model.max_tokens)
+        requested = _coerce_positive_int(max_tokens)
+        if limit and requested and requested > limit:
+            max_tokens = limit
+
         completion_kwargs, tool_name_mapping = _Handler._prepare_completion_kwargs(
             max_tokens=max_tokens,
             messages=payload["messages"],
@@ -474,247 +280,70 @@ class LiteLLMAnthropicBridge:
             metadata=payload.get("metadata"),
             stop_sequences=payload.get("stop_sequences"),
             output_format=payload.get("output_format"),
-            extra_kwargs=extra,
+            extra_kwargs=self._build_extra_kwargs(),
         )
 
         openai_stream = await litellm_mod.acompletion(**completion_kwargs)
 
-        return self._openai_stream_to_anthropic_sse(
+        from cckit._engine.sse_converter import openai_stream_to_anthropic_sse
+        return openai_stream_to_anthropic_sse(
             openai_stream,
+            model_name=self._model.model,
             tool_name_mapping=tool_name_mapping,
         )
 
-    async def _openai_stream_to_anthropic_sse(
-        self,
-        stream: Any,
-        *,
-        tool_name_mapping: dict[str, str] | None = None,
-    ) -> AsyncIterator[bytes]:
-        """Convert OpenAI streaming chunks to Anthropic SSE bytes.
-
-        Unlike LiteLLM's ``AnthropicStreamWrapper``, this generator
-        **never** discards tool_call arguments — the trigger chunk's
-        ``function.arguments`` is emitted as an ``input_json_delta``
-        immediately after the ``content_block_start``.
-        """
-        sent_start = False
-        block_index = -1
-        block_open = False
-        last_usage: Any = None
-
-        async for chunk in stream:
-            choices = getattr(chunk, "choices", None) or []
-
-            # Track usage (some providers send it in a separate chunk).
-            chunk_usage = getattr(chunk, "usage", None)
-            if chunk_usage:
-                last_usage = chunk_usage
-
-            if not choices:
-                continue
-
-            choice = choices[0]
-            delta = choice.delta
-            finish_reason = choice.finish_reason
-
-            # ── message_start (once) ──────────────────────────────
-            if not sent_start:
-                sent_start = True
-                yield _sse_frame("message_start", {
-                    "type": "message_start",
-                    "message": {
-                        "id": f"msg_{_uuid.uuid4().hex[:24]}",
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [],
-                        "model": self._model.model,
-                        "stop_reason": None,
-                        "stop_sequence": None,
-                        "usage": {
-                            "input_tokens": 0,
-                            "output_tokens": 0,
-                            "cache_creation_input_tokens": 0,
-                            "cache_read_input_tokens": 0,
-                        },
-                    },
-                })
-
-            # ── finish ────────────────────────────────────────────
-            if finish_reason is not None:
-                if block_open:
-                    yield _sse_frame("content_block_stop", {
-                        "type": "content_block_stop",
-                        "index": block_index,
-                    })
-                    block_open = False
-
-                stop_map = {
-                    "stop": "end_turn",
-                    "length": "max_tokens",
-                    "tool_calls": "tool_use",
-                }
-                usage = self._extract_usage(chunk_usage or last_usage)
-                yield _sse_frame("message_delta", {
-                    "type": "message_delta",
-                    "delta": {
-                        "stop_reason": stop_map.get(finish_reason, "end_turn"),
-                    },
-                    "usage": usage,
-                })
-                yield _sse_frame("message_stop", {"type": "message_stop"})
-                return
-
-            # ── text content ──────────────────────────────────────
-            text = getattr(delta, "content", None)
-            if text:
-                if not block_open or block_index < 0:
-                    block_index += 1
-                    block_open = True
-                    yield _sse_frame("content_block_start", {
-                        "type": "content_block_start",
-                        "index": block_index,
-                        "content_block": {"type": "text", "text": ""},
-                    })
-                yield _sse_frame("content_block_delta", {
-                    "type": "content_block_delta",
-                    "index": block_index,
-                    "delta": {"type": "text_delta", "text": text},
-                })
-
-            # ── tool calls ────────────────────────────────────────
-            tool_calls = getattr(delta, "tool_calls", None)
-            if tool_calls:
-                for tc in tool_calls:
-                    tc_id = getattr(tc, "id", None)
-                    tc_func = getattr(tc, "function", None)
-
-                    if tc_id:
-                        # New tool call → close previous block, open new one.
-                        if block_open:
-                            yield _sse_frame("content_block_stop", {
-                                "type": "content_block_stop",
-                                "index": block_index,
-                            })
-                        block_index += 1
-                        block_open = True
-
-                        name = getattr(tc_func, "name", "") or ""
-                        if tool_name_mapping:
-                            name = tool_name_mapping.get(name, name)
-
-                        yield _sse_frame("content_block_start", {
-                            "type": "content_block_start",
-                            "index": block_index,
-                            "content_block": {
-                                "type": "tool_use",
-                                "id": tc_id,
-                                "name": name,
-                                "input": {},
-                            },
-                        })
-
-                    # Arguments — including from the very first chunk.
-                    args = (
-                        getattr(tc_func, "arguments", None)
-                        if tc_func
-                        else None
-                    )
-                    if args:
-                        yield _sse_frame("content_block_delta", {
-                            "type": "content_block_delta",
-                            "index": block_index,
-                            "delta": {
-                                "type": "input_json_delta",
-                                "partial_json": args,
-                            },
-                        })
-
-        # ── stream ended without explicit finish_reason ───────────
-        if block_open:
-            yield _sse_frame("content_block_stop", {
-                "type": "content_block_stop",
-                "index": block_index,
+    async def _wrap_stream(self, stream: Any) -> AsyncIterator[bytes]:
+        """Normalize heterogeneous stream chunks into SSE bytes."""
+        try:
+            async for chunk in stream:
+                data = _jsonable(chunk)
+                if isinstance(data, (bytes, bytearray)):
+                    yield bytes(data)
+                elif isinstance(data, str):
+                    yield data.encode()
+                else:
+                    yield sse_frame(str(data.get("type", "message_delta")), data)
+        except Exception as exc:
+            yield sse_frame("error", {
+                "type": "error",
+                "error": {"type": "api_error", "message": str(exc)},
             })
-        if sent_start:
-            usage = self._extract_usage(last_usage)
-            yield _sse_frame("message_delta", {
-                "type": "message_delta",
-                "delta": {"stop_reason": "end_turn"},
-                "usage": usage,
-            })
-            yield _sse_frame("message_stop", {"type": "message_stop"})
 
-    @staticmethod
-    def _extract_usage(usage_obj: Any) -> dict[str, int]:
-        """Build an Anthropic-style usage dict from a LiteLLM usage object."""
-        if usage_obj is None:
-            return {"input_tokens": 0, "output_tokens": 0}
-        input_tokens = getattr(usage_obj, "prompt_tokens", 0) or 0
-        output_tokens = getattr(usage_obj, "completion_tokens", 0) or 0
-        cached = 0
-        details = getattr(usage_obj, "prompt_tokens_details", None)
-        if details:
-            cached = getattr(details, "cached_tokens", 0) or 0
-        result: dict[str, int] = {
-            "input_tokens": max(input_tokens - cached, 0),
-            "output_tokens": output_tokens,
-        }
-        if cached:
-            result["cache_read_input_tokens"] = cached
-        return result
-
-    async def _call_litellm_messages(
-        self,
-        litellm: Any,
-        kwargs: dict[str, Any],
-    ) -> Any:
-        """Call LiteLLM's Anthropic pass-through endpoint (non-streaming)."""
-        return await litellm.anthropic.messages.acreate(**kwargs)
+    # ── token counting ────────────────────────────────────────────
 
     def _count_tokens(self, payload: dict[str, Any]) -> int:
-        """Best-effort token counting for Anthropic-compatible callers."""
         litellm = _load_litellm()
         counter = getattr(litellm, "token_counter", None)
         if not callable(counter):
             return 0
 
         messages = list(payload.get("messages") or [])
-        system_prompt = payload.get("system")
-        if system_prompt:
-            system_text = self._flatten_system_prompt(system_prompt)
-            if system_text:
-                messages = [{"role": "system", "content": system_text}, *messages]
-
+        system = payload.get("system")
+        if system:
+            text = self._flatten_system(system)
+            if text:
+                messages = [{"role": "system", "content": text}, *messages]
         try:
-            return int(counter(model=self._model.model, messages=messages))
+            return int(counter(model=self._transport.model, messages=messages))
         except Exception:
             return 0
 
     @staticmethod
-    def _flatten_system_prompt(system_prompt: Any) -> str:
-        """Normalize Anthropic system prompt structures into plain text."""
-        if isinstance(system_prompt, str):
-            return system_prompt
-        if isinstance(system_prompt, list):
-            parts: list[str] = []
-            for item in system_prompt:
+    def _flatten_system(system: Any) -> str:
+        if isinstance(system, str):
+            return system
+        if isinstance(system, list):
+            parts = []
+            for item in system:
                 if isinstance(item, dict) and item.get("type") == "text":
                     parts.append(str(item.get("text", "")))
                 elif isinstance(item, str):
                     parts.append(item)
-            return "\n".join(part for part in parts if part)
+            return "\n".join(p for p in parts if p)
         return ""
 
-    @staticmethod
-    def _load_module(name: str) -> Any:
-        """Import an optional runtime dependency with a good error."""
-        try:
-            return importlib.import_module(name)
-        except ImportError as exc:
-            raise AgentExecutionError(
-                "cckit model execution requires bridge runtime dependencies",
-                detail=f"Missing import: {name}",
-            ) from exc
+
+# ── public entry point ───────────────────────────────────────────
 
 
 async def prepare_model_endpoint(model: ModelConfig) -> PreparedModelEndpoint:
@@ -725,9 +354,7 @@ async def prepare_model_endpoint(model: ModelConfig) -> PreparedModelEndpoint:
             model=transport.model,
             api_key=model.api_key,
             base_url=transport.api_base,
-            bridge=None,
         )
-
     bridge = await LiteLLMAnthropicBridge(model).start()
     return PreparedModelEndpoint(
         model=model.model,

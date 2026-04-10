@@ -108,58 +108,63 @@ fix_agent = Agent(
 
 ### 模型配置
 
-只用三个字段：`model`、`base_url`、`api_key`。
+配置仅需三个字段：`model`、`api_key` 和 `base_url`（大部分情况不填）。
 
-协议解析规则按以下优先级执行：
+#### 协议路由
 
-- `model` 前缀优先：`anthropic/<model>` 走 Anthropic `messages`
-- `model` 前缀优先：`openai/<model>` 走 OpenAI `responses`
-- 其它有前缀模型：默认走 `chat/completions`
-- `model` 无前缀时：默认走 `chat/completions`
-- `model` 无前缀且 `base_url` 是全路径时：`.../v1/chat/completions`、`.../v1/responses`、`.../v1/messages` 会分别匹配到对应协议
+前缀决定请求走哪种协议：
 
-其中：
+| 前缀 | 协议 | 说明 |
+|------|------|------|
+| `anthropic/` | Anthropic Messages | 直连 Claude SDK，**零开销**，不经过桥接 |
+| `openai/` | OpenAI Responses API | 走 LiteLLM 的 Responses API 适配器 |
+| `responses/` | OpenAI Responses API | 与 `openai/` 相同，语义更明确 |
+| `deepseek/`、`dashscope/` 等 | Chat Completions | 走 LiteLLM 的 chat/completions 适配器 |
+| 无前缀 | Chat Completions | 默认按 `chat/completions` 处理；也可通过 `base_url` 后缀自动推断协议 |
 
-- Anthropic 协议会直接透传给 Claude SDK
-- 非 Anthropic 协议会通过本地 Anthropic-compatible bridge 转换后再交给 Claude SDK
-- `chat/completions` 目标协议不支持的 Anthropic 顶层字段（例如 `output_config`、`context_management`）会在桥接前丢弃，避免透传到 OpenAI 风格 SDK 时报参数错误
-- `chat/completions` 若收到 Claude SDK 默认的较大 `max_tokens`（例如 32000），会按 `ModelConfig.max_tokens` 自动钳制，避免低上限模型直接报错
-
-示例：
-
-- Anthropic 默认：只填 `api_key`，默认模型为 `anthropic/claude-sonnet-4-6`
-- Anthropic 指定模型：`model="anthropic/claude-sonnet-4-6"`
-- OpenAI Responses：`model="openai/gpt-4o-mini"`，`base_url="https://api.openai.com/v1"`
-- OpenAI Chat：`model="gpt-4o-mini"`，`base_url="https://api.openai.com/v1/chat/completions"`
-- Anthropic gateway：`model="anthropic/claude-sonnet-4-6"`，`base_url="https://gateway.example.com"`
-- 三方 OpenAI-compatible Chat：`model="qwen-plus"`，`base_url="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"`
+> **最佳实践**：**强烈建议使用大模型原厂前缀**（如 `dashscope/`、`deepseek/`）。原厂前缀拥有最好的工具调用（Tool Calling）兼容性和精准的流式计费支持，体验全面优于将其视为通用 `openai/` 前缀。
 
 ```python
 from cckit import ModelConfig
 
-anthropic_default = ModelConfig(api_key="sk-ant-...")
-anthropic_model = ModelConfig(model="anthropic/claude-sonnet-4-6", api_key="sk-ant-...")
-openai_responses_model = ModelConfig(
-    model="openai/gpt-4o-mini",
-    base_url="https://api.openai.com/v1",
-    api_key="sk-openai",
-)
-openai_chat_model = ModelConfig(
-    model="gpt-4o-mini",
-    base_url="https://api.openai.com/v1/chat/completions",
-    api_key="sk-openai",
-)
-claude_via_anthropic_gateway = ModelConfig(
-    model="anthropic/claude-sonnet-4-6",
-    base_url="https://gateway.example.com",
-    api_key="sk-gateway",
-)
-qwen_via_dashscope_chat = ModelConfig(
-    model="qwen-plus",
-    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-    api_key="sk-dashscope",
-)
+# Anthropic 直连（不经过桥接层）
+anthropic = ModelConfig(model="anthropic/claude-sonnet-4-6", api_key="sk-ant...")
+
+# OpenAI Responses API
+openai = ModelConfig(model="openai/gpt-4o", api_key="sk-...")
+
+# 使用 responses/ 前缀也走 Responses API（适用于 openai 新模型）
+responses = ModelConfig(model="responses/gpt-5.2", api_key="sk-...")
+
+# 其他厂商走 chat/completions
+qwen = ModelConfig(model="dashscope/qwen-max", api_key="sk-dashscope...")
+deepseek = ModelConfig(model="deepseek/deepseek-chat", api_key="sk-ds...")
+
+# 代理/自定义端点
+proxy = ModelConfig(model="openai/gpt-4o", base_url="https://api.proxy.com/v1", api_key="sk-...")
 ```
+
+#### 常见厂商前缀及配置指南
+
+> 💡 LiteLLM 支持 100+ 厂商，完整列表请查阅 [LiteLLM Providers](https://docs.litellm.ai/docs/providers)。
+> 对于原生前缀（如 `dashscope/` 或 `deepseek/`），**清空并省略 `base_url`** 是保障兼容性最安全的做法。
+
+| 厂商生态 | 推荐前缀示例 | `base_url` 配置指南 |
+|---|---|---|
+| **Anthropic** | `anthropic/claude-sonnet-4-6` | 默认空直连官网。反代填 `https://api.anthropic.proxy/v1` |
+| **OpenAI** | `openai/gpt-4o` | 默认空连官方。自建/代理填 `https://api.yourproxy.com/v1` |
+| **OpenAI (Responses)** | `responses/gpt-5.2` | 与 `openai/` 等价，语义更明确 |
+| **通义千问** | `dashscope/qwen-max` | 默认空。若必须填请写全 `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+| **DeepSeek** | `deepseek/deepseek-chat` | 默认空。中转端点填 `https://api.deepseek.com/v1` |
+| **智谱 GLM** | `zhipu/glm-4` | 默认空连官方端点 |
+| **Kimi** | `moonshot/moonshot-v1-auto` | 默认空。代理端点填 `https://api.moonshot.cn/v1` |
+| **豆包** | `volcengine/ep-xxx...` | 默认空连官方端点 |
+| **Gemini** | `gemini/gemini-1.5-pro` | 默认空连官方端点 |
+| **本地 Ollama** | `ollama/qwen2.5` | ✅必填局域网地址：`http://localhost:11434` |
+| **云托管服务** | `azure/`、`bedrock/`、`vertex_ai/` | ✅按厂商规范必填真实资源端点和专属格式配置 |
+
+> **⚠️ API_BASE 排雷提示**：如果你配置了 `base_url` 却遇到了 `404 Not Found`（特别是 path 包含 `/chat/completions` 的报错），说明你只填了裸机域名导致底层路由寻址越界。遇到此报错，**直接移除 `base_url` 参数，或者在其后补足 `/v1` 即可恢复正常**。
+
 
 ## 运行上下文
 
