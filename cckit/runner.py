@@ -271,13 +271,20 @@ class Runner:
                                 extra_env=git_env,
                             )
 
-                    # --- provision skills ---
+                    # --- provision skills (top-level + sub-agents) ---
                     if agent.skills:
                         # Use agent-level skills_dir if specified, otherwise runner default
                         provisioner = self._skill_provisioner
                         if agent.skills_dir:
                             provisioner = SkillProvisioner(skills_dir=agent.skills_dir)
                         await provisioner.provision(agent.skills, holder.workspace_dir)
+
+                    for sub in agent.sub_agents:
+                        if sub.skills:
+                            sub_provisioner = self._skill_provisioner
+                            if sub.skills_dir:
+                                sub_provisioner = SkillProvisioner(skills_dir=sub.skills_dir)
+                            await sub_provisioner.provision(sub.skills, holder.workspace_dir)
 
                     # --- lifecycle: prepare_workspace ---
                     await agent.prepare_workspace(ctx)
@@ -530,7 +537,8 @@ class Runner:
             missing.append("git.repo_url")
 
         # Skills require a workspace
-        if agent.skills and not ctx.workspace.enabled:
+        any_skills = agent.skills or any(sub.skills for sub in agent.sub_agents)
+        if any_skills and not ctx.workspace.enabled:
             missing.append("workspace.enabled (required when skills are declared)")
 
         return missing
@@ -607,10 +615,14 @@ class Runner:
         agents: dict[str, AgentDefinition] = {}
         for sub in agent.sub_agents:
             sub_model = sub.model_config
+            # Auto-inject "Skill" tool for sub-agents that declare skills
+            sub_tools = list(sub.tools) if sub.tools else None
+            if sub.skills and sub_tools is not None and "Skill" not in sub_tools:
+                sub_tools.append("Skill")
             sub_def = AgentDefinition(
                 description=sub.description,
                 prompt=sub.resolve_instruction(ctx),
-                tools=list(sub.tools) if sub.tools else None,
+                tools=sub_tools,
                 disallowedTools=list(sub.disallowed_tools) if sub.disallowed_tools else None,
                 model=sub_model.model if sub_model else None,
                 skills=list(sub.skills) if sub.skills else None,
@@ -726,9 +738,10 @@ class Runner:
         # causing the CLI to swallow the next flag as the option value and
         # ultimately time-out.  "local" is the safe default (no project-level
         # settings); "project" enables skill discovery from ``.claude/``.
+        any_skills = agent.skills or any(sub.skills for sub in agent.sub_agents)
         opts.setting_sources = cast(
             list[Literal["user", "project", "local"]],
-            ["project"] if agent.skills else ["local"],
+            ["project"] if any_skills else ["local"],
         )
 
         # -- resume: restore a previous session's conversation context --
