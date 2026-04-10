@@ -52,22 +52,11 @@ def _load_module(name: str) -> Any:
         ) from exc
 
 
-def _jsonable(value: Any) -> Any:
-    """Convert LiteLLM / Pydantic payloads to plain JSON-compatible objects."""
-    if hasattr(value, "model_dump"):
-        return value.model_dump(mode="json", exclude_none=True)
-    if hasattr(value, "dict"):
-        return value.dict()
-    if hasattr(value, "json"):
-        raw = value.json()
-        return json.loads(raw) if isinstance(raw, str) else raw
-    return value
-
-
-def _sse_frame(event_type: str, payload: Any) -> bytes:
-    """Encode a single Anthropic-style SSE frame."""
-    body = json.dumps(_jsonable(payload), ensure_ascii=True, separators=(",", ":"))
-    return f"event: {event_type}\ndata: {body}\n\n".encode()
+def _error_sse_frame(message: str) -> bytes:
+    """Encode an Anthropic-style error SSE frame."""
+    payload = {"type": "error", "error": {"type": "api_error", "message": message}}
+    body = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+    return f"event: error\ndata: {body}\n\n".encode()
 
 
 # ── public data classes ──────────────────────────────────────────
@@ -192,7 +181,8 @@ class LiteLLMAnthropicBridge:
                         headers={"cache-control": "no-cache", "x-accel-buffering": "no"},
                     )
                 resp = await litellm.anthropic.messages.acreate(**kwargs)
-                return JSONResponse(_jsonable(resp))
+                body = resp.model_dump(mode="json", exclude_none=True) if hasattr(resp, "model_dump") else resp
+                return JSONResponse(body)
             except Exception as exc:
                 return JSONResponse(
                     {"type": "error", "error": {"type": "api_error", "message": str(exc)}},
@@ -229,21 +219,24 @@ class LiteLLMAnthropicBridge:
     # ── streaming ─────────────────────────────────────────────────
 
     async def _wrap_stream(self, stream: Any) -> AsyncIterator[bytes]:
-        """Normalize heterogeneous stream chunks into SSE bytes."""
+        """Pass through SSE bytes from litellm, with error boundary.
+
+        ``litellm.anthropic.messages.acreate(stream=True)`` returns an
+        ``AsyncIterator[bytes]`` (via ``async_anthropic_sse_wrapper``),
+        so chunks are already SSE-encoded.  We just forward them and
+        catch any mid-stream exceptions as an SSE error event.
+        """
         try:
             async for chunk in stream:
-                data = _jsonable(chunk)
-                if isinstance(data, (bytes, bytearray)):
-                    yield bytes(data)
-                elif isinstance(data, str):
-                    yield data.encode()
+                if isinstance(chunk, (bytes, bytearray)):
+                    yield bytes(chunk)
+                elif isinstance(chunk, str):
+                    yield chunk.encode()
                 else:
-                    yield _sse_frame(str(data.get("type", "message_delta")), data)
+                    # Shouldn't happen with current litellm, but be safe.
+                    yield json.dumps(chunk).encode()
         except Exception as exc:
-            yield _sse_frame("error", {
-                "type": "error",
-                "error": {"type": "api_error", "message": str(exc)},
-            })
+            yield _error_sse_frame(str(exc))
 
     # ── token counting ────────────────────────────────────────────
 
