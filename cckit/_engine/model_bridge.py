@@ -188,7 +188,7 @@ def _apply_max_tokens_policy(
 ) -> dict[str, Any]:
     """Clamp Claude SDK defaults to the transport-safe model max_tokens."""
     kwargs = dict(payload)
-    if transport.protocol != "chat":
+    if transport.protocol == "anthropic":
         return kwargs
 
     configured = _coerce_positive_int(configured_max_tokens)
@@ -201,7 +201,8 @@ def _apply_max_tokens_policy(
         return kwargs
     if requested > configured:
         logger.debug(
-            "Clamping max_tokens for chat/completions transport: requested=%s configured=%s",
+            "Clamping max_tokens for %s transport: requested=%s configured=%s",
+            transport.protocol,
             requested,
             configured,
         )
@@ -436,7 +437,7 @@ class LiteLLMAnthropicBridge:
 
         # Apply the same max_tokens clamping as _build_litellm_kwargs.
         max_tokens = payload.get("max_tokens", self._model.max_tokens)
-        if self._transport.protocol == "chat":
+        if self._transport.protocol != "anthropic":
             configured = _coerce_positive_int(self._model.max_tokens)
             requested = _coerce_positive_int(max_tokens)
             if configured and requested and requested > configured:
