@@ -2,11 +2,19 @@
 
 Routing rules
 -------------
-* ``responses/<model>`` – Responses API; ``responses/`` prefix preserved for litellm routing.
-* ``openai/<model>``    – Same as ``responses/`` (litellm routes ``openai`` provider to Responses API).
+* ``responses/<model>`` – Responses API via ``openai`` provider; bare model passed.
+* ``openai/<model>``    – Chat/completions via ``custom_openai`` provider (NOT Responses API).
 * ``anthropic/<model>`` – Direct Anthropic protocol (no bridge).
 * ``<provider>/<model>`` – Chat/completions via the named LiteLLM provider.
 * No prefix             – ``base_url`` suffix detection or plain chat/completions fallback.
+
+Provider semantics (LiteLLM internal routing)
+----------------------------------------------
+* ``"openai"``        → litellm routes to **Responses API** (``/responses``).
+* ``"custom_openai"`` → litellm routes to **Chat Completions** (``/chat/completions``).
+
+Use ``"openai"`` **only** when the ``responses`` protocol is explicitly requested.
+All other OpenAI-compatible endpoints must use ``"custom_openai"``.
 """
 
 from __future__ import annotations
@@ -46,10 +54,12 @@ def resolve_model_transport(model: ModelConfig) -> ResolvedTransport:
     base = model.base_url or ""
 
     if prefix == "responses":
-        return ResolvedTransport("responses", "openai", f"responses/{bare}", base)
+        return ResolvedTransport("responses", "openai", bare, base)
 
     if prefix == "openai":
-        return ResolvedTransport("responses", "openai", bare, base)
+        # "openai/" prefix → OpenAI-compatible chat/completions, NOT Responses API.
+        # Use "custom_openai" to prevent litellm from routing to /responses.
+        return ResolvedTransport("chat", "custom_openai", bare, base)
 
     if prefix == "anthropic":
         return ResolvedTransport("anthropic", "anthropic", bare, base)
@@ -59,10 +69,10 @@ def resolve_model_transport(model: ModelConfig) -> ResolvedTransport:
 
     # No prefix — use endpoint_protocol hint from base_url suffix detection.
     if model.endpoint_protocol == "responses":
-        return ResolvedTransport("responses", "openai", f"responses/{model.model}", base)
+        return ResolvedTransport("responses", "openai", model.model, base)
     if model.endpoint_protocol == "anthropic":
         return ResolvedTransport("anthropic", "anthropic", model.model, base)
-    return ResolvedTransport("chat", "openai", model.model, base)
+    return ResolvedTransport("chat", "custom_openai", model.model, base)
 
 
 # ── payload helpers ──────────────────────────────────────────────
