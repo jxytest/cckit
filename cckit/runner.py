@@ -272,19 +272,23 @@ class Runner:
                             )
 
                     # --- provision skills (top-level + sub-agents) ---
-                    if agent.skills:
-                        # Use agent-level skills_dir if specified, otherwise runner default
+                    # Collect ALL skills across agent tree first, then
+                    # provision once — provision() purges .claude/ on each
+                    # call, so multiple calls would wipe earlier results.
+                    all_skills = self._collect_all_skills(agent)
+                    if all_skills:
                         provisioner = self._skill_provisioner
-                        if agent.skills_dir:
-                            provisioner = SkillProvisioner(skills_dir=agent.skills_dir)
-                        await provisioner.provision(agent.skills, holder.workspace_dir)
-
-                    for sub in agent.sub_agents:
-                        if sub.skills:
-                            sub_provisioner = self._skill_provisioner
-                            if sub.skills_dir:
-                                sub_provisioner = SkillProvisioner(skills_dir=sub.skills_dir)
-                            await sub_provisioner.provision(sub.skills, holder.workspace_dir)
+                        # Use agent-level skills_dir if specified; otherwise
+                        # fall back to the first sub-agent that declares one.
+                        effective_dir = agent.skills_dir
+                        if not effective_dir:
+                            for sub in agent.sub_agents:
+                                if sub.skills_dir:
+                                    effective_dir = sub.skills_dir
+                                    break
+                        if effective_dir:
+                            provisioner = SkillProvisioner(skills_dir=effective_dir)
+                        await provisioner.provision(all_skills, holder.workspace_dir)
 
                     # --- lifecycle: prepare_workspace ---
                     await agent.prepare_workspace(ctx)
@@ -513,6 +517,26 @@ class Runner:
     def _resolve_sandbox(self, agent: Agent) -> SandboxOptions:
         """Return the sandbox policy for this run."""
         return agent.sandbox_config or SandboxOptions()
+
+    # ------------------------------------------------------------------
+    # Skill collection
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _collect_all_skills(agent: Agent) -> list[str]:
+        """Collect deduplicated skill names from agent and its sub-agents."""
+        seen: set[str] = set()
+        result: list[str] = []
+        for name in agent.skills:
+            if name not in seen:
+                seen.add(name)
+                result.append(name)
+        for sub in agent.sub_agents:
+            for name in sub.skills:
+                if name not in seen:
+                    seen.add(name)
+                    result.append(name)
+        return result
 
     # ------------------------------------------------------------------
     # Context validation
