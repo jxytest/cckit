@@ -700,8 +700,9 @@ class Runner:
             env["ANTHROPIC_BASE_URL"] = prepared_model.base_url
             # Third-party proxies often reject Anthropic-specific beta headers
             # and non-essential traffic (telemetry, autoupdater, etc.)
-            env.setdefault("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "1")
-            env.setdefault("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+            env.setdefault("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "0")
+            env.setdefault("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "0")
+            env.setdefault("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "0")
             # Disable extended thinking — many proxies don't support it
             env.setdefault("MAX_THINKING_TOKENS", "0")
             # 打开agent team功能
