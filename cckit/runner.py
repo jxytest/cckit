@@ -17,6 +17,7 @@ from typing import Any, Literal, cast
 
 from cckit._cli import check_api_connectivity, check_claude_cli
 from cckit._engine.model_bridge import PreparedModelEndpoint, prepare_model_endpoint
+from cckit._engine.model_transport import resolve_model_transport
 from cckit._engine.sdk_bridge import run_sdk_query
 from cckit._engine.state import RunState
 from cckit.agent import Agent
@@ -304,7 +305,18 @@ class Runner:
             state = RunState(ctx.task_id)
             # --- build SDK options ---
             model = self._resolve_model(agent, ctx)
-            prepared_model = await prepare_model_endpoint(model)
+
+            # Collect sub-agent models that differ from the main model so the
+            # bridge can route requests to the correct provider/credentials.
+            extra_models: dict[str, ModelConfig] = {}
+            for sub in agent.sub_agents:
+                sub_cfg = self._resolve_model(sub, ctx)
+                if sub_cfg.model != model.model:
+                    extra_models[sub_cfg.model] = sub_cfg
+
+            prepared_model = await prepare_model_endpoint(
+                model, extra_models=extra_models or None,
+            )
             if self._preflight_check:
                 check_api_connectivity(
                     api_key=prepared_model.api_key or model.api_key,
@@ -640,17 +652,33 @@ class Runner:
         # -- sub-agents → SDK AgentDefinition --
         agents: dict[str, AgentDefinition] = {}
         for sub in agent.sub_agents:
-            sub_model = sub.model_config
             # Auto-inject "Skill" tool for sub-agents that declare skills
             sub_tools = list(sub.tools) if sub.tools else None
             if sub.skills and sub_tools is not None and "Skill" not in sub_tools:
                 sub_tools.append("Skill")
+
+            # Resolve the model name that gets passed to AgentDefinition.
+            # When a bridge is active, sub-agents keep their full LiteLLM model
+            # name (e.g. "openai/gpt-4o-mini") so the bridge can route the
+            # request to the correct provider.  Without a bridge (all models use
+            # Anthropic), strip the LiteLLM prefix so the CLI receives a bare
+            # Anthropic model ID it understands (e.g. "claude-haiku-4-5").
+            sub_cfg = self._resolve_model(sub, ctx)
+            if prepared_model.bridge is not None:
+                # Bridge is active — keep the full model name for routing.
+                agent_model_name: str | None = sub_cfg.model
+            else:
+                # No bridge — all models are Anthropic.  Strip provider prefix
+                # so the CLI gets a native model ID (e.g. "claude-haiku-4-5").
+                sub_transport = resolve_model_transport(sub_cfg)
+                agent_model_name = sub_transport.model
+
             sub_def = AgentDefinition(
                 description=sub.description,
                 prompt=sub.resolve_instruction(ctx),
                 tools=sub_tools,
                 disallowedTools=list(sub.disallowed_tools) if sub.disallowed_tools else None,
-                model=sub_model.model if sub_model else None,
+                model=agent_model_name,
                 skills=list(sub.skills) if sub.skills else None,
                 mcpServers=(
                     [

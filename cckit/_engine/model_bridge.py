@@ -4,6 +4,14 @@ The bridge starts a lightweight Starlette server on ``127.0.0.1:<random-port>``
 that accepts Anthropic ``/v1/messages`` requests and forwards them to the
 real provider through LiteLLM.  Anthropic-protocol models bypass the bridge
 entirely.
+
+Multi-model routing
+-------------------
+When sub-agents use different models (or even different providers), the bridge
+acts as a **model router**: it inspects the ``model`` field in each incoming
+request and dispatches to the correct provider + credentials.  This allows
+the main agent to use e.g. ``openai/gpt-4o`` while a sub-agent uses
+``anthropic/claude-haiku-4-5`` — all through a single local HTTP server.
 """
 
 from __future__ import annotations
@@ -79,12 +87,48 @@ class PreparedModelEndpoint:
 # ── bridge server ────────────────────────────────────────────────
 
 
-class LiteLLMAnthropicBridge:
-    """Temporary local Anthropic-compatible HTTP bridge backed by LiteLLM."""
+class _ModelRoute:
+    """Pre-resolved route for a single model used by the bridge."""
 
-    def __init__(self, model: ModelConfig) -> None:
-        self._model = model
-        self._transport = resolve_model_transport(model)
+    __slots__ = ("config", "transport")
+
+    def __init__(self, config: ModelConfig) -> None:
+        self.config = config
+        self.transport = resolve_model_transport(config)
+
+    def __repr__(self) -> str:
+        return (
+            f"<_ModelRoute model={self.config.model!r} "
+            f"protocol={self.transport.protocol!r}>"
+        )
+
+
+class LiteLLMAnthropicBridge:
+    """Temporary local Anthropic-compatible HTTP bridge backed by LiteLLM.
+
+    Parameters
+    ----------
+    primary:
+        The main agent's :class:`ModelConfig`.  Used as the default route
+        when a request's ``model`` field doesn't match any registered route.
+    extra_models:
+        Optional mapping of **model name** → :class:`ModelConfig` for
+        sub-agents that need different provider credentials.  The bridge
+        dispatches to the matching route based on the ``model`` field in
+        each incoming request payload.
+    """
+
+    def __init__(
+        self,
+        primary: ModelConfig,
+        extra_models: dict[str, ModelConfig] | None = None,
+    ) -> None:
+        self._primary = _ModelRoute(primary)
+        # Model routing table: model_name → _ModelRoute
+        self._routes: dict[str, _ModelRoute] = {primary.model: self._primary}
+        if extra_models:
+            for name, cfg in extra_models.items():
+                self._routes[name] = _ModelRoute(cfg)
         self._server: Any | None = None
         self._task: asyncio.Task[None] | None = None
         self._socket: socket.socket | None = None
@@ -94,13 +138,25 @@ class LiteLLMAnthropicBridge:
 
     async def start(self) -> LiteLLMAnthropicBridge:
         """Boot the local bridge server and wait until it is ready."""
+        primary_t = self._primary.transport
         logger.debug(
-            "Starting bridge: protocol=%s provider=%s model=%s api_base=%s",
-            self._transport.protocol,
-            self._transport.custom_llm_provider,
-            self._transport.model,
-            self._transport.api_base,
+            "Starting bridge: primary=%s protocol=%s provider=%s api_base=%s "
+            "routes=%d",
+            self._primary.config.model,
+            primary_t.protocol,
+            primary_t.custom_llm_provider,
+            primary_t.api_base,
+            len(self._routes),
         )
+        for name, route in self._routes.items():
+            if name != self._primary.config.model:
+                logger.debug(
+                    "  route %s → protocol=%s provider=%s api_base=%s",
+                    name,
+                    route.transport.protocol,
+                    route.transport.custom_llm_provider,
+                    route.transport.api_base,
+                )
 
         # Apply the streaming bug-fix patch before first use.
         from cckit._engine._stream_patch import apply_stream_patch
@@ -200,20 +256,37 @@ class LiteLLMAnthropicBridge:
             Route("/{path:path}", lambda _: Response(status_code=404), methods=["GET", "POST"]),
         ])
 
+    # ── routing ──────────────────────────────────────────────────
+
+    def _resolve_route(self, request_model: str | None) -> _ModelRoute:
+        """Look up the route for *request_model*, falling back to primary."""
+        if request_model and request_model in self._routes:
+            return self._routes[request_model]
+        # Fallback: use the primary (main agent) route.
+        return self._primary
+
     # ── request building ─────────────────────────────────────────
 
     def _build_kwargs(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Build kwargs for ``litellm.anthropic.messages.acreate``."""
-        kwargs = sanitize_payload(payload, self._transport)
-        kwargs = clamp_max_tokens(kwargs, self._transport, self._model.max_tokens)
-        kwargs["model"] = self._transport.model
-        kwargs["custom_llm_provider"] = self._transport.custom_llm_provider
-        kwargs.setdefault("max_tokens", self._model.max_tokens)
-        kwargs["timeout"] = self._model.timeout_seconds
-        if self._model.api_key:
-            kwargs["api_key"] = self._model.api_key
-        if self._transport.api_base:
-            kwargs["api_base"] = self._transport.api_base
+        """Build kwargs for ``litellm.anthropic.messages.acreate``.
+
+        Dispatches to the correct provider credentials by looking up the
+        ``model`` field in the incoming request against the routing table.
+        """
+        route = self._resolve_route(payload.get("model"))
+        transport = route.transport
+        cfg = route.config
+
+        kwargs = sanitize_payload(payload, transport)
+        kwargs = clamp_max_tokens(kwargs, transport, cfg.max_tokens)
+        kwargs["model"] = transport.model
+        kwargs["custom_llm_provider"] = transport.custom_llm_provider
+        kwargs.setdefault("max_tokens", cfg.max_tokens)
+        kwargs["timeout"] = cfg.timeout_seconds
+        if cfg.api_key:
+            kwargs["api_key"] = cfg.api_key
+        if transport.api_base:
+            kwargs["api_base"] = transport.api_base
         return kwargs
 
     # ── streaming ─────────────────────────────────────────────────
@@ -246,6 +319,7 @@ class LiteLLMAnthropicBridge:
         if not callable(counter):
             return 0
 
+        route = self._resolve_route(payload.get("model"))
         messages = list(payload.get("messages") or [])
         system = payload.get("system")
         if system:
@@ -253,7 +327,7 @@ class LiteLLMAnthropicBridge:
             if text:
                 messages = [{"role": "system", "content": text}, *messages]
         try:
-            return int(counter(model=self._transport.model, messages=messages))
+            return int(counter(model=route.transport.model, messages=messages))
         except Exception:
             return 0
 
@@ -275,16 +349,41 @@ class LiteLLMAnthropicBridge:
 # ── public entry point ───────────────────────────────────────────
 
 
-async def prepare_model_endpoint(model: ModelConfig) -> PreparedModelEndpoint:
-    """Resolve the SDK-facing endpoint for this run."""
+async def prepare_model_endpoint(
+    model: ModelConfig,
+    extra_models: dict[str, ModelConfig] | None = None,
+) -> PreparedModelEndpoint:
+    """Resolve the SDK-facing endpoint for this run.
+
+    Parameters
+    ----------
+    model:
+        The main agent's :class:`ModelConfig`.
+    extra_models:
+        Optional mapping of ``model_name → ModelConfig`` for sub-agents
+        whose models differ from the main agent.  When provided and at
+        least one entry requires a non-Anthropic transport, a multi-model
+        bridge is started so that every model (including Anthropic ones)
+        can be routed through a single local HTTP endpoint.
+    """
     transport = resolve_model_transport(model)
-    if transport.protocol == "anthropic":
+
+    # Determine whether *any* model (main or sub) needs a bridge.
+    need_bridge = transport.protocol != "anthropic"
+    if not need_bridge and extra_models:
+        for cfg in extra_models.values():
+            if resolve_model_transport(cfg).protocol != "anthropic":
+                need_bridge = True
+                break
+
+    if not need_bridge:
         return PreparedModelEndpoint(
             model=transport.model,
             api_key=model.api_key,
             base_url=transport.api_base,
         )
-    bridge = await LiteLLMAnthropicBridge(model).start()
+
+    bridge = await LiteLLMAnthropicBridge(model, extra_models).start()
     return PreparedModelEndpoint(
         model=model.model,
         api_key="cckit-bridge",

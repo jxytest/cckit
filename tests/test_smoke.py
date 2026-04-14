@@ -243,9 +243,9 @@ def test_prepare_model_endpoint_uses_litellm_bridge_for_plain_model(monkeypatch)
     assert prepared.api_key == "cckit-bridge"
     assert prepared.base_url == "http://127.0.0.1:41001"
     assert prepared.bridge is not None
-    assert prepared.bridge._model.model == "claude-sonnet-4-6"
-    assert prepared.bridge._transport.protocol == "chat"
-    assert prepared.bridge._transport.custom_llm_provider == "openai"
+    assert prepared.bridge._primary.config.model == "claude-sonnet-4-6"
+    assert prepared.bridge._primary.transport.protocol == "chat"
+    assert prepared.bridge._primary.transport.custom_llm_provider == "openai"
 
 
 def test_prepare_model_endpoint_missing_litellm_is_clear(monkeypatch):
@@ -319,9 +319,9 @@ def test_prepare_model_endpoint_prefixed_model_uses_bridge(monkeypatch):
     assert prepared.api_key == "cckit-bridge"
     assert prepared.base_url == "http://127.0.0.1:41001"
     assert prepared.bridge is not None
-    assert prepared.bridge._model.model == "openai/gpt-4o-mini"
-    assert prepared.bridge._transport.protocol == "responses"
-    assert prepared.bridge._transport.custom_llm_provider == "openai"
+    assert prepared.bridge._primary.config.model == "openai/gpt-4o-mini"
+    assert prepared.bridge._primary.transport.protocol == "responses"
+    assert prepared.bridge._primary.transport.custom_llm_provider == "openai"
 
 
 def test_bridge_chat_transport_drops_anthropic_only_fields():
@@ -334,7 +334,7 @@ def test_bridge_chat_transport_drops_anthropic_only_fields():
         )
     )
 
-    kwargs = bridge._build_litellm_kwargs(
+    kwargs = bridge._build_kwargs(
         {
             "messages": [{"role": "user", "content": "hello"}],
             "output_config": {"format": "json_schema"},
@@ -360,7 +360,7 @@ def test_bridge_chat_transport_clamps_max_tokens_to_model_config():
         )
     )
 
-    kwargs = bridge._build_litellm_kwargs(
+    kwargs = bridge._build_kwargs(
         {
             "messages": [{"role": "user", "content": "hello"}],
             "max_tokens": 32000,
@@ -380,7 +380,7 @@ def test_bridge_responses_transport_preserves_anthropic_only_fields():
         )
     )
 
-    kwargs = bridge._build_litellm_kwargs(
+    kwargs = bridge._build_kwargs(
         {
             "messages": [{"role": "user", "content": "hello"}],
             "output_config": {"format": "json_schema"},
@@ -406,7 +406,7 @@ def test_bridge_responses_transport_does_not_clamp_max_tokens():
         )
     )
 
-    kwargs = bridge._build_litellm_kwargs(
+    kwargs = bridge._build_kwargs(
         {
             "messages": [{"role": "user", "content": "hello"}],
             "max_tokens": 32000,
