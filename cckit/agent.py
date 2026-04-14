@@ -13,9 +13,12 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from cckit.types import AgentResult, ModelConfig, RunContext, SandboxOptions
+from cckit.types import AgentResult, ModelConfig, RunContext, SandboxOptions, TaskBudgetConfig
+
+if TYPE_CHECKING:
+    from claude_agent_sdk.types import HookEvent, HookMatcher
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +75,42 @@ class Agent:
         Optional sandbox policy for this agent. Workspace root remains a
         Runner-level infrastructure concern; per-agent sandbox rules such as
         enabled/read-write/network policy belong here.
+    hooks:
+        Claude native hook configurations.  Maps hook events (e.g.
+        ``"PreToolUse"``, ``"PostToolUse"``) to a list of :class:`HookMatcher`
+        objects, each of which holds Python async callback functions invoked by
+        the SDK at the corresponding lifecycle point.
+
+        Example::
+
+            from claude_agent_sdk import HookMatcher
+            from claude_agent_sdk.types import PreToolUseHookInput, SyncHookJSONOutput
+
+            async def audit_bash(input, tool_use_id, ctx) -> SyncHookJSONOutput:
+                print(f"Bash called: {input['tool_input']}")
+                return {}
+
+            agent = Agent(
+                name="audited",
+                hooks={
+                    "PreToolUse": [HookMatcher(matcher="Bash", hooks=[audit_bash])],
+                },
+            )
+
+    task_budget:
+        API-side token budget hint.  When set, the model is made aware of its
+        remaining token budget so it can pace tool use and wrap up before the
+        limit is reached.  Uses the SDK's ``task-budgets-2026-03-13`` beta
+        header automatically.
+
+        Example::
+
+            from cckit import Agent, TaskBudgetConfig
+
+            agent = Agent(
+                name="budget-agent",
+                task_budget=TaskBudgetConfig(total=50_000),
+            )
 
     Lifecycle callbacks (optional):
     on_before:
@@ -103,6 +142,8 @@ class Agent:
         max_turns: int = 0,
         effort: str | None = None,
         sandbox: SandboxOptions | None = None,
+        hooks: dict[HookEvent, list[HookMatcher]] | None = None,
+        task_budget: TaskBudgetConfig | None = None,
         # Lifecycle callbacks
         on_before: LifecycleBeforeFn | None = None,
         on_prepare_workspace: LifecycleBeforeFn | None = None,
@@ -122,6 +163,8 @@ class Agent:
         self.max_turns = max_turns
         self.effort = effort
         self._sandbox = sandbox
+        self.hooks: dict[str, list[Any]] | None = hooks  # type: ignore[assignment]
+        self.task_budget: TaskBudgetConfig | None = task_budget
 
         # Normalize model → ModelConfig | None
         if model is None:

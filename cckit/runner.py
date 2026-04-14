@@ -33,6 +33,7 @@ from cckit.types import (
     RunnerConfig,
     SandboxOptions,
     StreamResult,
+    TaskBudgetConfig,
     TaskStatus,
     _ResultHolder,
 )
@@ -777,5 +778,14 @@ class Runner:
         # -- resume implies continue_conversation (unless forking) --
         if ctx.resume_session_id and not ctx.fork_session:
             opts.continue_conversation = True
+
+        # -- Claude native hooks --
+        if agent.hooks:
+            opts.hooks = agent.hooks  # type: ignore[assignment]
+
+        # -- task budget --
+        if agent.task_budget is not None:
+            from claude_agent_sdk.types import TaskBudget  # noqa: WPS433
+            opts.task_budget = TaskBudget(total=agent.task_budget.total)
 
         return opts

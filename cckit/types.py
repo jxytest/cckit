@@ -503,6 +503,39 @@ class StreamResult:
 
 
 # ---------------------------------------------------------------------------
+# Task budget
+# ---------------------------------------------------------------------------
+
+
+class TaskBudgetConfig(CustomModel):
+    """API-side task budget configuration — controls the model's token budget awareness.
+
+    When set, the model is made aware of its remaining token budget so it can
+    pace tool use and wrap up gracefully before the limit is reached.  Sent as
+    ``output_config.task_budget`` with the ``task-budgets-2026-03-13`` beta
+    header by the SDK.
+
+    Fields
+    ------
+    total:
+        Total token budget for the task (input + output tokens combined).
+        The model will try to finish within this budget.
+
+    Usage::
+
+        from cckit import Agent, TaskBudgetConfig
+
+        agent = Agent(
+            name="budget-agent",
+            task_budget=TaskBudgetConfig(total=50_000),
+            instruction="Analyze and summarize the codebase.",
+        )
+    """
+
+    total: int
+
+
+# ---------------------------------------------------------------------------
 # Sandbox options
 # ---------------------------------------------------------------------------
 

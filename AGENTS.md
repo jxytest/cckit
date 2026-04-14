@@ -310,6 +310,60 @@ CckitError                        # 根异常
 └── GitLabAPIError                # GitLab API 调用失败
 ```
 
+## 16. Claude Hooks（原生钩子）
+
+cckit 通过 `Agent(hooks=...)` 直接透传 SDK 的 `hooks` 参数，支持 Claude 原生 10 种 Hook 事件。Hook 回调在 **SDK 进程内**（Python 侧）同步执行，无需外部进程。
+
+### 支持的 Hook 事件
+
+| 事件 | 触发时机 |
+|------|----------|
+| `PreToolUse` | 工具调用前（可拦截 / 修改输入） |
+| `PostToolUse` | 工具调用成功后 |
+| `PostToolUseFailure` | 工具调用失败后 |
+| `UserPromptSubmit` | 用户提示提交时 |
+| `Stop` | 主 Agent 停止时 |
+| `SubagentStop` | 子 Agent 停止时 |
+| `SubagentStart` | 子 Agent 启动时 |
+| `PreCompact` | 上下文压缩前 |
+| `Notification` | Claude 发出通知时 |
+| `PermissionRequest` | 权限请求时 |
+
+### Hook 回调签名
+
+```python
+async def my_hook(
+    input: HookInput,         # 事件输入（强类型 TypedDict）
+    tool_use_id: str | None,  # 工具调用 ID（仅工具类事件有值）
+    ctx: HookContext,         # Hook 上下文（含 abort signal）
+) -> HookJSONOutput:          # 返回控制指令（可返回空 {} 表示放行）
+    ...
+```
+
+`HookJSONOutput` 可以是 `SyncHookJSONOutput`（同步控制）或 `AsyncHookJSONOutput`（异步延迟执行）。
+
+### HookMatcher
+
+```python
+from claude_agent_sdk import HookMatcher
+
+HookMatcher(
+    matcher="Bash",           # 匹配字符串（如工具名），None = 匹配所有
+    hooks=[my_hook],          # 回调列表
+    timeout=30.0,             # 单个 Hook 超时秒数（默认 60）
+)
+```
+
+## 17. TaskBudget（Token 预算）
+
+`TaskBudgetConfig` 向模型声明 token 预算，使模型能主动控制工具使用节奏，在达到上限前优雅收尾。由 SDK 以 `task-budgets-2026-03-13` Beta Header 发送。
+
+```python
+TaskBudgetConfig(
+    total=50_000,  # 总 token 预算（输入 + 输出之和）
+)
+```
+
 ## 13. 验证方式
 
 ```bash
