@@ -54,6 +54,7 @@ from cckit.runner import Runner
 # Data types
 from cckit.types import (
     AgentResult,
+    ContextConfig,
     GitConfig,
     ModelConfig,
     RunContext,
@@ -72,6 +73,7 @@ __all__ = [
     "check_api_connectivity",
     # Types
     "AgentResult",
+    "ContextConfig",
     "GitConfig",
     "ModelConfig",
     "RunContext",

@@ -503,6 +503,84 @@ class StreamResult:
 
 
 # ---------------------------------------------------------------------------
+# Context window & auto-compact configuration
+# ---------------------------------------------------------------------------
+
+
+class ContextConfig(CustomModel):
+    """Context window and auto-compact configuration for an Agent.
+
+    Controls when Claude Code automatically compresses the conversation
+    context.  Under the hood, cckit translates these settings into CLI
+    environment variables (``CLAUDE_CODE_AUTO_COMPACT_WINDOW``,
+    ``CLAUDE_AUTOCOMPACT_PCT_OVERRIDE``) that are injected **per
+    subprocess**, so different Agents can have independent compact
+    thresholds even when running concurrently.
+
+    Fields
+    ------
+    max_context_tokens:
+        Effective context window size in tokens.  Defaults to the
+        ``max_tokens`` value from the Agent's :class:`ModelConfig`.
+        The CLI uses this value (instead of the model's native 200 K
+        window) to decide when to trigger auto-compact.
+    auto_compact_pct:
+        Percentage of the context window (0–100) at which auto-compact
+        fires.  Defaults to ``80`` (compact when 80 % of the window is
+        consumed).  Lower values trigger compaction earlier — useful for
+        small-context models.
+    disable_auto_compact:
+        When ``True``, disable automatic compaction entirely.  Manual
+        ``/compact`` still works.
+
+    Usage::
+
+        from cckit import Agent, ContextConfig
+
+        # 8 K model — compact at 60 %
+        agent = Agent(
+            name="small-model",
+            model=ModelConfig(model="openai/gpt-4o-mini", max_tokens=8192),
+            context=ContextConfig(auto_compact_pct=60),
+        )
+
+        # Explicit context window override (ignores ModelConfig.max_tokens)
+        agent = Agent(
+            name="custom-window",
+            context=ContextConfig(max_context_tokens=4096, auto_compact_pct=50),
+        )
+    """
+
+    max_context_tokens: int | None = None
+    auto_compact_pct: int = 80
+    disable_auto_compact: bool = False
+
+    def effective_max_context_tokens(self, model_max_tokens: int) -> int:
+        """Return the effective context window size.
+
+        If ``max_context_tokens`` is explicitly set, it takes precedence.
+        Otherwise falls back to ``model_max_tokens`` (typically
+        ``ModelConfig.max_tokens``).
+        """
+        return self.max_context_tokens if self.max_context_tokens is not None else model_max_tokens
+
+    def to_env(self, model_max_tokens: int) -> dict[str, str]:
+        """Translate this config into CLI environment variables.
+
+        Returns a dict suitable for merging into ``RunContext.env`` /
+        ``ClaudeAgentOptions.env``.
+        """
+        env: dict[str, str] = {}
+        window = self.effective_max_context_tokens(model_max_tokens)
+        env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(window)
+        if self.auto_compact_pct != 80:
+            env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = str(self.auto_compact_pct)
+        if self.disable_auto_compact:
+            env["DISABLE_AUTO_COMPACT"] = "1"
+        return env
+
+
+# ---------------------------------------------------------------------------
 # Task budget
 # ---------------------------------------------------------------------------
 

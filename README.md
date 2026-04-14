@@ -402,128 +402,68 @@ agent = Agent(
 )
 ```
 
-## Claude Hooks（原生钩子）
+## Hooks / TaskBudget / ContextConfig
 
-`Agent` 支持 `hooks` 参数，直接透传给 Claude SDK，在 Agent 执行过程中拦截工具调用、权限请求、通知等事件。
+### Hooks（原生钩子）
 
-### 支持的 Hook 事件
-
-| 事件 | 触发时机 |
-|------|----------|
-| `PreToolUse` | 工具调用前（可拦截 / 修改输入 / 拒绝） |
-| `PostToolUse` | 工具调用成功后（可追加上下文） |
-| `PostToolUseFailure` | 工具调用失败后 |
-| `UserPromptSubmit` | 用户提示提交时 |
-| `Stop` | 主 Agent 停止时 |
-| `SubagentStop` | 子 Agent 停止时 |
-| `SubagentStart` | 子 Agent 启动时 |
-| `PreCompact` | 上下文压缩前 |
-| `Notification` | Claude 发出通知时 |
-| `PermissionRequest` | 权限请求时 |
-
-### Hook 回调签名
-
-```python
-from claude_agent_sdk.types import HookInput, HookContext, SyncHookJSONOutput
-
-async def my_hook(
-    input: HookInput,         # 事件输入（强类型 TypedDict，按 hook_event_name 分发）
-    tool_use_id: str | None,  # 工具调用 ID（仅工具类事件有值）
-    ctx: HookContext,         # Hook 上下文
-) -> SyncHookJSONOutput:      # 返回控制指令，空 {} 表示放行
-    ...
-```
-
-### 基础用法
+`hooks` 透传 Claude SDK 原生钩子，拦截工具调用、压缩、通知等事件。支持 10 种事件：`PreToolUse`、`PostToolUse`、`PostToolUseFailure`、`UserPromptSubmit`、`Stop`、`SubagentStop`、`SubagentStart`、`PreCompact`、`Notification`、`PermissionRequest`。
 
 ```python
 from cckit import Agent
 from claude_agent_sdk import HookMatcher
 from claude_agent_sdk.types import PreToolUseHookInput, SyncHookJSONOutput
 
-async def log_bash(input: PreToolUseHookInput, tool_use_id, ctx) -> SyncHookJSONOutput:
-    print(f"[PreToolUse] Bash: {input['tool_input'].get('command', '')[:80]}")
-    return {}  # 空 dict = 放行
-
-agent = Agent(
-    name="audited-agent",
-    tools=["Bash", "Read"],
-    hooks={
-        "PreToolUse": [HookMatcher(matcher="Bash", hooks=[log_bash])],
-    },
-)
-```
-
-### 拦截工具调用
-
-```python
 async def block_rm(input: PreToolUseHookInput, tool_use_id, ctx) -> SyncHookJSONOutput:
-    cmd = input["tool_input"].get("command", "")
-    if "rm -rf" in cmd:
-        return {
-            "continue_": False,
-            "stopReason": "rm -rf is not allowed",
-        }
-    return {}
+    if "rm -rf" in input["tool_input"].get("command", ""):
+        return {"continue_": False, "stopReason": "rm -rf is not allowed"}
+    return {}  # 空 dict = 放行
 
 agent = Agent(
     name="safe-agent",
     tools=["Bash"],
-    hooks={
-        "PreToolUse": [HookMatcher(matcher="Bash", hooks=[block_rm])],
-    },
+    hooks={"PreToolUse": [HookMatcher(matcher="Bash", hooks=[block_rm])]},
 )
 ```
 
-### 修改工具输入（PreToolUse updatedInput）
+### TaskBudget（Token 预算）
 
-```python
-from claude_agent_sdk.types import PreToolUseHookSpecificOutput, SyncHookJSONOutput
-
-async def sanitize_bash(input: PreToolUseHookInput, tool_use_id, ctx) -> SyncHookJSONOutput:
-    tool_input = dict(input["tool_input"])
-    # 强制加上 --dry-run
-    tool_input["command"] = tool_input.get("command", "") + " --dry-run"
-    return {
-        "hookSpecificOutput": PreToolUseHookSpecificOutput(
-            hookEventName="PreToolUse",
-            updatedInput=tool_input,
-        ),
-    }
-```
-
-### 多事件组合
-
-```python
-agent = Agent(
-    name="monitored-agent",
-    tools=["Bash", "Write", "Edit"],
-    hooks={
-        "PreToolUse":  [HookMatcher(hooks=[pre_hook])],   # 匹配所有工具
-        "PostToolUse": [HookMatcher(matcher="Write|Edit", hooks=[post_write_hook])],
-        "Notification": [HookMatcher(hooks=[notify_hook])],
-    },
-)
-```
-
-## TaskBudget（Token 预算）
-
-`task_budget` 参数向模型声明 token 预算，使模型能主动控制工具使用节奏，在达到上限前优雅收尾。
+声明 token 总预算，模型会在接近上限时主动收尾，避免硬截断。
 
 ```python
 from cckit import Agent, TaskBudgetConfig
 
 agent = Agent(
     name="budget-agent",
-    instruction="Analyze the codebase and generate a summary.",
-    tools=["Read", "Grep"],
-    task_budget=TaskBudgetConfig(total=50_000),  # 5 万 token 预算
+    task_budget=TaskBudgetConfig(total=50_000),  # 输入 + 输出 token 总预算
 )
 ```
 
-`total` 为输入 + 输出 token 的总预算（整数）。超出预算后模型会尝试尽快结束任务，而非被硬截断。
+### ContextConfig（上下文窗口与自动压缩）
 
-> **底层机制**：cckit 将 `TaskBudgetConfig` 转换为 SDK 的 `TaskBudget(total=...)` TypedDict，由 SDK 通过 `task-budgets-2026-03-13` Beta Header 发送给 API。
+控制上下文窗口大小和自动压缩触发时机，适用于小上下文模型（如 8K）。每个 Agent 独立子进程，配置互不影响。
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `max_context_tokens` | `ModelConfig.max_tokens` | 上下文窗口大小 |
+| `auto_compact_pct` | `80` | 使用率达到此百分比时触发压缩 |
+| `disable_auto_compact` | `False` | 禁用自动压缩 |
+
+```python
+from cckit import Agent, ContextConfig, ModelConfig
+
+# 8K 模型 — 60% 时压缩
+agent = Agent(
+    name="small-model",
+    model=ModelConfig(model="openai/gpt-4o-mini", max_tokens=8192),
+    context=ContextConfig(auto_compact_pct=60),
+)
+
+# 手动指定窗口大小
+agent = Agent(
+    name="custom-window",
+    context=ContextConfig(max_context_tokens=4096, auto_compact_pct=50),
+)
+```
 
 ## 示例
 

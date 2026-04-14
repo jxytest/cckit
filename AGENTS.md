@@ -73,7 +73,7 @@ tests/
 ## 4. 核心三层设计
 
 ```
-Agent = "我是谁" → name, instruction, tools, sub_agents, skills, model, sandbox
+Agent = "我是谁" → name, instruction, tools, sub_agents, skills, model, sandbox, hooks, task_budget, context
 RunContext = "怎么跑" → workspace, git(GitConfig), prompt, params, env
 Runner = "执行引擎" → default_model、workspace_root、中间件、并发控制、SDK 桥接
 ```
@@ -362,6 +362,52 @@ HookMatcher(
 TaskBudgetConfig(
     total=50_000,  # 总 token 预算（输入 + 输出之和）
 )
+```
+
+## 18. ContextConfig（上下文窗口与自动压缩）
+
+`ContextConfig` 控制 Claude Code 的上下文窗口大小和自动压缩触发时机。cckit 将其转换为 CLI 环境变量注入到 Agent 子进程中，**每个 Agent 独立进程，互不影响**。
+
+```python
+ContextConfig(
+    max_context_tokens=None,   # 默认取 ModelConfig.max_tokens
+    auto_compact_pct=80,       # 上下文使用率 80% 时触发压缩
+    disable_auto_compact=False, # 禁用自动压缩
+)
+```
+
+### 环境变量映射
+
+| ContextConfig 字段 | CLI 环境变量 | 说明 |
+|---|---|---|
+| `max_context_tokens` / `ModelConfig.max_tokens` | `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | 上下文窗口大小 |
+| `auto_compact_pct` | `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` | 压缩触发百分比（仅非 80 时设置） |
+| `disable_auto_compact` | `DISABLE_AUTO_COMPACT` | 禁用自动压缩 |
+
+### CLI 源码中的阈值计算
+
+```
+effectiveContextWindow = min(modelContextWindow, CLAUDE_CODE_AUTO_COMPACT_WINDOW)
+                       - min(maxOutputTokens, 20_000)
+
+autoCompactThreshold = effectiveContextWindow - 13_000  // AUTOCOMPACT_BUFFER_TOKENS
+
+// 或用百分比覆盖：
+autoCompactThreshold = min(
+    effectiveContextWindow * CLAUDE_AUTOCOMPACT_PCT_OVERRIDE%,
+    effectiveContextWindow - 13_000
+)
+```
+
+### Runner 中的注入位置
+
+`runner.py` `_build_options()` 中，在 `env` 构建之后、模型端点覆盖之前：
+
+```python
+env: dict[str, str] = dict(ctx.env)
+context_cfg = agent.context
+if context_cfg is not None:
+    env.update(context_cfg.to_env(model.max_tokens))
 ```
 
 ## 13. 验证方式

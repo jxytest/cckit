@@ -15,7 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from cckit.types import AgentResult, ModelConfig, RunContext, SandboxOptions, TaskBudgetConfig
+from cckit.types import AgentResult, ContextConfig, ModelConfig, RunContext, SandboxOptions, TaskBudgetConfig
 
 if TYPE_CHECKING:
     from claude_agent_sdk.types import HookEvent, HookMatcher
@@ -112,6 +112,23 @@ class Agent:
                 task_budget=TaskBudgetConfig(total=50_000),
             )
 
+    context:
+        Context window and auto-compact configuration.  Controls when Claude
+        Code automatically compresses the conversation context.  By default,
+        the context window size is derived from ``ModelConfig.max_tokens``
+        and auto-compact triggers at 80 %.
+
+        Example::
+
+            from cckit import Agent, ContextConfig, ModelConfig
+
+            # 8 K model — compact at 60 %
+            agent = Agent(
+                name="small-model",
+                model=ModelConfig(model="openai/gpt-4o-mini", max_tokens=8192),
+                context=ContextConfig(auto_compact_pct=60),
+            )
+
     Lifecycle callbacks (optional):
     on_before:
         ``async def (ctx: RunContext) -> None`` — called before execution.
@@ -144,6 +161,7 @@ class Agent:
         sandbox: SandboxOptions | None = None,
         hooks: dict[HookEvent, list[HookMatcher]] | None = None,
         task_budget: TaskBudgetConfig | None = None,
+        context: ContextConfig | None = None,
         # Lifecycle callbacks
         on_before: LifecycleBeforeFn | None = None,
         on_prepare_workspace: LifecycleBeforeFn | None = None,
@@ -165,6 +183,7 @@ class Agent:
         self._sandbox = sandbox
         self.hooks: dict[str, list[Any]] | None = hooks  # type: ignore[assignment]
         self.task_budget: TaskBudgetConfig | None = task_budget
+        self.context: ContextConfig | None = context
 
         # Normalize model → ModelConfig | None
         if model is None:
