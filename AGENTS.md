@@ -368,9 +368,11 @@ TaskBudgetConfig(
 
 `ContextConfig` 控制 Claude Code 的上下文窗口大小和自动压缩触发时机。cckit 将其转换为 CLI 环境变量注入到 Agent 子进程中，**每个 Agent 独立进程，互不影响**。
 
+> **重要**：`max_context_tokens` 是上下文窗口大小（输入+输出总量），与 `ModelConfig.max_tokens`（最大输出 token 数）是不同概念。`max_context_tokens` 默认为 `None`，表示使用模型原生上下文窗口，不会回退到 `ModelConfig.max_tokens`。
+
 ```python
 ContextConfig(
-    max_context_tokens=None,   # 默认取 ModelConfig.max_tokens
+    max_context_tokens=None,   # None = 使用模型原生上下文窗口（非 max_tokens）
     auto_compact_pct=80,       # 上下文使用率 80% 时触发压缩
     disable_auto_compact=False, # 禁用自动压缩
 )
@@ -380,7 +382,7 @@ ContextConfig(
 
 | ContextConfig 字段 | CLI 环境变量 | 说明 |
 |---|---|---|
-| `max_context_tokens` / `ModelConfig.max_tokens` | `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | 上下文窗口大小 |
+| `max_context_tokens` | `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | 上下文窗口大小（仅非 None 时设置） |
 | `auto_compact_pct` | `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` | 压缩触发百分比（仅非 80 时设置） |
 | `disable_auto_compact` | `DISABLE_AUTO_COMPACT` | 禁用自动压缩 |
 
@@ -407,7 +409,7 @@ autoCompactThreshold = min(
 env: dict[str, str] = dict(ctx.env)
 context_cfg = agent.context
 if context_cfg is not None:
-    env.update(context_cfg.to_env(model.max_tokens))
+    env.update(context_cfg.to_env())
 ```
 
 ## 13. 验证方式

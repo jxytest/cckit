@@ -114,19 +114,19 @@ class Agent:
 
     context:
         Context window and auto-compact configuration.  Controls when Claude
-        Code automatically compresses the conversation context.  By default,
-        the context window size is derived from ``ModelConfig.max_tokens``
-        and auto-compact triggers at 80 %.
+        Code automatically compresses the conversation context.  When
+        ``max_context_tokens`` is not set, the CLI uses the model's native
+        context window; auto-compact triggers at 80 % by default.
 
         Example::
 
             from cckit import Agent, ContextConfig, ModelConfig
 
-            # 8 K model — compact at 60 %
+            # 8 K context model — compact at 60 %
             agent = Agent(
                 name="small-model",
-                model=ModelConfig(model="openai/gpt-4o-mini", max_tokens=8192),
-                context=ContextConfig(auto_compact_pct=60),
+                model=ModelConfig(model="openai/gpt-4o-mini", max_tokens=4096),
+                context=ContextConfig(max_context_tokens=8192, auto_compact_pct=60),
             )
 
     Lifecycle callbacks (optional):

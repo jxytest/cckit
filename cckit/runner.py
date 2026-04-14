@@ -696,7 +696,7 @@ class Runner:
         # -- ContextConfig → CLI env vars (auto-compact threshold, etc.) --
         context_cfg = agent.context
         if context_cfg is not None:
-            env.update(context_cfg.to_env(model.max_tokens))
+            env.update(context_cfg.to_env())
         if prepared_model.api_key:
             # ANTHROPIC_API_KEY  → sent as X-Api-Key header (direct Anthropic API)
             # ANTHROPIC_AUTH_TOKEN → sent as Authorization: Bearer header (LLM gateway / proxy)

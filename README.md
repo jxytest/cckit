@@ -442,26 +442,28 @@ agent = Agent(
 
 控制上下文窗口大小和自动压缩触发时机，适用于小上下文模型（如 8K）。每个 Agent 独立子进程，配置互不影响。
 
+> **注意**：`max_context_tokens` 是上下文窗口大小（输入+输出总量），与 `ModelConfig.max_tokens`（最大输出 token 数）不同，不要混淆。
+
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
-| `max_context_tokens` | `ModelConfig.max_tokens` | 上下文窗口大小 |
+| `max_context_tokens` | `None`（使用模型原生窗口） | 上下文窗口大小 |
 | `auto_compact_pct` | `80` | 使用率达到此百分比时触发压缩 |
 | `disable_auto_compact` | `False` | 禁用自动压缩 |
 
 ```python
 from cckit import Agent, ContextConfig, ModelConfig
 
-# 8K 模型 — 60% 时压缩
+# 8K 上下文模型 — 60% 时压缩
 agent = Agent(
     name="small-model",
-    model=ModelConfig(model="openai/gpt-4o-mini", max_tokens=8192),
-    context=ContextConfig(auto_compact_pct=60),
+    model=ModelConfig(model="openai/gpt-4o-mini", max_tokens=4096),
+    context=ContextConfig(max_context_tokens=8192, auto_compact_pct=60),
 )
 
-# 手动指定窗口大小
+# 只调整压缩百分比，窗口大小用模型默认值
 agent = Agent(
-    name="custom-window",
-    context=ContextConfig(max_context_tokens=4096, auto_compact_pct=50),
+    name="early-compact",
+    context=ContextConfig(auto_compact_pct=50),
 )
 ```
 
