@@ -20,6 +20,48 @@ from cckit.exceptions import AgentExecutionError
 logger = logging.getLogger(__name__)
 
 
+def _patch_log_cli_command() -> None:
+    """Monkey-patch SubprocessCLITransport to log the real CLI command once.
+
+    The patch wraps ``start()`` so that the ``_build_command()`` result is
+    logged at DEBUG level right before the subprocess is launched.  It is
+    idempotent — the original ``start`` is stored on the class the first time
+    and reused on subsequent calls.
+    """
+    try:
+        from claude_agent_sdk._internal.transport.subprocess_cli import (  # noqa: WPS433
+            SubprocessCLITransport,
+        )
+    except ImportError:
+        return
+
+    if getattr(SubprocessCLITransport, "_cckit_start_patched", False):
+        return  # already patched
+
+    original_start = SubprocessCLITransport.start  # type: ignore[attr-defined]
+
+    async def _patched_start(self: Any) -> None:  # type: ignore[no-untyped-def]
+        cmd = self._build_command()
+        # Mask sensitive flags: --api-key / anything that looks like a token
+        _SENSITIVE = {"--api-key", "--auth-token"}
+        safe_cmd: list[str] = []
+        skip_next = False
+        for part in cmd:
+            if skip_next:
+                safe_cmd.append("***")
+                skip_next = False
+            elif part in _SENSITIVE:
+                safe_cmd.append(part)
+                skip_next = True
+            else:
+                safe_cmd.append(part)
+        logger.debug("[CLI command] %s", " ".join(safe_cmd))
+        await original_start(self)
+
+    SubprocessCLITransport.start = _patched_start  # type: ignore[method-assign]
+    SubprocessCLITransport._cckit_start_patched = True  # type: ignore[attr-defined]
+
+
 async def run_sdk_query(
     prompt: str,
     options: Any,
@@ -38,6 +80,8 @@ async def run_sdk_query(
             "claude-agent-sdk is not installed",
             detail=str(exc),
         ) from exc
+
+    _patch_log_cli_command()
 
     try:
         async for message in query(prompt=prompt, options=options):
