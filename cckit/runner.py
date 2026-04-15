@@ -975,4 +975,24 @@ class Runner:
             _safe_env,
         )
 
+        # -- log each sub-agent's configuration --
+        for sub in agent.sub_agents:
+            sub_def = agents.get(sub.name)
+            sub_cfg = self._resolve_model(sub, ctx)
+            logger.info(
+                "  Sub-agent config: name=%s model=%s "
+                "description=%s tools=%s disallowed_tools=%s "
+                "skills=%s max_turns=%s effort=%s "
+                "mcp_servers=%s",
+                sub.name,
+                sub_def.model if sub_def else sub_cfg.model,
+                sub.description or "(none)",
+                sub_def.tools if sub_def else sub.tools,
+                sub_def.disallowedTools if sub_def else sub.disallowed_tools,
+                sub_def.skills if sub_def else sub.skills,
+                sub_def.maxTurns if sub_def else sub.max_turns,
+                sub_def.effort if sub_def else sub.effort,
+                list(sub.mcp_servers.keys()) if sub.mcp_servers else [],
+            )
+
         return opts
