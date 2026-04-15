@@ -18,6 +18,42 @@ from typing import Any, Literal, cast
 from cckit._cli import check_api_connectivity, check_claude_cli
 from cckit._cost import recalculate_model_usage_costs
 from cckit._engine.model_bridge import PreparedModelEndpoint, prepare_model_endpoint
+
+
+def _patch_result_message_costs(
+    message: Any,
+    all_configs: dict[str, "ModelConfig"],
+) -> Any:
+    """Patch ``model_usage`` and ``total_cost_usd`` on a ``ResultMessage`` in-place.
+
+    If *message* is not a ``ResultMessage`` or has no ``model_usage``, it is
+    returned unchanged.  The patch is applied via ``object.__setattr__`` so it
+    works on frozen dataclasses too.
+    """
+    try:
+        from claude_agent_sdk import ResultMessage  # noqa: WPS433
+    except ImportError:
+        return message
+
+    if not isinstance(message, ResultMessage):
+        return message
+
+    model_usage = getattr(message, "model_usage", None)
+    if not model_usage or not isinstance(model_usage, dict):
+        return message
+
+    try:
+        recalculated = recalculate_model_usage_costs(model_usage, all_configs)
+        new_total_cost = sum(
+            u.get("costUSD", 0.0) for u in recalculated.values()
+            if isinstance(u, dict)
+        )
+        object.__setattr__(message, "model_usage", recalculated)
+        object.__setattr__(message, "total_cost_usd", new_total_cost)
+    except Exception:
+        logger.debug("Could not patch ResultMessage costs", exc_info=True)
+
+    return message
 from cckit._engine.model_transport import resolve_model_transport
 from cckit._engine.sdk_bridge import run_sdk_query
 from cckit._engine.state import RunState
@@ -339,7 +375,18 @@ class Runner:
             query_fn = self._build_middleware_chain(ctx)
             sdk_stream = query_fn(prompt, options, state)
 
+            # Build short-name → ModelConfig map once for cost recalculation
+            _short = lambda m: m.split("/")[-1] if "/" in m else m
+            _all_configs: dict[str, ModelConfig] = {_short(model.model): model}
+            for sub_cfg in extra_models.values():
+                _all_configs[_short(sub_cfg.model)] = sub_cfg
+
             async for message in sdk_stream:
+                # Recalculate costUSD on ResultMessage before yielding so that
+                # downstream consumers (event serialisers, loggers, etc.) always
+                # receive accurate pricing without needing their own patches.
+                message = _patch_result_message_costs(message, _all_configs)
+
                 # Lifecycle: on_message
                 try:
                     await agent.on_message_received(ctx, message)
@@ -350,29 +397,8 @@ class Runner:
             # --- build result ---
             duration = time.monotonic() - start
             final_message = state.final_message
-
-            # Recalculate costUSD in model_usage using LiteLLM pricing or
-            # user-configured per-token rates, replacing Claude Code's
-            # hardcoded Anthropic-only price table.
-            if final_message is not None and final_message.model_usage:
-                # Build short-name → ModelConfig map for all models in this run
-                _short = lambda m: m.split("/")[-1] if "/" in m else m
-                all_configs: dict[str, ModelConfig] = {_short(model.model): model}
-                for sub_cfg in extra_models.values():
-                    all_configs[_short(sub_cfg.model)] = sub_cfg
-
-                recalculated = recalculate_model_usage_costs(
-                    final_message.model_usage, all_configs
-                )
-                try:
-                    object.__setattr__(final_message, "model_usage", recalculated)
-                    new_total_cost = sum(
-                        u.get("costUSD", 0.0) for u in recalculated.values()
-                        if isinstance(u, dict)
-                    )
-                    object.__setattr__(final_message, "total_cost_usd", new_total_cost)
-                except Exception:
-                    logger.debug("Could not patch final_message costs", exc_info=True)
+            # final_message is the same object already patched above when it was
+            # yielded, so no second recalculation is needed here.
 
             if final_message is None:
                 holder.result = AgentResult(
@@ -448,7 +474,15 @@ class Runner:
                     raise HookError("after_execute", hook_exc) from hook_exc
 
                 # --- log final summary ---
-                usage = holder.result.usage or {}
+                # Aggregate token counts from model_usage (accurate) rather than
+                # result.usage which is the raw SDK usage object (often zeroed for
+                # non-Anthropic providers).
+                _model_usage: dict = {}
+                _fm = getattr(holder.result, "final_message", None)
+                if _fm is not None:
+                    _model_usage = getattr(_fm, "model_usage", None) or {}
+                _inp = sum(int(u.get("inputTokens", 0)) for u in _model_usage.values() if isinstance(u, dict))
+                _out = sum(int(u.get("outputTokens", 0)) for u in _model_usage.values() if isinstance(u, dict))
                 logger.info(
                     (
                         "Agent %s completed: task_id=%s session_id=%s "
@@ -461,9 +495,9 @@ class Runner:
                     holder.result.status,
                     holder.result.cost_usd,
                     holder.result.duration_seconds,
-                    usage.get("input_tokens", 0),
-                    usage.get("output_tokens", 0),
-                    usage.get("total_tokens", 0),
+                    _inp,
+                    _out,
+                    _inp + _out,
                 )
 
             # --- cleanup temporary askpass script ---
