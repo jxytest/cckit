@@ -347,7 +347,7 @@ class Runner:
             # bridge can route requests to the correct provider/credentials.
             extra_models: dict[str, ModelConfig] = {}
             for sub in agent.sub_agents:
-                sub_cfg = self._resolve_model(sub, ctx)
+                sub_cfg = self._resolve_model(sub, ctx, is_sub_agent=True)
                 if sub_cfg.model != model.model:
                     extra_models[sub_cfg.model] = sub_cfg
 
@@ -567,11 +567,28 @@ class Runner:
     # Model resolution
     # ------------------------------------------------------------------
 
-    def _resolve_model(self, agent: Agent, ctx: RunContext | None = None) -> ModelConfig:
-        """Merge agent model_config with runner defaults."""
+    def _resolve_model(
+        self,
+        agent: Agent,
+        ctx: RunContext | None = None,
+        *,
+        is_sub_agent: bool = False,
+    ) -> ModelConfig:
+        """Merge agent model_config with runner defaults.
+
+        ``ctx.model`` is a caller-level override intended for the **top-level**
+        agent only.  Sub-agents that declare their own ``model`` should honour
+        that declaration; ``ctx.model`` must NOT shadow it.
+        """
         agent_model = agent.model_config
         base = self._config.default_model
-        override_model = (ctx.model if ctx is not None else "").strip()
+        # ctx.model is only applied to the top-level agent, never to sub-agents
+        # that explicitly declare their own model.
+        override_model = (
+            ""
+            if is_sub_agent and agent_model is not None
+            else (ctx.model if ctx is not None else "").strip()
+        )
 
         if agent_model is None:
             if not override_model:
@@ -722,7 +739,7 @@ class Runner:
             # request to the correct provider.  Without a bridge (all models use
             # Anthropic), strip the LiteLLM prefix so the CLI receives a bare
             # Anthropic model ID it understands (e.g. "claude-haiku-4-5").
-            sub_cfg = self._resolve_model(sub, ctx)
+            sub_cfg = self._resolve_model(sub, ctx, is_sub_agent=True)
             if prepared_model.bridge is not None:
                 # Bridge is active — keep the full model name for routing.
                 agent_model_name: str | None = sub_cfg.model
@@ -978,7 +995,7 @@ class Runner:
         # -- log each sub-agent's configuration --
         for sub in agent.sub_agents:
             sub_def = agents.get(sub.name)
-            sub_cfg = self._resolve_model(sub, ctx)
+            sub_cfg = self._resolve_model(sub, ctx, is_sub_agent=True)
             logger.info(
                 "  Sub-agent config: name=%s model=%s "
                 "description=%s tools=%s disallowed_tools=%s "
