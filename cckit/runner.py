@@ -803,6 +803,20 @@ class Runner:
             # 打开agent team功能
             env.setdefault("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1")
 
+        # -- env isolation: blank-out os.environ keys not in the explicit env dict --
+        # The SDK's SubprocessCLITransport unconditionally inherits the host
+        # process's os.environ before merging options.env on top.  Since
+        # options.env is merged last, writing "" for every host variable that
+        # is NOT explicitly allowed effectively clears its value in the CLI
+        # subprocess (and transitively in every Bash child it spawns).
+        #
+        # Limitation: the variable name is still visible via `env`; only the
+        # value is wiped.  This is the best we can do within the SDK's
+        # dict[str, str] interface (None / unset is not supported upstream).
+        for _k, _v in os.environ.items():
+            if _k not in env:
+                env[_k] = ""
+
         # -- configurable SDK params --
         max_turns = agent.max_turns if agent.max_turns > 0 else model.max_turns
 
