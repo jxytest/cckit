@@ -201,7 +201,6 @@ class SandboxConfigBuilder:
 
         settings_json = json.dumps(settings_obj)
         logger.info("Sandbox settings JSON: %s", settings_json)
-        print("Sandbox settings JSON:", settings_json)
         return settings_json
 
     # ------------------------------------------------------------------

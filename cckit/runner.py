@@ -882,4 +882,27 @@ class Runner:
             from claude_agent_sdk.types import TaskBudget  # noqa: WPS433
             opts.task_budget = TaskBudget(total=agent.task_budget.total)
 
+        # -- log agent startup configuration --
+        _safe_env = {
+            k: ("***" if any(s in k.upper() for s in ("KEY", "TOKEN", "SECRET", "PASSWORD", "AUTH")) else v)
+            for k, v in env.items()
+        }
+        logger.info(
+            "Agent startup config: name=%s task_id=%s model=%s "
+            "permission_mode=%s max_turns=%d workspace=%s "
+            "tools=%s sub_agents=%s skills=%s "
+            "sandbox_enabled=%s env_keys=%s",
+            agent.name,
+            ctx.task_id,
+            prepared_model.model,
+            opts.permission_mode,
+            max_turns,
+            str(workspace_dir) if workspace_dir else None,
+            allowed_tools,
+            list(agents.keys()) if agents else [],
+            agent.skills or [],
+            sandbox.enabled,
+            _safe_env,
+        )
+
         return opts
