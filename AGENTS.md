@@ -450,6 +450,38 @@ if model.max_tokens is not None:
     env.setdefault("CLAUDE_CODE_MAX_OUTPUT_TOKENS", str(model.max_tokens))
 ```
 
+### ⚠️ 自动压缩总开关：`autoCompactEnabled` 在配置文件中，不是环境变量
+
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` / `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` 只控制**压缩触发阈值**，自动压缩的**总开关** `autoCompactEnabled` 存储在 Claude CLI 的全局配置文件 `~/.claude.json` 中（`$CLAUDE_CONFIG_DIR` 或 `$HOME`），**不受 cckit 注入的环境变量控制**。
+
+```
+isAutoCompactEnabled() 判断链：
+  1. DISABLE_COMPACT      env 为 truthy  → 关闭
+  2. DISABLE_AUTO_COMPACT env 为 truthy  → 关闭
+  3. ~/.claude.json 中 autoCompactEnabled 字段  ← 默认 true，但容器内该文件可能不存在
+```
+
+**容器部署时的常见陷阱**：容器内 `~/.claude.json` 不存在时，行为取决于 Claude CLI 版本——某些版本默认 `autoCompactEnabled: true`，某些版本需要手动创建配置文件。
+
+**解决方案**（三选一）：
+
+```bash
+# 方式 1（推荐）：容器启动时预置配置文件
+echo '{"autoCompactEnabled": true}' > ~/.claude.json
+
+# 方式 2：通过 CLAUDE_CONFIG_DIR 指向预置好的配置目录
+export CLAUDE_CONFIG_DIR=/path/to/config/dir
+# 确保该目录下有 .claude.json 包含 {"autoCompactEnabled": true}
+```
+
+```python
+# 方式 3：在 RunContext.env 中传入 CLAUDE_CONFIG_DIR
+ctx = RunContext(
+    prompt="...",
+    env={"CLAUDE_CONFIG_DIR": "/path/to/config/dir"},
+)
+```
+
 ## 13. 验证方式
 
 ```bash

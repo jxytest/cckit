@@ -21,8 +21,8 @@ from cckit._engine.model_bridge import PreparedModelEndpoint, prepare_model_endp
 
 
 def _patch_result_message_costs(
-    message: Any,
-    all_configs: dict[str, "ModelConfig"],
+        message: Any,
+        all_configs: dict[str, "ModelConfig"],
 ) -> Any:
     """Patch ``model_usage`` and ``total_cost_usd`` on a ``ResultMessage`` in-place.
 
@@ -54,6 +54,8 @@ def _patch_result_message_costs(
         logger.debug("Could not patch ResultMessage costs", exc_info=True)
 
     return message
+
+
 from cckit._engine.model_transport import resolve_model_transport
 from cckit._engine.sdk_bridge import run_sdk_query
 from cckit._engine.state import RunState
@@ -66,13 +68,11 @@ from cckit.sandbox.workspace import WorkspaceManager
 from cckit.skill.provisioner import SkillProvisioner
 from cckit.types import (
     AgentResult,
-    ContextConfig,
     ModelConfig,
     RunContext,
     RunnerConfig,
     SandboxOptions,
     StreamResult,
-    TaskBudgetConfig,
     TaskStatus,
     _ResultHolder,
 )
@@ -117,13 +117,13 @@ class Runner:
     """
 
     def __init__(
-        self,
-        *,
-        config: RunnerConfig | None = None,
-        middlewares: list[Middleware] | None = None,
-        workspace_manager: WorkspaceManager | None = None,
-        skill_provisioner: SkillProvisioner | None = None,
-        preflight_check: bool = False,
+            self,
+            *,
+            config: RunnerConfig | None = None,
+            middlewares: list[Middleware] | None = None,
+            workspace_manager: WorkspaceManager | None = None,
+            skill_provisioner: SkillProvisioner | None = None,
+            preflight_check: bool = False,
     ) -> None:
         # Validate Claude CLI on first Runner instantiation
         check_claude_cli()
@@ -154,9 +154,9 @@ class Runner:
     # ------------------------------------------------------------------
 
     async def run(
-        self,
-        agent: Agent,
-        ctx: RunContext,
+            self,
+            agent: Agent,
+            ctx: RunContext,
     ) -> AgentResult:
         """Run agent to completion and return the final result.
 
@@ -183,9 +183,9 @@ class Runner:
         )
 
     def run_stream(
-        self,
-        agent: Agent,
-        ctx: RunContext,
+            self,
+            agent: Agent,
+            ctx: RunContext,
     ) -> StreamResult:
         """Run *agent* and return a :class:`StreamResult` for streaming messages.
 
@@ -211,10 +211,10 @@ class Runner:
     # ------------------------------------------------------------------
 
     async def _execute(
-        self,
-        agent: Agent,
-        ctx: RunContext,
-        holder: _ResultHolder,
+            self,
+            agent: Agent,
+            ctx: RunContext,
+            holder: _ResultHolder,
     ) -> AsyncIterator[Any]:
         """Internal async generator — the full orchestration flow.
 
@@ -260,9 +260,9 @@ class Runner:
             # Claude Code rejects --dangerously-skip-permissions under root/sudo.
             # Fail fast here so callers get a clear error without needing debug logs.
             if (
-                not effective_sandbox.enabled
-                and self._config.permission_mode == "bypassPermissions"
-                and _is_root_user()
+                    not effective_sandbox.enabled
+                    and self._config.permission_mode == "bypassPermissions"
+                    and _is_root_user()
             ):
                 raise AgentExecutionError(
                     "Root execution does not support permission_mode='bypassPermissions'",
@@ -513,9 +513,9 @@ class Runner:
             #   - task succeeded       → cleanup (delete) by default
             if holder.workspace_dir:
                 should_suspend = (
-                    ctx.workspace.keep
-                    or holder.result is None
-                    or holder.result.status != TaskStatus.COMPLETED
+                        ctx.workspace.keep
+                        or holder.result is None
+                        or holder.result.status != TaskStatus.COMPLETED
                 )
                 if should_suspend:
                     await self._workspace.suspend(holder.workspace_dir)
@@ -645,8 +645,8 @@ class Runner:
     # ------------------------------------------------------------------
 
     def _build_middleware_chain(
-        self,
-        ctx: RunContext,
+            self,
+            ctx: RunContext,
     ) -> Any:
         """Wrap ``run_sdk_query`` with the middleware stack.
 
@@ -655,7 +655,7 @@ class Runner:
 
         # The innermost function — actual SDK call
         async def inner(
-            prompt: str, options: Any, state: Any
+                prompt: str, options: Any, state: Any
         ) -> AsyncIterator[Any]:
             async for message in run_sdk_query(prompt, options, state):
                 yield message
@@ -667,10 +667,10 @@ class Runner:
 
             def make_wrapper(middleware: Middleware, next_fn: Any) -> Any:
                 async def wrapper(
-                    prompt: str, options: Any, state: Any
+                        prompt: str, options: Any, state: Any
                 ) -> AsyncIterator[Any]:
                     async for message in middleware.wrap(
-                        next_fn, prompt, options, state, ctx
+                            next_fn, prompt, options, state, ctx
                     ):
                         yield message
 
@@ -685,15 +685,15 @@ class Runner:
     # ------------------------------------------------------------------
 
     def _build_options(
-        self,
-        agent: Agent,
-        ctx: RunContext,
-        model: ModelConfig,
-        prepared_model: PreparedModelEndpoint,
-        sandbox: SandboxOptions,
-        workspace_dir: Path | None,
-        instruction: str,
-        state: RunState,
+            self,
+            agent: Agent,
+            ctx: RunContext,
+            model: ModelConfig,
+            prepared_model: PreparedModelEndpoint,
+            sandbox: SandboxOptions,
+            workspace_dir: Path | None,
+            instruction: str,
+            state: RunState,
     ) -> Any:
         """Construct ``ClaudeAgentOptions`` from Agent + RunContext + resolved model."""
         from claude_agent_sdk import (  # noqa: WPS433
@@ -831,36 +831,36 @@ class Runner:
         _AGENT_ENV_PASSTHROUGH: frozenset[str] = frozenset(
             {
                 # --- shell / filesystem ---
-                "PATH",        # binary lookup — without this ls/git/python are gone
-                "HOME",        # many tools write config to $HOME
-                "USER",        # username (git author, some CLIs)
-                "LOGNAME",     # POSIX alias of USER
-                "SHELL",       # default shell for subprocess spawning
-                "TERM",        # terminal type (colour output, readline)
-                "LANG",        # locale — affects sort order, file encoding
-                "LC_ALL",      # overrides all LC_* at once
-                "LC_CTYPE",    # character classification / encoding
-                "TMPDIR",      # POSIX temp dir ($TMPDIR on macOS)
-                "TMP",         # Windows / some Linux tools
-                "TEMP",        # Windows alias
-                "PWD",         # current working directory
-                "OLDPWD",      # previous directory (cd -)
-                "SHLVL",       # shell nesting counter
+                "PATH",  # binary lookup — without this ls/git/python are gone
+                "HOME",  # many tools write config to $HOME
+                "USER",  # username (git author, some CLIs)
+                "LOGNAME",  # POSIX alias of USER
+                "SHELL",  # default shell for subprocess spawning
+                "TERM",  # terminal type (colour output, readline)
+                "LANG",  # locale — affects sort order, file encoding
+                "LC_ALL",  # overrides all LC_* at once
+                "LC_CTYPE",  # character classification / encoding
+                "TMPDIR",  # POSIX temp dir ($TMPDIR on macOS)
+                "TMP",  # Windows / some Linux tools
+                "TEMP",  # Windows alias
+                "PWD",  # current working directory
+                "OLDPWD",  # previous directory (cd -)
+                "SHLVL",  # shell nesting counter
                 # --- Python runtime (Claude CLI runs on Node but subprocesses may use py) ---
-                "PYTHONPATH",          # extra Python module search paths
-                "PYTHONUNBUFFERED",    # flush stdout/stderr immediately
-                "VIRTUAL_ENV",         # active venv (affects pip, python binary)
+                "PYTHONPATH",  # extra Python module search paths
+                "PYTHONUNBUFFERED",  # flush stdout/stderr immediately
+                "VIRTUAL_ENV",  # active venv (affects pip, python binary)
                 # --- Node.js / Claude CLI runtime ---
-                "NODE_PATH",           # Node module search path
-                "NODE_OPTIONS",        # Node JVM flags
-                "NVM_DIR",             # nvm installation root
-                "NVM_BIN",             # nvm active bin dir
+                "NODE_PATH",  # Node module search path
+                "NODE_OPTIONS",  # Node JVM flags
+                "NVM_DIR",  # nvm installation root
+                "NVM_BIN",  # nvm active bin dir
                 # --- git ---
                 "GIT_AUTHOR_NAME",
                 "GIT_AUTHOR_EMAIL",
                 "GIT_COMMITTER_NAME",
                 "GIT_COMMITTER_EMAIL",
-                "GIT_SSH_COMMAND",     # custom SSH wrapper for git
+                "GIT_SSH_COMMAND",  # custom SSH wrapper for git
                 "GIT_CONFIG_GLOBAL",
                 "GIT_CONFIG_NOSYSTEM",
                 # --- Claude Code internals ---
@@ -953,7 +953,8 @@ class Runner:
 
         # -- log agent startup configuration --
         _safe_env = {
-            k: ("***" if any(s in k.upper() for s in ("KEY", "TOKEN", "SECRET", "PASSWORD", "AUTH")) else v)
+            k: ("***" if any(s in k.upper() for s in
+                             ("API_KEY", "AUTH_TOKEN", "SECRET", "PASSWORD", "_AUTH", "GPG_KEY", "INVITE_CODE")) else v)
             for k, v in env.items()
         }
         logger.info(
