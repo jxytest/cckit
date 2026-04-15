@@ -813,8 +813,52 @@ class Runner:
         # Limitation: the variable name is still visible via `env`; only the
         # value is wiped.  This is the best we can do within the SDK's
         # dict[str, str] interface (None / unset is not supported upstream).
-        for _k, _v in os.environ.items():
-            if _k not in env:
+        #
+        # _AGENT_ENV_PASSTHROUGH: variables that must be inherited as-is from the
+        # host process so that basic shell tooling (ls, git, python, node …) works
+        # correctly inside the Claude CLI subprocess.
+        _AGENT_ENV_PASSTHROUGH: frozenset[str] = frozenset(
+            {
+                # --- shell / filesystem ---
+                "PATH",        # binary lookup — without this ls/git/python are gone
+                "HOME",        # many tools write config to $HOME
+                "USER",        # username (git author, some CLIs)
+                "LOGNAME",     # POSIX alias of USER
+                "SHELL",       # default shell for subprocess spawning
+                "TERM",        # terminal type (colour output, readline)
+                "LANG",        # locale — affects sort order, file encoding
+                "LC_ALL",      # overrides all LC_* at once
+                "LC_CTYPE",    # character classification / encoding
+                "TMPDIR",      # POSIX temp dir ($TMPDIR on macOS)
+                "TMP",         # Windows / some Linux tools
+                "TEMP",        # Windows alias
+                "PWD",         # current working directory
+                "OLDPWD",      # previous directory (cd -)
+                "SHLVL",       # shell nesting counter
+                # --- Python runtime (Claude CLI runs on Node but subprocesses may use py) ---
+                "PYTHONPATH",          # extra Python module search paths
+                "PYTHONUNBUFFERED",    # flush stdout/stderr immediately
+                "VIRTUAL_ENV",         # active venv (affects pip, python binary)
+                # --- Node.js / Claude CLI runtime ---
+                "NODE_PATH",           # Node module search path
+                "NODE_OPTIONS",        # Node JVM flags
+                "NVM_DIR",             # nvm installation root
+                "NVM_BIN",             # nvm active bin dir
+                # --- git ---
+                "GIT_AUTHOR_NAME",
+                "GIT_AUTHOR_EMAIL",
+                "GIT_COMMITTER_NAME",
+                "GIT_COMMITTER_EMAIL",
+                "GIT_SSH_COMMAND",     # custom SSH wrapper for git
+                "GIT_CONFIG_GLOBAL",
+                "GIT_CONFIG_NOSYSTEM",
+                # --- Claude Code internals ---
+                "CLAUDE_CONFIG_DIR",
+                "CLAUDE_CODE_TMPDIR",
+            }
+        )
+        for _k in os.environ:
+            if _k not in env and _k not in _AGENT_ENV_PASSTHROUGH:
                 env[_k] = ""
 
         # -- configurable SDK params --
