@@ -41,22 +41,27 @@ def _patch_log_cli_command() -> None:
     original_connect = SubprocessCLITransport.connect  # type: ignore[attr-defined]
 
     async def _patched_connect(self: Any) -> None:  # type: ignore[no-untyped-def]
-        cmd = self._build_command()
-        # Mask sensitive flags: --api-key / anything that looks like a token
-        _SENSITIVE = {"--api-key", "--auth-token"}
-        safe_cmd: list[str] = []
-        skip_next = False
-        for part in cmd:
-            if skip_next:
-                safe_cmd.append("***")
-                skip_next = False
-            elif part in _SENSITIVE:
-                safe_cmd.append(part)
-                skip_next = True
-            else:
-                safe_cmd.append(part)
-        logger.info("[CLI command] %s", " ".join(safe_cmd))
+        # Call original connect() first — it resolves _cli_path internally.
+        # _build_command() requires _cli_path to be set, so we log *after*.
         await original_connect(self)
+        try:
+            cmd = self._build_command()
+            # Mask sensitive flags: --api-key / anything that looks like a token
+            _SENSITIVE = {"--api-key", "--auth-token"}
+            safe_cmd: list[str] = []
+            skip_next = False
+            for part in cmd:
+                if skip_next:
+                    safe_cmd.append("***")
+                    skip_next = False
+                elif part in _SENSITIVE:
+                    safe_cmd.append(part)
+                    skip_next = True
+                else:
+                    safe_cmd.append(part)
+            logger.info("[CLI command] %s", " ".join(safe_cmd))
+        except Exception:
+            logger.debug("Failed to log CLI command", exc_info=True)
 
     SubprocessCLITransport.connect = _patched_connect  # type: ignore[method-assign]
     SubprocessCLITransport._cckit_start_patched = True  # type: ignore[attr-defined]
