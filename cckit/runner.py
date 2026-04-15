@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 from cckit._cli import check_api_connectivity, check_claude_cli
+from cckit._cost import recalculate_model_usage_costs
 from cckit._engine.model_bridge import PreparedModelEndpoint, prepare_model_endpoint
 from cckit._engine.model_transport import resolve_model_transport
 from cckit._engine.sdk_bridge import run_sdk_query
@@ -349,6 +350,30 @@ class Runner:
             # --- build result ---
             duration = time.monotonic() - start
             final_message = state.final_message
+
+            # Recalculate costUSD in model_usage using LiteLLM pricing or
+            # user-configured per-token rates, replacing Claude Code's
+            # hardcoded Anthropic-only price table.
+            if final_message is not None and final_message.model_usage:
+                # Build short-name → ModelConfig map for all models in this run
+                _short = lambda m: m.split("/")[-1] if "/" in m else m
+                all_configs: dict[str, ModelConfig] = {_short(model.model): model}
+                for sub_cfg in extra_models.values():
+                    all_configs[_short(sub_cfg.model)] = sub_cfg
+
+                recalculated = recalculate_model_usage_costs(
+                    final_message.model_usage, all_configs
+                )
+                try:
+                    object.__setattr__(final_message, "model_usage", recalculated)
+                    new_total_cost = sum(
+                        u.get("costUSD", 0.0) for u in recalculated.values()
+                        if isinstance(u, dict)
+                    )
+                    object.__setattr__(final_message, "total_cost_usd", new_total_cost)
+                except Exception:
+                    logger.debug("Could not patch final_message costs", exc_info=True)
+
             if final_message is None:
                 holder.result = AgentResult(
                     task_id=ctx.task_id,

@@ -101,6 +101,12 @@ class ModelConfig(CustomModel):
     max_tokens: int = 16384
     max_turns: int = 50
     timeout_seconds: int = 300
+    # Per-token pricing override (USD). When set, takes priority over LiteLLM's
+    # built-in price table. Cache token costs are handled automatically by LiteLLM
+    # using the model's standard cache pricing ratios.
+    # Example: $1/M input, $2/M output → input_cost_per_token=1e-6, output_cost_per_token=2e-6
+    input_cost_per_token: float | None = None
+    output_cost_per_token: float | None = None
 
     @model_validator(mode="before")
     @classmethod
