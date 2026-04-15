@@ -86,35 +86,63 @@ def _cost_for_model(
     cfg = configs.get(model_name)
     litellm_model = cfg.model if cfg is not None else model_name
 
-    # Build custom_cost_per_token when user has configured explicit rates
-    custom_cost: Any = None
+    # Priority 1: user-configured per-token rates — compute directly, no litellm needed
     if (
         cfg is not None
         and cfg.input_cost_per_token is not None
         and cfg.output_cost_per_token is not None
     ):
+        return (
+            input_tokens * cfg.input_cost_per_token
+            + output_tokens * cfg.output_cost_per_token
+        )
+
+    # Priority 2: LiteLLM built-in price table
+    # Try the full model name first (e.g. "custom_openai/glm-5"), then fall back
+    # to scanning the price table for any "*/short_name" entry (e.g. "zai/glm-5").
+    _litellm_model_candidates = _resolve_litellm_model_candidates(litellm_model)
+    for candidate in _litellm_model_candidates:
         try:
             _litellm = importlib.import_module("litellm")
-            custom_cost = _litellm.CostPerToken(
-                input_cost_per_token=cfg.input_cost_per_token,
-                output_cost_per_token=cfg.output_cost_per_token,
+            prompt_cost, completion_cost = _litellm.cost_per_token(
+                model=candidate,
+                prompt_tokens=input_tokens,
+                completion_tokens=output_tokens,
+                cache_creation_input_tokens=cache_creation_tokens,
+                cache_read_input_tokens=cache_read_tokens,
             )
+            if prompt_cost + completion_cost > 0:
+                return prompt_cost + completion_cost
         except Exception:
-            logger.debug("Failed to build CostPerToken for model %s", model_name, exc_info=True)
-
-    # Delegate to litellm.cost_per_token — handles cache tokens natively
-    try:
-        _litellm = importlib.import_module("litellm")
-        prompt_cost, completion_cost = _litellm.cost_per_token(
-            model=litellm_model,
-            prompt_tokens=input_tokens,
-            completion_tokens=output_tokens,
-            cache_creation_input_tokens=cache_creation_tokens,
-            cache_read_input_tokens=cache_read_tokens,
-            custom_cost_per_token=custom_cost,
-        )
-        return prompt_cost + completion_cost
-    except Exception:
-        logger.debug("litellm.cost_per_token failed for model %s", model_name, exc_info=True)
+            logger.debug(
+                "litellm.cost_per_token failed for candidate %s (model %s)",
+                candidate, model_name, exc_info=True,
+            )
 
     return 0.0
+
+
+def _resolve_litellm_model_candidates(litellm_model: str) -> list[str]:
+    """Return a list of model name candidates to try against the LiteLLM price table.
+
+    Tries the full model name first, then scans the price table for any entry
+    whose short name (part after the last ``/``) matches the given model's
+    short name.  This handles cases where the user configures ``custom_openai/glm-5``
+    but the price table only has ``zai/glm-5``.
+    """
+    candidates: list[str] = [litellm_model]
+
+    # Extract short name: "custom_openai/glm-5" → "glm-5", "glm-5" → "glm-5"
+    short_name = litellm_model.split("/")[-1]
+
+    # Scan litellm.model_cost for any "*/short_name" entries
+    try:
+        _litellm = importlib.import_module("litellm")
+        model_cost: dict = getattr(_litellm, "model_cost", {})
+        for key in model_cost:
+            if key.split("/")[-1] == short_name and key not in candidates:
+                candidates.append(key)
+    except Exception:
+        pass
+
+    return candidates
