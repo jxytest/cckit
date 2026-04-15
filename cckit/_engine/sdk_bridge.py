@@ -38,9 +38,9 @@ def _patch_log_cli_command() -> None:
     if getattr(SubprocessCLITransport, "_cckit_start_patched", False):
         return  # already patched
 
-    original_start = SubprocessCLITransport.start  # type: ignore[attr-defined]
+    original_connect = SubprocessCLITransport.connect  # type: ignore[attr-defined]
 
-    async def _patched_start(self: Any) -> None:  # type: ignore[no-untyped-def]
+    async def _patched_connect(self: Any) -> None:  # type: ignore[no-untyped-def]
         cmd = self._build_command()
         # Mask sensitive flags: --api-key / anything that looks like a token
         _SENSITIVE = {"--api-key", "--auth-token"}
@@ -55,10 +55,10 @@ def _patch_log_cli_command() -> None:
                 skip_next = True
             else:
                 safe_cmd.append(part)
-        logger.debug("[CLI command] %s", " ".join(safe_cmd))
-        await original_start(self)
+        logger.info("[CLI command] %s", " ".join(safe_cmd))
+        await original_connect(self)
 
-    SubprocessCLITransport.start = _patched_start  # type: ignore[method-assign]
+    SubprocessCLITransport.connect = _patched_connect  # type: ignore[method-assign]
     SubprocessCLITransport._cckit_start_patched = True  # type: ignore[attr-defined]
 
 
