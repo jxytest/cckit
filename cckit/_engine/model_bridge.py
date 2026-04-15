@@ -281,7 +281,8 @@ class LiteLLMAnthropicBridge:
         kwargs = clamp_max_tokens(kwargs, transport, cfg.max_tokens)
         kwargs["model"] = transport.model
         kwargs["custom_llm_provider"] = transport.custom_llm_provider
-        kwargs.setdefault("max_tokens", cfg.max_tokens)
+        if cfg.max_tokens is not None:
+            kwargs.setdefault("max_tokens", cfg.max_tokens)
         kwargs["timeout"] = cfg.timeout_seconds
         if cfg.api_key:
             kwargs["api_key"] = cfg.api_key

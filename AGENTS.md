@@ -401,6 +401,41 @@ autoCompactThreshold = min(
 )
 ```
 
+### 阈值计算示意图
+
+以 `max_context_tokens=30000, max_tokens=8000, auto_compact_pct=79` 为例：
+
+```
+max_context_tokens = 30000
+│
+│  留给摘要输出: 8000 (= min(max_tokens=8000, 20_000))
+├──────────────────────────────────────── 30000
+│
+│  effectiveContextWindow = 22000
+│  （对话内容实际可用 token 数，触发压缩时需留出输出空间）
+│
+│  留给估算误差缓冲: 13000 (AUTOCOMPACT_BUFFER_TOKENS)
+├──────────────────────────── 22000
+│
+│  autoCompactThreshold = min(22000 * 79%, 22000 - 13000)
+│                       = min(17380, 9000)
+│                       = 9000  ← 对话 token 数超过这里就触发压缩
+├───────── 9000
+│
+0
+```
+
+> **注意**：`max_context_tokens` 必须满足 `max_context_tokens > max_tokens + 13_000`，否则 `autoCompactThreshold` 为负数，自动压缩永远不会触发。建议留至少 10_000 的余量，即 `max_context_tokens ≥ max_tokens + 23_000`。
+
+### ModelConfig.max_tokens 与 CLAUDE_CODE_MAX_OUTPUT_TOKENS
+
+`ModelConfig.max_tokens` 显式设置后，cckit 会同步将其注入为 `CLAUDE_CODE_MAX_OUTPUT_TOKENS` 环境变量，使 Claude CLI 的 `getMaxOutputTokensForModel()` 与 cckit 侧保持一致。`max_tokens=None`（默认）时不注入，CLI 使用模型原生默认值。
+
+| `ModelConfig.max_tokens` | CLI 环境变量 | 说明 |
+|---|---|---|
+| `None`（默认） | 不注入 | CLI 使用模型原生 maxOutputTokens |
+| 显式整数（如 `8000`） | `CLAUDE_CODE_MAX_OUTPUT_TOKENS=8000` | CLI 与 cckit 侧保持一致 |
+
 ### Runner 中的注入位置
 
 `runner.py` `_build_options()` 中，在 `env` 构建之后、模型端点覆盖之前：
@@ -410,6 +445,9 @@ env: dict[str, str] = dict(ctx.env)
 context_cfg = agent.context
 if context_cfg is not None:
     env.update(context_cfg.to_env())
+# max_tokens 显式设置时注入
+if model.max_tokens is not None:
+    env.setdefault("CLAUDE_CODE_MAX_OUTPUT_TOKENS", str(model.max_tokens))
 ```
 
 ## 13. 验证方式

@@ -98,7 +98,7 @@ class ModelConfig(CustomModel):
     api_key: str = ""  # empty = let provider-specific env/defaults resolve it
     base_url: str = ""  # provider or gateway API base
     endpoint_protocol: TransportProtocol | None = Field(default=None, exclude=True)
-    max_tokens: int = 16384
+    max_tokens: int | None = None  # None = let CLI use model-native default; set explicitly to also inject CLAUDE_CODE_MAX_OUTPUT_TOKENS
     max_turns: int = 50
     timeout_seconds: int = 300
     # Per-token pricing override (USD). When set, takes priority over LiteLLM's
@@ -705,7 +705,7 @@ class RunnerConfig(CustomModel):
             api_key: str = ""
             base_url: str = ""
             model: str = "anthropic/claude-sonnet-4-6"
-            max_tokens: int = 16384
+            max_tokens: int | None = None
             max_turns: int = 50
             timeout_seconds: int = 300
 

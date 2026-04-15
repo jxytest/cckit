@@ -784,6 +784,17 @@ class Runner:
         context_cfg = agent.context
         if context_cfg is not None:
             env.update(context_cfg.to_env())
+
+        # -- ModelConfig.max_tokens → CLAUDE_CODE_MAX_OUTPUT_TOKENS --
+        # When the user explicitly sets max_tokens on ModelConfig, propagate it
+        # to the Claude CLI subprocess so getMaxOutputTokensForModel() uses the
+        # same limit.  This is critical for CLAUDE_CODE_AUTO_COMPACT_WINDOW to
+        # work correctly: effectiveContextWindow = window - min(maxOutputTokens, 20000).
+        # With max_tokens=None (default) we leave CLAUDE_CODE_MAX_OUTPUT_TOKENS
+        # unset so the CLI falls back to its own model-specific defaults.
+        if model.max_tokens is not None:
+            env.setdefault("CLAUDE_CODE_MAX_OUTPUT_TOKENS", str(model.max_tokens))
+
         if prepared_model.api_key:
             # ANTHROPIC_API_KEY  → sent as X-Api-Key header (direct Anthropic API)
             # ANTHROPIC_AUTH_TOKEN → sent as Authorization: Bearer header (LLM gateway / proxy)

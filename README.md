@@ -442,7 +442,10 @@ agent = Agent(
 
 控制上下文窗口大小和自动压缩触发时机，适用于小上下文模型（如 8K）。每个 Agent 独立子进程，配置互不影响。
 
-> **注意**：`max_context_tokens` 是上下文窗口大小（输入+输出总量），与 `ModelConfig.max_tokens`（最大输出 token 数）不同，不要混淆。
+> **注意**：
+> - `max_context_tokens` 是上下文窗口大小（输入+输出总量），与 `ModelConfig.max_tokens`（最大输出 token 数）不同，不要混淆。
+> - `max_context_tokens` 必须 **大于 `max_tokens + 23000`**，否则自动压缩不会触发。例如 `max_tokens=8000` 时，`max_context_tokens` 至少设为 `31000`。
+> - 设置 `max_tokens` 后，cckit 会自动将其同步注入给 Claude CLI，无需手动配置环境变量。
 
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
