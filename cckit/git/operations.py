@@ -203,6 +203,7 @@ async def status(*, cwd: Path, short: bool = False) -> str:
 async def diff(
     *,
     cwd: Path,
+    commit_range: str | None = None,
     name_only: bool = False,
     staged: bool = False,
     extra_env: dict[str, str] | None = None,
@@ -211,15 +212,22 @@ async def diff(
 
     Parameters
     ----------
+    commit_range:
+        Optional commit range such as ``"abc123..def456"`` or
+        ``"HEAD~3..HEAD"``.  When provided, shows the diff between
+        two commits instead of the working-tree / staged diff.
     name_only:
         Only show changed file names (``--name-only``).
     staged:
         Show staged (cached) changes instead of working-tree changes.
+        Ignored when *commit_range* is provided.
     extra_env:
         Per-task environment variables for credential isolation.
     """
     args = ["diff"]
-    if staged:
+    if commit_range:
+        args.append(commit_range)
+    elif staged:
         args.append("--cached")
     if name_only:
         args.append("--name-only")
