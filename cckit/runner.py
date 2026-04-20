@@ -947,7 +947,7 @@ class Runner:
         any_skills = agent.skills or any(sub.skills for sub in agent.sub_agents)
         opts.setting_sources = cast(
             list[Literal["user", "project", "local"]],
-            ["project"] if any_skills else ["local"],
+            ["user", "project", "local"],
         )
 
         # -- resume: restore a previous session's conversation context --
