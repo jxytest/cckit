@@ -563,6 +563,55 @@ class Runner:
         except Exception:
             logger.warning('Failed to restore session JSONL for %s', session_id, exc_info=True)
 
+    @staticmethod
+    def read_session_dir(workspace_dir: Path) -> dict[str, bytes] | None:
+        """Read all session JSONL files from the project directory.
+
+        Returns ``{filename: content}`` for every ``.jsonl`` file, or
+        *None* when the directory does not exist or contains no files.
+        """
+        try:
+            from claude_agent_sdk._internal.sessions import (
+                _canonicalize_path,
+                _find_project_dir,
+            )
+            project_dir = _find_project_dir(_canonicalize_path(str(workspace_dir)))
+            if project_dir is None:
+                return None
+            files: dict[str, bytes] = {}
+            for entry in project_dir.iterdir():
+                if entry.is_file() and entry.suffix == '.jsonl':
+                    files[entry.name] = entry.read_bytes()
+            return files or None
+        except Exception:
+            logger.debug('Failed to read session dir for %s', workspace_dir, exc_info=True)
+        return None
+
+    @staticmethod
+    def restore_session_dir(workspace_dir: Path, files: dict[str, bytes]) -> None:
+        """Restore multiple session JSONL files to the project directory.
+
+        Skips files that already exist (idempotent).
+        """
+        try:
+            from claude_agent_sdk._internal.sessions import (
+                _canonicalize_path,
+                _get_project_dir,
+            )
+            project_dir = _get_project_dir(_canonicalize_path(str(workspace_dir)))
+            project_dir.mkdir(parents=True, exist_ok=True)
+            for name, content in files.items():
+                target = project_dir / name
+                if not target.exists():
+                    target.write_bytes(content)
+            logger.info(
+                'Restored %d session file(s) to %s', len(files), project_dir,
+            )
+        except Exception:
+            logger.warning(
+                'Failed to restore session dir for %s', workspace_dir, exc_info=True,
+            )
+
     # ------------------------------------------------------------------
     # Model resolution
     # ------------------------------------------------------------------
