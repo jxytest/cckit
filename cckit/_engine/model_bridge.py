@@ -26,6 +26,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
+from cckit._engine._patches.deepseek_reasoning import patch_deepseek_reasoning
 from cckit._engine.model_transport import (
     ResolvedTransport,  # noqa: F401 – used internally
     clamp_max_tokens,
@@ -159,7 +160,7 @@ class LiteLLMAnthropicBridge:
                 )
 
         # Apply the streaming bug-fix patch before first use.
-        from cckit._engine._stream_patch import apply_stream_patch
+        from cckit._engine._patches._stream_patch import apply_stream_patch
         apply_stream_patch()
 
         uvicorn = _load_module("uvicorn")
@@ -279,6 +280,7 @@ class LiteLLMAnthropicBridge:
 
         kwargs = sanitize_payload(payload, transport)
         kwargs = clamp_max_tokens(kwargs, transport, cfg.max_tokens)
+        kwargs = patch_deepseek_reasoning(kwargs, transport.model)
         kwargs["model"] = transport.model
         kwargs["custom_llm_provider"] = transport.custom_llm_provider
         if cfg.max_tokens is not None:
