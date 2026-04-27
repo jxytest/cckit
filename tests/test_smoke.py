@@ -43,6 +43,7 @@ from cckit import (  # noqa: F401 — test_imports verifies all public API symbo
     WorkspaceConfig,
     WorkspaceError,
 )
+from cckit._engine._patches.deepseek_reasoning import patch_deepseek_reasoning
 from cckit._engine.model_bridge import (
     LiteLLMAnthropicBridge,
     PreparedModelEndpoint,
@@ -414,6 +415,22 @@ def test_bridge_responses_transport_does_not_clamp_max_tokens():
     )
 
     assert kwargs["max_tokens"] == 32000
+
+
+def test_deepseek_v4_reasoning_patch_uses_non_empty_placeholder():
+    """DeepSeek V4 gateways reject missing or empty reasoning_content in thinking mode."""
+    payload = {
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "已深度思考\nanswer", "reasoning_content": ""},
+            {"role": "assistant", "content": "answer", "reasoning_content": None},
+        ]
+    }
+
+    patched = patch_deepseek_reasoning(payload, "deepseek-v4-pro")
+
+    assistant_messages = [m for m in patched["messages"] if m["role"] == "assistant"]
+    assert all(m["reasoning_content"] == "已深度思考" for m in assistant_messages)
 
 
 def test_agent_with_sub_agents():

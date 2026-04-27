@@ -7,8 +7,9 @@ causing the second turn onward to fail with::
 
     The `reasoning_content` in the thinking mode must be passed back to the API.
 
-This patch injects ``reasoning_content = ""`` into assistant messages before
-the request is forwarded to the provider, without modifying LiteLLM internals.
+This patch injects a non-empty ``reasoning_content`` placeholder into assistant
+messages before the request is forwarded to the provider, without modifying
+LiteLLM internals.
 
 See: https://github.com/BerriAI/litellm/issues/26395
 """
@@ -22,6 +23,11 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _DEEPSEEK_V4_RE = re.compile(r"deepseek-v4", re.IGNORECASE)
+# Some DeepSeek V4 gateways treat an empty string the same as a missing
+# reasoning_content field.  Claude CLI / Anthropic history does not preserve the
+# provider's original OpenAI-specific reasoning_content, so use the conventional
+# non-empty marker returned/displayed by many gateways instead of "".
+_PLACEHOLDER_REASONING_CONTENT = "已深度思考"
 
 
 def _is_deepseek_v4(model: str) -> bool:
@@ -50,8 +56,8 @@ def patch_deepseek_reasoning(payload: dict[str, Any], model: str) -> dict[str, A
     for msg in messages:
         if msg.get("role") != "assistant":
             continue
-        if "reasoning_content" not in msg or msg["reasoning_content"] is None:
-            msg["reasoning_content"] = ""
+        if not msg.get("reasoning_content"):
+            msg["reasoning_content"] = _PLACEHOLDER_REASONING_CONTENT
             patched += 1
 
     if patched:
