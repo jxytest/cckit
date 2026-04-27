@@ -122,16 +122,14 @@ fix_agent = Agent(
 | `deepseek/`、`dashscope/` 等 | Chat Completions | 走 LiteLLM 的 chat/completions 适配器 |
 | 无前缀 | Chat Completions | 默认按 `chat/completions` 处理；也可通过 `base_url` 后缀自动推断协议 |
 
-> **最佳实践**：**强烈建议使用大模型原厂前缀**（如 `dashscope/`、`deepseek/`）。原厂前缀拥有最好的工具调用（Tool Calling）兼容性和精准的流式计费支持，体验全面优于将其视为通用 `openai/` 前缀。
-
 ```python
 from cckit import ModelConfig
 
 # Anthropic 直连（不经过桥接层）
 anthropic = ModelConfig(model="anthropic/claude-sonnet-4-6", api_key="sk-ant...")
 
-# OpenAI Responses API
-openai = ModelConfig(model="openai/gpt-4o", api_key="sk-...")
+# OpenAI chat/completions
+openai = ModelConfig(model="gpt-4o", api_key="sk-...")
 
 # 使用 responses/ 前缀也走 Responses API（适用于 openai 新模型）
 responses = ModelConfig(model="responses/gpt-5.2", api_key="sk-...")
@@ -147,7 +145,6 @@ proxy = ModelConfig(model="openai/gpt-4o", base_url="https://api.proxy.com/v1", 
 #### 常见厂商前缀及配置指南
 
 > 💡 LiteLLM 支持 100+ 厂商，完整列表请查阅 [LiteLLM Providers](https://docs.litellm.ai/docs/providers)。
-> 对于原生前缀（如 `dashscope/` 或 `deepseek/`），**清空并省略 `base_url`** 是保障兼容性最安全的做法。
 
 | 厂商生态 | 推荐前缀示例 | `base_url` 配置指南 |
 |---|---|---|
@@ -162,8 +159,6 @@ proxy = ModelConfig(model="openai/gpt-4o", base_url="https://api.proxy.com/v1", 
 | **Gemini** | `gemini/gemini-1.5-pro` | 默认空连官方端点 |
 | **本地 Ollama** | `ollama/qwen2.5` | ✅必填局域网地址：`http://localhost:11434` |
 | **云托管服务** | `azure/`、`bedrock/`、`vertex_ai/` | ✅按厂商规范必填真实资源端点和专属格式配置 |
-
-> **⚠️ API_BASE 排雷提示**：如果你配置了 `base_url` 却遇到了 `404 Not Found`（特别是 path 包含 `/chat/completions` 的报错），说明你只填了裸机域名导致底层路由寻址越界。遇到此报错，**直接移除 `base_url` 参数，或者在其后补足 `/v1` 即可恢复正常**。
 
 
 ## 运行上下文
@@ -305,7 +300,7 @@ agent = Agent(
 
 ### permission_mode 说明
 
-`permission_mode` 位于 `RunnerConfig`（非 `ModelConfig`），控制 Claude 内置工具的权限策略：
+`permission_mode` 位于 `RunnerConfig`，控制 Claude 内置工具的权限策略：
 
 | 值 | 行为 |
 |----|------|
