@@ -43,7 +43,10 @@ from cckit import (  # noqa: F401 — test_imports verifies all public API symbo
     WorkspaceConfig,
     WorkspaceError,
 )
-from cckit._engine._patches.deepseek_reasoning import patch_deepseek_reasoning
+from cckit._engine._patches.deepseek_reasoning import (
+    apply_deepseek_reasoning_patch,
+    patch_deepseek_reasoning,
+)
 from cckit._engine.model_bridge import (
     LiteLLMAnthropicBridge,
     PreparedModelEndpoint,
@@ -431,6 +434,128 @@ def test_deepseek_v4_reasoning_patch_uses_non_empty_placeholder():
 
     assistant_messages = [m for m in patched["messages"] if m["role"] == "assistant"]
     assert all(m["reasoning_content"] == "已深度思考" for m in assistant_messages)
+
+
+def test_deepseek_v4_reasoning_patch_recovers_from_thinking_blocks():
+    """Phase 1 should recover real reasoning from thinking content blocks."""
+    payload = {
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "Let me think about this carefully."},
+                    {"type": "text", "text": "answer"},
+                ],
+            },
+        ]
+    }
+
+    patched = patch_deepseek_reasoning(payload, "deepseek-v4-flash")
+
+    assistant_msg = patched["messages"][1]
+    assert assistant_msg["reasoning_content"] == "Let me think about this carefully."
+
+
+def test_deepseek_v4_reasoning_survives_anthropic_adapter_translation():
+    """reasoning_content must survive LiteLLM's Anthropic→OpenAI message translation."""
+    try:
+        from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
+            LiteLLMAnthropicMessagesAdapter,
+        )
+    except ImportError:
+        pytest.skip("litellm not installed")
+
+    apply_deepseek_reasoning_patch()
+
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    anthropic_messages = [
+        {"role": "user", "content": "hello"},
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "world"}],
+            "reasoning_content": "The user said hello, I should respond.",
+        },
+        {"role": "user", "content": "follow up"},
+    ]
+
+    openai_messages = adapter.translate_anthropic_messages_to_openai(
+        anthropic_messages, model="deepseek-v4-flash"
+    )
+
+    assistant_msgs = [m for m in openai_messages if m.get("role") == "assistant"]
+    assert len(assistant_msgs) == 1
+    assert assistant_msgs[0]["reasoning_content"] == "The user said hello, I should respond."
+
+
+def test_deepseek_v4_reasoning_reconstructed_from_thinking_blocks_in_adapter():
+    """Phase 2 should reconstruct reasoning_content from thinking_blocks when no explicit value."""
+    try:
+        from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
+            LiteLLMAnthropicMessagesAdapter,
+        )
+    except ImportError:
+        pytest.skip("litellm not installed")
+
+    apply_deepseek_reasoning_patch()
+
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    anthropic_messages = [
+        {"role": "user", "content": "hello"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "Real reasoning from DeepSeek."},
+                {"type": "text", "text": "world"},
+            ],
+        },
+    ]
+
+    openai_messages = adapter.translate_anthropic_messages_to_openai(
+        anthropic_messages, model="deepseek-v4-pro"
+    )
+
+    assistant_msgs = [m for m in openai_messages if m.get("role") == "assistant"]
+    assert len(assistant_msgs) == 1
+    assert assistant_msgs[0]["reasoning_content"] == "Real reasoning from DeepSeek."
+
+
+def test_deepseek_reasoning_patch_does_not_affect_non_deepseek_models():
+    """Non-DeepSeek models must not get reasoning_content injected."""
+    payload = {
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "world"},
+        ]
+    }
+    patched = patch_deepseek_reasoning(payload, "qwen-plus")
+    assert "reasoning_content" not in patched["messages"][1]
+
+    try:
+        from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
+            LiteLLMAnthropicMessagesAdapter,
+        )
+    except ImportError:
+        pytest.skip("litellm not installed")
+
+    apply_deepseek_reasoning_patch()
+
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    anthropic_messages = [
+        {"role": "user", "content": "hello"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "Some reasoning."},
+                {"type": "text", "text": "world"},
+            ],
+        },
+    ]
+    openai_messages = adapter.translate_anthropic_messages_to_openai(
+        anthropic_messages, model="qwen-plus"
+    )
+    assistant_msgs = [m for m in openai_messages if m.get("role") == "assistant"]
+    assert "reasoning_content" not in assistant_msgs[0]
 
 
 def test_agent_with_sub_agents():

@@ -159,9 +159,11 @@ class LiteLLMAnthropicBridge:
                     route.transport.api_base,
                 )
 
-        # Apply the streaming bug-fix patch before first use.
+        # Apply monkey-patches before first use.
         from cckit._engine._patches._stream_patch import apply_stream_patch
+        from cckit._engine._patches.deepseek_reasoning import apply_deepseek_reasoning_patch
         apply_stream_patch()
+        apply_deepseek_reasoning_patch()
 
         uvicorn = _load_module("uvicorn")
         config = uvicorn.Config(
