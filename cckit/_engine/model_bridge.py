@@ -20,6 +20,7 @@ import asyncio
 import importlib
 import json
 import logging
+import os
 import socket
 import traceback
 import uuid
@@ -271,7 +272,6 @@ class LiteLLMAnthropicBridge:
         litellm.drop_params = True
 
         # Enable LiteLLM's native OTEL callback when OTLP env vars are set.
-        import os
         if os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT") or os.environ.get(
             "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
         ):
