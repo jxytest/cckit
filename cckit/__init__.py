@@ -48,6 +48,7 @@ from cckit.middleware import (
     LoggingMiddleware,
     Middleware,
     RetryMiddleware,
+    TracingMiddleware,
 )
 from cckit.runner import Runner
 
@@ -97,4 +98,5 @@ __all__ = [
     "RetryMiddleware",
     "ConcurrencyMiddleware",
     "LoggingMiddleware",
+    "TracingMiddleware",
 ]

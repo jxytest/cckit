@@ -13,6 +13,7 @@ from cckit.middleware.base import Middleware, SdkQueryFunc
 from cckit.middleware.concurrency import ConcurrencyMiddleware
 from cckit.middleware.logging import LoggingMiddleware
 from cckit.middleware.retry import RetryMiddleware
+from cckit.middleware.tracing import TracingMiddleware
 
 __all__ = [
     "ConcurrencyMiddleware",
@@ -20,4 +21,5 @@ __all__ = [
     "Middleware",
     "RetryMiddleware",
     "SdkQueryFunc",
+    "TracingMiddleware",
 ]

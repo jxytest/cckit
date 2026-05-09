@@ -21,9 +21,12 @@ import importlib
 import json
 import logging
 import socket
+import traceback
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from cckit._engine._patches.deepseek_reasoning import patch_deepseek_reasoning
@@ -37,6 +40,54 @@ from cckit.exceptions import AgentExecutionError
 from cckit.types import ModelConfig
 
 logger = logging.getLogger(__name__)
+
+
+# ── LiteLLM OTEL callback helpers ───────────────────────────────
+
+
+def _create_litellm_logging(kwargs: dict[str, Any]) -> Any | None:
+    """Create a LiteLLM ``Logging`` object so OTEL callbacks fire.
+
+    Returns *None* when ``litellm`` internals are unavailable (no-op path).
+    """
+    try:
+        from litellm.litellm_core_utils.litellm_logging import Logging
+    except ImportError:
+        return None
+
+    messages = kwargs.get("messages") or []
+    return Logging(
+        model=kwargs.get("model", "unknown"),
+        messages=messages,
+        stream=kwargs.get("stream", False),
+        call_type="acompletion",
+        litellm_call_id=str(uuid.uuid4()),
+        start_time=datetime.now(tz=timezone.utc),
+        function_id=str(uuid.uuid4()),
+    )
+
+
+async def _fire_success_callback(logging_obj: Any, result: Any) -> None:
+    if logging_obj is None:
+        return
+    with suppress(Exception):
+        await logging_obj.async_success_handler(
+            result=result,
+            start_time=getattr(logging_obj, "start_time", None),
+            end_time=datetime.now(tz=timezone.utc),
+        )
+
+
+async def _fire_failure_callback(logging_obj: Any, exc: BaseException) -> None:
+    if logging_obj is None:
+        return
+    with suppress(Exception):
+        await logging_obj.async_failure_handler(
+            exception=exc,
+            traceback_exception=traceback.format_exc(),
+            start_time=getattr(logging_obj, "start_time", None),
+            end_time=datetime.now(tz=timezone.utc),
+        )
 
 
 def _load_litellm() -> Any:
@@ -219,6 +270,16 @@ class LiteLLMAnthropicBridge:
         litellm = _load_litellm()
         litellm.drop_params = True
 
+        # Enable LiteLLM's native OTEL callback when OTLP env vars are set.
+        import os
+        if os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT") or os.environ.get(
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
+        ):
+            if "otel" not in (litellm.success_callback or []):
+                litellm.success_callback = list(litellm.success_callback or []) + ["otel"]
+            if "otel" not in (litellm.failure_callback or []):
+                litellm.failure_callback = list(litellm.failure_callback or []) + ["otel"]
+
         Route = starlette_rt.Route
         JSONResponse = starlette_resp.JSONResponse
         StreamingResponse = starlette_resp.StreamingResponse
@@ -229,20 +290,26 @@ class LiteLLMAnthropicBridge:
 
         async def create_message(request: Any) -> Any:
             payload = await request.json()
+            logging_obj = None
             try:
                 kwargs = self._build_kwargs(payload)
+                logging_obj = _create_litellm_logging(kwargs)
+                if logging_obj is not None:
+                    kwargs["litellm_logging_obj"] = logging_obj
                 if payload.get("stream"):
                     kwargs["stream"] = True
                     stream = await litellm.anthropic.messages.acreate(**kwargs)
                     return StreamingResponse(
-                        self._wrap_stream(stream),
+                        self._wrap_stream(stream, logging_obj),
                         media_type="text/event-stream",
                         headers={"cache-control": "no-cache", "x-accel-buffering": "no"},
                     )
                 resp = await litellm.anthropic.messages.acreate(**kwargs)
+                await _fire_success_callback(logging_obj, resp)
                 body = resp.model_dump(mode="json", exclude_none=True) if hasattr(resp, "model_dump") else resp
                 return JSONResponse(body)
             except Exception as exc:
+                await _fire_failure_callback(logging_obj, exc)
                 return JSONResponse(
                     {"type": "error", "error": {"type": "api_error", "message": str(exc)}},
                     status_code=500,
@@ -296,7 +363,9 @@ class LiteLLMAnthropicBridge:
 
     # ── streaming ─────────────────────────────────────────────────
 
-    async def _wrap_stream(self, stream: Any) -> AsyncIterator[bytes]:
+    async def _wrap_stream(
+        self, stream: Any, logging_obj: Any = None,
+    ) -> AsyncIterator[bytes]:
         """Pass through SSE bytes from litellm, with error boundary.
 
         ``litellm.anthropic.messages.acreate(stream=True)`` returns an
@@ -314,7 +383,10 @@ class LiteLLMAnthropicBridge:
                     # Shouldn't happen with current litellm, but be safe.
                     yield json.dumps(chunk).encode()
         except Exception as exc:
+            await _fire_failure_callback(logging_obj, exc)
             yield _error_sse_frame(str(exc))
+        else:
+            await _fire_success_callback(logging_obj, None)
 
     # ── token counting ────────────────────────────────────────────
 
