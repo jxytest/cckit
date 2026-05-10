@@ -20,14 +20,10 @@ import asyncio
 import importlib
 import json
 import logging
-import os
 import socket
-import traceback
-import uuid
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any
 
 from cckit._engine._patches.deepseek_reasoning import patch_deepseek_reasoning
@@ -43,56 +39,33 @@ from cckit.types import ModelConfig
 logger = logging.getLogger(__name__)
 
 
-# ── LiteLLM OTEL callback helpers ───────────────────────────────
+# ── Direct OTEL span helpers ─────────────────────────────────────
 
 
-def _create_litellm_logging(kwargs: dict[str, Any]) -> Any | None:
-    """Create a LiteLLM ``Logging`` object so OTEL callbacks fire.
-
-    Returns *None* when ``litellm`` internals are unavailable (no-op path).
-    """
-    try:
-        from litellm.litellm_core_utils.litellm_logging import Logging
-    except ImportError:
-        return None
-
-    messages = kwargs.get("messages") or []
-    return Logging(
-        model=kwargs.get("model", "unknown"),
-        messages=messages,
-        stream=kwargs.get("stream", False),
-        call_type="acompletion",
-        litellm_call_id=str(uuid.uuid4()),
-        start_time=datetime.now(tz=timezone.utc),
-        function_id=str(uuid.uuid4()),
-    )
+def _span_attrs_for_route(route: Any, model_str: str) -> dict[str, Any]:
+    """Build GenAI semantic-convention span attributes from a resolved route."""
+    return {
+        "gen_ai.operation.name": "chat",
+        "gen_ai.system": getattr(route.transport, "custom_llm_provider", None) or "anthropic",
+        "gen_ai.request.model": model_str,
+    }
 
 
-async def _fire_success_callback(logging_obj: Any, result: Any) -> None:
-    if logging_obj is None:
-        return
-    try:
-        await logging_obj.async_success_handler(
-            result=result,
-            start_time=getattr(logging_obj, "start_time", None),
-            end_time=datetime.now(tz=timezone.utc),
-        )
-    except Exception:
-        logger.debug("LiteLLM success callback failed", exc_info=True)
+def _set_usage_on_span(span: Any, usage_data: dict[str, int], route: Any) -> None:
+    """Record token counts and cost on a span."""
+    prompt = usage_data.get("prompt_tokens", 0)
+    completion = usage_data.get("completion_tokens", 0)
+    if prompt:
+        span.set_attribute("gen_ai.usage.prompt_tokens", prompt)
+    if completion:
+        span.set_attribute("gen_ai.usage.completion_tokens", completion)
+    if prompt or completion:
+        span.set_attribute("gen_ai.usage.total_tokens", prompt + completion)
+    in_cost = getattr(getattr(route, "config", None), "input_cost_per_token", None)
+    out_cost = getattr(getattr(route, "config", None), "output_cost_per_token", None)
+    if in_cost is not None and out_cost is not None and (prompt or completion):
+        span.set_attribute("gen_ai.usage.cost", prompt * in_cost + completion * out_cost)
 
-
-async def _fire_failure_callback(logging_obj: Any, exc: BaseException) -> None:
-    if logging_obj is None:
-        return
-    try:
-        await logging_obj.async_failure_handler(
-            exception=exc,
-            traceback_exception=traceback.format_exc(),
-            start_time=getattr(logging_obj, "start_time", None),
-            end_time=datetime.now(tz=timezone.utc),
-        )
-    except Exception:
-        logger.debug("LiteLLM failure callback failed", exc_info=True)
 
 
 def _load_litellm() -> Any:
@@ -128,8 +101,7 @@ def _try_extract_usage(raw: bytes, usage_data: dict[str, int]) -> None:
     """Best-effort parse of Anthropic SSE chunks to accumulate token counts.
 
     Anthropic sends ``message_start`` with ``usage.input_tokens`` and
-    ``message_delta`` with ``usage.output_tokens``.  We record both so the
-    LiteLLM success callback receives a result with usage for cost tracking.
+    ``message_delta`` with ``usage.output_tokens``.
     """
     try:
         text = raw.decode("utf-8", errors="ignore")
@@ -147,27 +119,6 @@ def _try_extract_usage(raw: bytes, usage_data: dict[str, int]) -> None:
                 usage_data["completion_tokens"] = int(usage["output_tokens"])
     except Exception:
         pass
-
-
-def _build_stream_result(logging_obj: Any, usage_data: dict[str, int]) -> dict[str, Any]:
-    """Build a minimal dict result for the LiteLLM success callback.
-
-    LiteLLM's OTEL handler uses dict-style ``.get()`` access on response_obj
-    (e.g. ``response_obj.get("usage")``).  Returning a plain dict satisfies
-    that contract even when a full ModelResponse is not available.
-    """
-    prompt_tokens = usage_data.get("prompt_tokens", 0)
-    completion_tokens = usage_data.get("completion_tokens", 0)
-    return {
-        "id": str(uuid.uuid4()),
-        "object": "chat.completion",
-        "model": getattr(logging_obj, "model", "unknown"),
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        },
-    }
 
 
 # ── public data classes ──────────────────────────────────────────
@@ -321,22 +272,6 @@ class LiteLLMAnthropicBridge:
         litellm = _load_litellm()
         litellm.drop_params = True
 
-        # Enable LiteLLM's native OTEL callback when OTLP env vars are set.
-        # Must register on BOTH the sync list (success_callback) AND the async
-        # list (_async_success_callback) — async_success_handler reads only the
-        # latter, and direct assignment to success_callback does not auto-sync.
-        if os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT") or os.environ.get(
-            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
-        ):
-            for _attr in ("success_callback", "_async_success_callback"):
-                _lst = list(getattr(litellm, _attr, None) or [])
-                if "otel" not in _lst:
-                    setattr(litellm, _attr, _lst + ["otel"])
-            for _attr in ("failure_callback", "_async_failure_callback"):
-                _lst = list(getattr(litellm, _attr, None) or [])
-                if "otel" not in _lst:
-                    setattr(litellm, _attr, _lst + ["otel"])
-
         Route = starlette_rt.Route
         JSONResponse = starlette_resp.JSONResponse
         StreamingResponse = starlette_resp.StreamingResponse
@@ -347,26 +282,32 @@ class LiteLLMAnthropicBridge:
 
         async def create_message(request: Any) -> Any:
             payload = await request.json()
-            logging_obj = None
             try:
                 kwargs = self._build_kwargs(payload)
-                logging_obj = _create_litellm_logging(kwargs)
-                if logging_obj is not None:
-                    kwargs["litellm_logging_obj"] = logging_obj
+                route = self._resolve_route(payload.get("model"))
                 if payload.get("stream"):
                     kwargs["stream"] = True
-                    stream = await litellm.anthropic.messages.acreate(**kwargs)
                     return StreamingResponse(
-                        self._wrap_stream(stream, logging_obj),
+                        self._wrap_stream(kwargs, route),
                         media_type="text/event-stream",
                         headers={"cache-control": "no-cache", "x-accel-buffering": "no"},
                     )
-                resp = await litellm.anthropic.messages.acreate(**kwargs)
-                await _fire_success_callback(logging_obj, resp)
+                from cckit.telemetry import get_tracer
+                tracer = get_tracer("cckit.litellm")
+                with tracer.start_as_current_span(
+                    "gen_ai.chat",
+                    attributes=_span_attrs_for_route(route, kwargs.get("model", "")),
+                ) as span:
+                    resp = await litellm.anthropic.messages.acreate(**kwargs)
+                    usage = getattr(resp, "usage", None)
+                    if usage:
+                        _set_usage_on_span(span, {
+                            "prompt_tokens": getattr(usage, "input_tokens", 0),
+                            "completion_tokens": getattr(usage, "output_tokens", 0),
+                        }, route)
                 body = resp.model_dump(mode="json", exclude_none=True) if hasattr(resp, "model_dump") else resp
                 return JSONResponse(body)
             except Exception as exc:
-                await _fire_failure_callback(logging_obj, exc)
                 return JSONResponse(
                     {"type": "error", "error": {"type": "api_error", "message": str(exc)}},
                     status_code=500,
@@ -421,36 +362,42 @@ class LiteLLMAnthropicBridge:
     # ── streaming ─────────────────────────────────────────────────
 
     async def _wrap_stream(
-        self, stream: Any, logging_obj: Any = None,
+        self, kwargs: dict[str, Any], route: _ModelRoute,
     ) -> AsyncIterator[bytes]:
-        """Pass through SSE bytes from litellm, with error boundary.
+        """Start the LLM call, forward SSE bytes, and emit an OTEL span.
 
-        ``litellm.anthropic.messages.acreate(stream=True)`` returns an
-        ``AsyncIterator[bytes]`` (via ``async_anthropic_sse_wrapper``),
-        so chunks are already SSE-encoded.  We just forward them and
-        catch any mid-stream exceptions as an SSE error event.
+        The span covers the entire streaming duration — from the initial
+        ``acreate()`` call to the last byte yielded to the client.
         """
-        # Accumulate usage from stream to pass to the success callback.
-        # Anthropic SSE emits a ``message_delta`` event at stream end with
-        # ``usage.output_tokens``; we carry it so LiteLLM OTEL can record cost.
+        from cckit.telemetry import get_tracer
+        tracer = get_tracer("cckit.litellm")
+        litellm = _load_litellm()
         usage_data: dict[str, int] = {}
-        try:
-            async for chunk in stream:
-                if isinstance(chunk, (bytes, bytearray)):
-                    raw = bytes(chunk)
-                elif isinstance(chunk, str):
-                    raw = chunk.encode()
-                else:
-                    raw = json.dumps(chunk).encode()
-                # Best-effort parse for usage from message_delta SSE frame.
-                _try_extract_usage(raw, usage_data)
-                yield raw
-        except Exception as exc:
-            await _fire_failure_callback(logging_obj, exc)
-            yield _error_sse_frame(str(exc))
-        else:
-            result = _build_stream_result(logging_obj, usage_data) if logging_obj else None
-            await _fire_success_callback(logging_obj, result)
+        with tracer.start_as_current_span(
+            "gen_ai.chat",
+            attributes=_span_attrs_for_route(route, kwargs.get("model", "")),
+        ) as span:
+            try:
+                stream = await litellm.anthropic.messages.acreate(**kwargs)
+                async for chunk in stream:
+                    if isinstance(chunk, (bytes, bytearray)):
+                        raw = bytes(chunk)
+                    elif isinstance(chunk, str):
+                        raw = chunk.encode()
+                    else:
+                        raw = json.dumps(chunk).encode()
+                    _try_extract_usage(raw, usage_data)
+                    yield raw
+            except Exception as exc:
+                try:
+                    from opentelemetry.trace import StatusCode
+                    span.set_status(StatusCode.ERROR)
+                except ImportError:
+                    pass
+                span.record_exception(exc)
+                yield _error_sse_frame(str(exc))
+            else:
+                _set_usage_on_span(span, usage_data, route)
 
     # ── token counting ────────────────────────────────────────────
 
