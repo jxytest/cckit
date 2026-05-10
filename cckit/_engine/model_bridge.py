@@ -42,6 +42,21 @@ logger = logging.getLogger(__name__)
 # ── Direct OTEL span helpers ─────────────────────────────────────
 
 
+def _extract_trace_context(headers: Any) -> Any:
+    """Extract W3C trace context from HTTP request headers.
+
+    Returns a context object to pass as ``context=`` to
+    ``start_as_current_span()``, so bridge spans become children of the
+    caller's span even though the bridge runs in a separate asyncio Task.
+    Returns None when opentelemetry is not installed.
+    """
+    try:
+        from opentelemetry.propagate import extract
+        return extract(dict(headers))
+    except ImportError:
+        return None
+
+
 def _span_attrs_for_route(route: Any, model_str: str) -> dict[str, Any]:
     """Build GenAI semantic-convention span attributes from a resolved route."""
     return {
@@ -285,10 +300,11 @@ class LiteLLMAnthropicBridge:
             try:
                 kwargs = self._build_kwargs(payload)
                 route = self._resolve_route(payload.get("model"))
+                parent_ctx = _extract_trace_context(request.headers)
                 if payload.get("stream"):
                     kwargs["stream"] = True
                     return StreamingResponse(
-                        self._wrap_stream(kwargs, route),
+                        self._wrap_stream(kwargs, route, parent_ctx),
                         media_type="text/event-stream",
                         headers={"cache-control": "no-cache", "x-accel-buffering": "no"},
                     )
@@ -296,6 +312,7 @@ class LiteLLMAnthropicBridge:
                 tracer = get_tracer("cckit.litellm")
                 with tracer.start_as_current_span(
                     "gen_ai.chat",
+                    context=parent_ctx,
                     attributes=_span_attrs_for_route(route, kwargs.get("model", "")),
                 ) as span:
                     resp = await litellm.anthropic.messages.acreate(**kwargs)
@@ -362,7 +379,7 @@ class LiteLLMAnthropicBridge:
     # ── streaming ─────────────────────────────────────────────────
 
     async def _wrap_stream(
-        self, kwargs: dict[str, Any], route: _ModelRoute,
+        self, kwargs: dict[str, Any], route: _ModelRoute, parent_ctx: Any = None,
     ) -> AsyncIterator[bytes]:
         """Start the LLM call, forward SSE bytes, and emit an OTEL span.
 
@@ -375,6 +392,7 @@ class LiteLLMAnthropicBridge:
         usage_data: dict[str, int] = {}
         with tracer.start_as_current_span(
             "gen_ai.chat",
+            context=parent_ctx,
             attributes=_span_attrs_for_route(route, kwargs.get("model", "")),
         ) as span:
             try:

@@ -41,10 +41,11 @@ def setup_telemetry() -> None:
     global _setup_done
     if _setup_done:
         return
-    _setup_done = True
 
     if not _otel_enabled():
         return
+
+    _setup_done = True
 
     try:
         from opentelemetry import trace
@@ -64,6 +65,15 @@ def setup_telemetry() -> None:
     provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
     trace.set_tracer_provider(provider)
     logger.info("OTEL tracing enabled — service=%s", service_name)
+
+    # Auto-instrument httpx so requests to the bridge carry traceparent headers,
+    # enabling gen_ai.chat spans to be children of cckit.agent.execute.
+    try:
+        from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+        HTTPXClientInstrumentor().instrument()
+        logger.debug("httpx instrumentation enabled")
+    except ImportError:
+        logger.debug("opentelemetry-instrumentation-httpx not installed — skipping")
 
 
 def get_tracer(name: str = "cckit") -> Any:
