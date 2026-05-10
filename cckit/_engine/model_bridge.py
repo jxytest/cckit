@@ -71,24 +71,28 @@ def _create_litellm_logging(kwargs: dict[str, Any]) -> Any | None:
 async def _fire_success_callback(logging_obj: Any, result: Any) -> None:
     if logging_obj is None:
         return
-    with suppress(Exception):
+    try:
         await logging_obj.async_success_handler(
             result=result,
             start_time=getattr(logging_obj, "start_time", None),
             end_time=datetime.now(tz=timezone.utc),
         )
+    except Exception:
+        logger.debug("LiteLLM success callback failed", exc_info=True)
 
 
 async def _fire_failure_callback(logging_obj: Any, exc: BaseException) -> None:
     if logging_obj is None:
         return
-    with suppress(Exception):
+    try:
         await logging_obj.async_failure_handler(
             exception=exc,
             traceback_exception=traceback.format_exc(),
             start_time=getattr(logging_obj, "start_time", None),
             end_time=datetime.now(tz=timezone.utc),
         )
+    except Exception:
+        logger.debug("LiteLLM failure callback failed", exc_info=True)
 
 
 def _load_litellm() -> Any:
@@ -118,6 +122,52 @@ def _error_sse_frame(message: str) -> bytes:
     payload = {"type": "error", "error": {"type": "api_error", "message": message}}
     body = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
     return f"event: error\ndata: {body}\n\n".encode()
+
+
+def _try_extract_usage(raw: bytes, usage_data: dict[str, int]) -> None:
+    """Best-effort parse of Anthropic SSE chunks to accumulate token counts.
+
+    Anthropic sends ``message_start`` with ``usage.input_tokens`` and
+    ``message_delta`` with ``usage.output_tokens``.  We record both so the
+    LiteLLM success callback receives a result with usage for cost tracking.
+    """
+    try:
+        text = raw.decode("utf-8", errors="ignore")
+        for line in text.splitlines():
+            if not line.startswith("data:"):
+                continue
+            data_str = line[5:].strip()
+            if not data_str or data_str == "[DONE]":
+                continue
+            obj = json.loads(data_str)
+            usage = obj.get("usage") or {}
+            if "input_tokens" in usage:
+                usage_data["prompt_tokens"] = int(usage["input_tokens"])
+            if "output_tokens" in usage:
+                usage_data["completion_tokens"] = int(usage["output_tokens"])
+    except Exception:
+        pass
+
+
+def _build_stream_result(logging_obj: Any, usage_data: dict[str, int]) -> dict[str, Any]:
+    """Build a minimal dict result for the LiteLLM success callback.
+
+    LiteLLM's OTEL handler uses dict-style ``.get()`` access on response_obj
+    (e.g. ``response_obj.get("usage")``).  Returning a plain dict satisfies
+    that contract even when a full ModelResponse is not available.
+    """
+    prompt_tokens = usage_data.get("prompt_tokens", 0)
+    completion_tokens = usage_data.get("completion_tokens", 0)
+    return {
+        "id": str(uuid.uuid4()),
+        "object": "chat.completion",
+        "model": getattr(logging_obj, "model", "unknown"),
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    }
 
 
 # ── public data classes ──────────────────────────────────────────
@@ -272,13 +322,20 @@ class LiteLLMAnthropicBridge:
         litellm.drop_params = True
 
         # Enable LiteLLM's native OTEL callback when OTLP env vars are set.
+        # Must register on BOTH the sync list (success_callback) AND the async
+        # list (_async_success_callback) — async_success_handler reads only the
+        # latter, and direct assignment to success_callback does not auto-sync.
         if os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT") or os.environ.get(
             "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
         ):
-            if "otel" not in (litellm.success_callback or []):
-                litellm.success_callback = list(litellm.success_callback or []) + ["otel"]
-            if "otel" not in (litellm.failure_callback or []):
-                litellm.failure_callback = list(litellm.failure_callback or []) + ["otel"]
+            for _attr in ("success_callback", "_async_success_callback"):
+                _lst = list(getattr(litellm, _attr, None) or [])
+                if "otel" not in _lst:
+                    setattr(litellm, _attr, _lst + ["otel"])
+            for _attr in ("failure_callback", "_async_failure_callback"):
+                _lst = list(getattr(litellm, _attr, None) or [])
+                if "otel" not in _lst:
+                    setattr(litellm, _attr, _lst + ["otel"])
 
         Route = starlette_rt.Route
         JSONResponse = starlette_resp.JSONResponse
@@ -373,20 +430,27 @@ class LiteLLMAnthropicBridge:
         so chunks are already SSE-encoded.  We just forward them and
         catch any mid-stream exceptions as an SSE error event.
         """
+        # Accumulate usage from stream to pass to the success callback.
+        # Anthropic SSE emits a ``message_delta`` event at stream end with
+        # ``usage.output_tokens``; we carry it so LiteLLM OTEL can record cost.
+        usage_data: dict[str, int] = {}
         try:
             async for chunk in stream:
                 if isinstance(chunk, (bytes, bytearray)):
-                    yield bytes(chunk)
+                    raw = bytes(chunk)
                 elif isinstance(chunk, str):
-                    yield chunk.encode()
+                    raw = chunk.encode()
                 else:
-                    # Shouldn't happen with current litellm, but be safe.
-                    yield json.dumps(chunk).encode()
+                    raw = json.dumps(chunk).encode()
+                # Best-effort parse for usage from message_delta SSE frame.
+                _try_extract_usage(raw, usage_data)
+                yield raw
         except Exception as exc:
             await _fire_failure_callback(logging_obj, exc)
             yield _error_sse_frame(str(exc))
         else:
-            await _fire_success_callback(logging_obj, None)
+            result = _build_stream_result(logging_obj, usage_data) if logging_obj else None
+            await _fire_success_callback(logging_obj, result)
 
     # ── token counting ────────────────────────────────────────────
 
