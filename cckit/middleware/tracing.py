@@ -87,7 +87,17 @@ class TracingMiddleware(Middleware):
     Records tool calls, tool results, and sub-agent lifecycle as span
     events.  Cost/usage is NOT recorded here — that is the responsibility
     of LiteLLM's native OTEL callback configured on the bridge.
+
+    Parameters
+    ----------
+    attributes:
+        Static span attributes applied to every execution handled by this
+        middleware instance (e.g. ``{"service.namespace": "my-app"}``).
+        Per-run dynamic attributes are supplied via ``RunContext.span_attributes``.
     """
+
+    def __init__(self, attributes: dict[str, Any] | None = None) -> None:
+        self._static_attributes: dict[str, Any] = dict(attributes or {})
 
     async def wrap(
         self,
@@ -98,13 +108,18 @@ class TracingMiddleware(Middleware):
         ctx: RunContext,
     ) -> AsyncIterator[Any]:
         tracer = get_tracer("cckit")
-        with tracer.start_as_current_span(
-            "cckit.agent.execute",
-            attributes={
-                "cckit.task_id": ctx.task_id,
-                "cckit.user": ctx.user or "",
-            },
-        ) as span:
+        span_name = ctx.span_name or "cckit.agent.execute"
+
+        # Priority: static (deployment-level) < per-run (ctx.span_attributes) < cckit-own
+        attributes: dict[str, Any] = {
+            **self._static_attributes,
+            **ctx.span_attributes,
+            "cckit.task_id": ctx.task_id,
+        }
+        if ctx.user:
+            attributes["cckit.user"] = ctx.user
+
+        with tracer.start_as_current_span(span_name, attributes=attributes) as span:
             message_count = 0
             try:
                 async for message in next_call(prompt, options, state):

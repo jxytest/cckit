@@ -327,6 +327,14 @@ class RunContext(CustomModel):
     resume_session_id: str = ""  # when set, resumes a previous SDK session
     fork_session: bool = False  # when resuming, create a new branch session
 
+    # Caller-supplied OpenTelemetry span attributes.
+    # Keys and values are passed verbatim to the span; cckit does not interpret them.
+    # Callers should namespace their keys (e.g. "myapp.user_id") to avoid collision
+    # with cckit's own attributes (prefixed "cckit.*").
+    span_attributes: dict[str, Any] = Field(default_factory=dict)
+    # Override the default span name ("cckit.agent.execute").
+    span_name: str | None = None
+
     # ------------------------------------------------------------------
     # Backward compatibility — deprecated, will be removed in v1.0
     # ------------------------------------------------------------------
