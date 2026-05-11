@@ -58,16 +58,103 @@ def _extract_trace_context(headers: Any) -> Any:
 
 
 def _span_attrs_for_route(route: Any, model_str: str) -> dict[str, Any]:
-    """Build GenAI semantic-convention span attributes from a resolved route."""
+    """Build GenAI + Langfuse span attributes from a resolved route."""
     return {
         "gen_ai.operation.name": "chat",
         "gen_ai.system": getattr(route.transport, "custom_llm_provider", None) or "anthropic",
         "gen_ai.request.model": model_str,
+        # Langfuse: classify this span as a generation (LLM call) observation.
+        # Without this, langfuse falls back to inferring type from `model`
+        # presence and can mis-categorise tool / sub-agent spans.
+        "langfuse.observation.type": "generation",
+        "langfuse.observation.model.name": model_str,
     }
 
 
+# Soft cap to keep span attributes within OTLP exporter limits.
+_MAX_ATTR_BYTES = 100_000
+
+
+def _truncate_for_attr(value: str) -> str:
+    """Clip an attribute value to a safe size."""
+    if len(value) <= _MAX_ATTR_BYTES:
+        return value
+    return value[:_MAX_ATTR_BYTES] + "...[truncated]"
+
+
+def _serialize_input(payload: dict[str, Any]) -> str:
+    """Build a JSON string suitable for langfuse.observation.input.
+
+    Includes both ``system`` and ``messages`` so reviewers see the full prompt.
+    """
+    try:
+        body = {
+            "system": payload.get("system"),
+            "messages": payload.get("messages"),
+            # Generation parameters help debugging.
+            "temperature": payload.get("temperature"),
+            "max_tokens": payload.get("max_tokens"),
+            "tools": payload.get("tools"),
+        }
+        body = {k: v for k, v in body.items() if v is not None}
+        return _truncate_for_attr(json.dumps(body, ensure_ascii=False, default=str))
+    except Exception:
+        return ""
+
+
+def _serialize_output_from_anthropic_response(resp: Any) -> str:
+    """Convert an Anthropic non-streaming response to a JSON string."""
+    try:
+        body = (
+            resp.model_dump(mode="json", exclude_none=True)
+            if hasattr(resp, "model_dump")
+            else resp
+        )
+        # Keep only the user-relevant pieces to avoid bloat.
+        slim = {
+            "stop_reason": body.get("stop_reason") if isinstance(body, dict) else None,
+            "content": body.get("content") if isinstance(body, dict) else body,
+        }
+        slim = {k: v for k, v in slim.items() if v is not None}
+        return _truncate_for_attr(json.dumps(slim, ensure_ascii=False, default=str))
+    except Exception:
+        return ""
+
+
+def _try_extract_stream_content(raw: bytes, acc: dict[str, Any]) -> None:
+    """Best-effort accumulation of streamed Anthropic SSE deltas.
+
+    Populates ``acc["text"]`` (concatenated text chunks) and
+    ``acc["stop_reason"]`` if present.
+    """
+    try:
+        text = raw.decode("utf-8", errors="ignore")
+        for line in text.splitlines():
+            if not line.startswith("data:"):
+                continue
+            data_str = line[5:].strip()
+            if not data_str or data_str == "[DONE]":
+                continue
+            obj = json.loads(data_str)
+            ev = obj.get("type")
+            if ev == "content_block_delta":
+                delta = obj.get("delta") or {}
+                if delta.get("type") == "text_delta":
+                    acc.setdefault("text", "")
+                    acc["text"] += str(delta.get("text", ""))
+                elif delta.get("type") == "thinking_delta":
+                    acc.setdefault("thinking", "")
+                    acc["thinking"] += str(delta.get("thinking", ""))
+            elif ev == "message_delta":
+                delta = obj.get("delta") or {}
+                if delta.get("stop_reason"):
+                    acc["stop_reason"] = delta["stop_reason"]
+    except Exception:
+        pass
+
+
 def _set_usage_on_span(span: Any, usage_data: dict[str, int], route: Any) -> None:
-    """Record token counts and cost on a span."""
+    """Record token counts and cost on a span (gen_ai + langfuse conventions)."""
     prompt = usage_data.get("prompt_tokens", 0)
     completion = usage_data.get("completion_tokens", 0)
     if prompt:
@@ -76,10 +163,30 @@ def _set_usage_on_span(span: Any, usage_data: dict[str, int], route: Any) -> Non
         span.set_attribute("gen_ai.usage.completion_tokens", completion)
     if prompt or completion:
         span.set_attribute("gen_ai.usage.total_tokens", prompt + completion)
+        # Langfuse-preferred: usage_details JSON with explicit keys.
+        span.set_attribute(
+            "langfuse.observation.usage_details",
+            json.dumps({
+                "input": prompt,
+                "output": completion,
+                "total": prompt + completion,
+            }),
+        )
     in_cost = getattr(getattr(route, "config", None), "input_cost_per_token", None)
     out_cost = getattr(getattr(route, "config", None), "output_cost_per_token", None)
     if in_cost is not None and out_cost is not None and (prompt or completion):
-        span.set_attribute("gen_ai.usage.cost", prompt * in_cost + completion * out_cost)
+        in_total = prompt * in_cost
+        out_total = completion * out_cost
+        total_cost = in_total + out_total
+        span.set_attribute("gen_ai.usage.cost", total_cost)
+        span.set_attribute(
+            "langfuse.observation.cost_details",
+            json.dumps({
+                "input": in_total,
+                "output": out_total,
+                "total": total_cost,
+            }),
+        )
 
 
 
@@ -203,6 +310,36 @@ class LiteLLMAnthropicBridge:
         self._socket: socket.socket | None = None
         self.base_url: str = ""
 
+        # OTEL parent context registered by the cckit tracing middleware.
+        # The Claude Code CLI is a Node.js subprocess and cannot propagate
+        # `traceparent` HTTP headers, so we pin the parent context here
+        # so every gen_ai.chat span becomes a child of cckit.agent.execute.
+        self._parent_otel_context: Any = None
+        # Trace-level attributes (langfuse.session.id, langfuse.user.id, …)
+        # that should be copied onto every gen_ai.chat span so that langfuse
+        # filters/aggregations work at the observation level.
+        self._trace_attributes: dict[str, Any] = {}
+
+    # ── tracing wiring ────────────────────────────────────────────
+
+    def set_parent_otel_context(self, ctx: Any) -> None:
+        """Pin the parent OTEL Context for child gen_ai.chat spans.
+
+        Called by the tracing middleware once ``cckit.agent.execute`` is
+        in flight.  ``ctx`` must be an ``opentelemetry.context.Context``;
+        passing ``None`` clears the binding.
+        """
+        self._parent_otel_context = ctx
+
+    def set_trace_attributes(self, attrs: dict[str, Any]) -> None:
+        """Set attributes that the bridge will copy onto every LLM span.
+
+        Typical entries: ``langfuse.session.id``, ``langfuse.user.id``,
+        ``langfuse.trace.tags`` — anything you need available at the
+        observation level for filtering inside langfuse.
+        """
+        self._trace_attributes = {k: v for k, v in (attrs or {}).items() if v is not None}
+
     # ── lifecycle ─────────────────────────────────────────────────
 
     async def start(self) -> LiteLLMAnthropicBridge:
@@ -300,28 +437,47 @@ class LiteLLMAnthropicBridge:
             try:
                 kwargs = self._build_kwargs(payload)
                 route = self._resolve_route(payload.get("model"))
-                parent_ctx = _extract_trace_context(request.headers)
+                # Prefer the in-process pinned parent context (the Claude
+                # Code CLI subprocess cannot inject traceparent), fall back
+                # to header-based extraction for completeness.
+                parent_ctx = self._parent_otel_context or _extract_trace_context(request.headers)
                 if payload.get("stream"):
                     kwargs["stream"] = True
                     return StreamingResponse(
-                        self._wrap_stream(kwargs, route, parent_ctx),
+                        self._wrap_stream(kwargs, route, parent_ctx, payload),
                         media_type="text/event-stream",
                         headers={"cache-control": "no-cache", "x-accel-buffering": "no"},
                     )
                 from cckit.telemetry import get_tracer
                 tracer = get_tracer("cckit.litellm")
+                attrs = _span_attrs_for_route(route, kwargs.get("model", ""))
+                # Propagate trace-level attrs (session.id, user.id, …) onto
+                # every LLM span so langfuse can filter at observation level.
+                attrs.update(self._trace_attributes)
+                input_json = _serialize_input(payload)
+                if input_json:
+                    attrs["langfuse.observation.input"] = input_json
                 with tracer.start_as_current_span(
                     "gen_ai.chat",
                     context=parent_ctx,
-                    attributes=_span_attrs_for_route(route, kwargs.get("model", "")),
+                    attributes=attrs,
                 ) as span:
                     resp = await litellm.anthropic.messages.acreate(**kwargs)
-                    usage = getattr(resp, "usage", None)
-                    if usage:
-                        _set_usage_on_span(span, {
-                            "prompt_tokens": getattr(usage, "input_tokens", 0),
-                            "completion_tokens": getattr(usage, "output_tokens", 0),
-                        }, route)
+                    # Telemetry must never break the LLM response path.
+                    # Any failure recording usage/output is swallowed so
+                    # the caller still receives the model's reply.
+                    try:
+                        usage = getattr(resp, "usage", None)
+                        if usage:
+                            _set_usage_on_span(span, {
+                                "prompt_tokens": getattr(usage, "input_tokens", 0),
+                                "completion_tokens": getattr(usage, "output_tokens", 0),
+                            }, route)
+                        output_json = _serialize_output_from_anthropic_response(resp)
+                        if output_json:
+                            span.set_attribute("langfuse.observation.output", output_json)
+                    except Exception:
+                        logger.debug("telemetry recording failed", exc_info=True)
                 body = resp.model_dump(mode="json", exclude_none=True) if hasattr(resp, "model_dump") else resp
                 return JSONResponse(body)
             except Exception as exc:
@@ -379,7 +535,11 @@ class LiteLLMAnthropicBridge:
     # ── streaming ─────────────────────────────────────────────────
 
     async def _wrap_stream(
-        self, kwargs: dict[str, Any], route: _ModelRoute, parent_ctx: Any = None,
+        self,
+        kwargs: dict[str, Any],
+        route: _ModelRoute,
+        parent_ctx: Any = None,
+        payload: dict[str, Any] | None = None,
     ) -> AsyncIterator[bytes]:
         """Start the LLM call, forward SSE bytes, and emit an OTEL span.
 
@@ -390,10 +550,18 @@ class LiteLLMAnthropicBridge:
         tracer = get_tracer("cckit.litellm")
         litellm = _load_litellm()
         usage_data: dict[str, int] = {}
+        content_acc: dict[str, Any] = {}
+        attrs = _span_attrs_for_route(route, kwargs.get("model", ""))
+        # Propagate trace-level attrs onto each LLM span (langfuse filtering).
+        attrs.update(self._trace_attributes)
+        if payload is not None:
+            input_json = _serialize_input(payload)
+            if input_json:
+                attrs["langfuse.observation.input"] = input_json
         with tracer.start_as_current_span(
             "gen_ai.chat",
             context=parent_ctx,
-            attributes=_span_attrs_for_route(route, kwargs.get("model", "")),
+            attributes=attrs,
         ) as span:
             try:
                 stream = await litellm.anthropic.messages.acreate(**kwargs)
@@ -405,6 +573,7 @@ class LiteLLMAnthropicBridge:
                     else:
                         raw = json.dumps(chunk).encode()
                     _try_extract_usage(raw, usage_data)
+                    _try_extract_stream_content(raw, content_acc)
                     yield raw
             except Exception as exc:
                 try:
@@ -416,6 +585,27 @@ class LiteLLMAnthropicBridge:
                 yield _error_sse_frame(str(exc))
             else:
                 _set_usage_on_span(span, usage_data, route)
+                # Emit accumulated streaming output for langfuse.
+                if content_acc:
+                    try:
+                        slim: dict[str, Any] = {}
+                        if content_acc.get("text"):
+                            slim["content"] = [
+                                {"type": "text", "text": content_acc["text"]},
+                            ]
+                        if content_acc.get("thinking"):
+                            slim["thinking"] = content_acc["thinking"]
+                        if content_acc.get("stop_reason"):
+                            slim["stop_reason"] = content_acc["stop_reason"]
+                        if slim:
+                            span.set_attribute(
+                                "langfuse.observation.output",
+                                _truncate_for_attr(
+                                    json.dumps(slim, ensure_ascii=False, default=str),
+                                ),
+                            )
+                    except Exception:
+                        pass
 
     # ── token counting ────────────────────────────────────────────
 

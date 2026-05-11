@@ -13,6 +13,10 @@ class RunState:
         self.session_id: str = ""
         self.final_message: Any | None = None
         self._stderr_lines: list[str] = []
+        # Optional reference to the in-process LiteLLM bridge owned by this run.
+        # When set, telemetry middleware can register the active OTEL context
+        # so that gen_ai.chat spans become children of cckit.agent.execute.
+        self.bridge: Any | None = None
 
     def observe(self, message: Any) -> None:
         """Update run state from a single SDK message."""

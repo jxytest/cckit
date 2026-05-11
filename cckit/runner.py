@@ -354,6 +354,11 @@ class Runner:
             prepared_model = await prepare_model_endpoint(
                 model, extra_models=extra_models or None,
             )
+            # Expose the in-process bridge to the tracing middleware so it
+            # can register the active OTEL context. This is the only way to
+            # make gen_ai.chat spans children of cckit.agent.execute, since
+            # the Claude Code CLI subprocess cannot inject traceparent.
+            state.bridge = prepared_model.bridge
             if self._preflight_check:
                 check_api_connectivity(
                     api_key=prepared_model.api_key or model.api_key,
