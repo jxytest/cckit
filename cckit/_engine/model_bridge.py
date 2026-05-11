@@ -390,6 +390,10 @@ def _absorb_usage_from_obj(obj: Any, usage_data: dict[str, int]) -> None:
     accepts OpenAI-style names so providers whose LiteLLM adapters do
     not fully translate to Anthropic format are still captured.
 
+    Additionally handles Gemini/DeepSeek-style ``usage_metadata`` with
+    field names like ``prompt_token_count``, ``candidates_token_count``,
+    ``cached_content_token_count``, and ``thoughts_token_count``.
+
     Cache tokens (``cache_creation_input_tokens`` /
     ``cache_read_input_tokens``) are recorded separately so that
     pricing — which differs from base input — can be computed
@@ -404,15 +408,29 @@ def _absorb_usage_from_obj(obj: Any, usage_data: dict[str, int]) -> None:
         if isinstance(msg, dict):
             usage = msg.get("usage")
     if not isinstance(usage, dict):
+        # Gemini / DeepSeek: usage lives under ``usage_metadata``.
+        usage = obj.get("usage_metadata")
+        if not isinstance(usage, dict):
+            msg = obj.get("message")
+            if isinstance(msg, dict):
+                usage = msg.get("usage_metadata")
+    if not isinstance(usage, dict):
         return
 
-    # Accept both Anthropic and OpenAI naming.
+    # Accept Anthropic, OpenAI, and Gemini/DeepSeek naming.
     inp = usage.get("input_tokens")
     if inp is None:
         inp = usage.get("prompt_tokens")
+    if inp is None:
+        inp = usage.get("prompt_token_count")
     out = usage.get("output_tokens")
     if out is None:
         out = usage.get("completion_tokens")
+    if out is None:
+        out = usage.get("candidates_token_count")
+
+    # DeepSeek reasoning/thinking tokens are billed as output.
+    thoughts = usage.get("thoughts_token_count")
 
     if inp is not None:
         try:
@@ -421,7 +439,14 @@ def _absorb_usage_from_obj(obj: Any, usage_data: dict[str, int]) -> None:
             pass
     if out is not None:
         try:
-            usage_data["completion_tokens"] = int(out)
+            completion = int(out)
+            # Add thinking/reasoning tokens to output for cost calculation.
+            if thoughts is not None:
+                try:
+                    completion += int(thoughts)
+                except (TypeError, ValueError):
+                    pass
+            usage_data["completion_tokens"] = completion
         except (TypeError, ValueError):
             pass
 
@@ -432,6 +457,8 @@ def _absorb_usage_from_obj(obj: Any, usage_data: dict[str, int]) -> None:
         except (TypeError, ValueError):
             pass
     cr = usage.get("cache_read_input_tokens")
+    if cr is None:
+        cr = usage.get("cached_content_token_count")
     if cr is not None:
         try:
             usage_data["cache_read_input_tokens"] = int(cr)
@@ -940,11 +967,14 @@ class LiteLLMAnthropicBridge:
                     # the caller still receives the model's reply.
                     try:
                         usage = getattr(resp, "usage", None)
+                        if not usage:
+                            usage = getattr(resp, "usage_metadata", None)
                         if usage:
                             # Pull every field through the same accessor —
                             # tolerant of pydantic-like objects, dicts, and
-                            # OpenAI-style naming. Cache tokens included so
-                            # cost matches the streaming path exactly.
+                            # OpenAI/Gemini/DeepSeek-style naming. Cache
+                            # tokens included so cost matches the streaming
+                            # path exactly.
                             def _u(name: str) -> int:
                                 value = (
                                     getattr(usage, name, None)
@@ -956,11 +986,27 @@ class LiteLLMAnthropicBridge:
                                 except (TypeError, ValueError):
                                     return 0
 
+                            prompt_tokens = (
+                                _u("input_tokens")
+                                or _u("prompt_tokens")
+                                or _u("prompt_token_count")
+                            )
+                            completion_tokens = (
+                                _u("output_tokens")
+                                or _u("completion_tokens")
+                                or _u("candidates_token_count")
+                            )
+                            # DeepSeek reasoning tokens are billed as output.
+                            completion_tokens += _u("thoughts_token_count")
+
                             usage_data: dict[str, int] = {
-                                "prompt_tokens": _u("input_tokens") or _u("prompt_tokens"),
-                                "completion_tokens": _u("output_tokens") or _u("completion_tokens"),
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": completion_tokens,
                                 "cache_creation_input_tokens": _u("cache_creation_input_tokens"),
-                                "cache_read_input_tokens": _u("cache_read_input_tokens"),
+                                "cache_read_input_tokens": (
+                                    _u("cache_read_input_tokens")
+                                    or _u("cached_content_token_count")
+                                ),
                             }
                             _set_usage_on_span(span, usage_data, route)
                         output_json = _serialize_output_from_anthropic_response(resp)
