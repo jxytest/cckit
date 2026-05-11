@@ -465,6 +465,22 @@ class LiteLLMAnthropicBridge:
         # filters/aggregations work at the observation level.
         self._trace_attributes: dict[str, Any] = {}
 
+        # Sub-agent routing
+        # =================
+        # ``_subagent_systems`` maps a sub-agent's ``task_type`` (its name in
+        # cckit.Agent) to a *signature* — the textual instruction string we
+        # expect to find inside the request's ``system`` field. We use
+        # substring matching against this signature to fingerprint incoming
+        # HTTP requests back to the sub-agent that issued them, because the
+        # Claude Code CLI offers no other in-band identifier.
+        #
+        # ``_subagent_contexts`` is a per-task_type stack of OTEL Contexts
+        # whose active span is the sub-agent's logical ``subagent.<name>``
+        # span. The tracing middleware pushes/pops as it observes the SDK
+        # message stream (ToolUseBlock(name="Task") / ToolResultBlock).
+        self._subagent_systems: dict[str, str] = {}
+        self._subagent_contexts: dict[str, list[Any]] = {}
+
     # ── tracing wiring ────────────────────────────────────────────
 
     def set_parent_otel_context(self, ctx: Any) -> None:
@@ -484,6 +500,84 @@ class LiteLLMAnthropicBridge:
         observation level for filtering inside langfuse.
         """
         self._trace_attributes = {k: v for k, v in (attrs or {}).items() if v is not None}
+
+    # ── sub-agent routing ────────────────────────────────────────
+
+    def register_subagent_systems(self, mapping: dict[str, str]) -> None:
+        """Register the textual signature for each sub-agent's system prompt.
+
+        The runner calls this once per agent run with
+        ``{sub.name: sub.resolve_instruction(ctx)}``. Used by
+        :meth:`_resolve_parent_context` to fingerprint inbound requests so
+        sub-agent LLM observations attach to the right sub-agent span
+        instead of the main agent span.
+
+        Empty / very short signatures are dropped because they're prone
+        to false-positive substring matches against the main agent's
+        system text.
+        """
+        cleaned: dict[str, str] = {}
+        for name, signature in (mapping or {}).items():
+            sig = self._flatten_system(signature) if signature else ""
+            if name and sig and len(sig) >= 32:
+                cleaned[name] = sig
+        self._subagent_systems = cleaned
+
+    def push_subagent_context(self, task_type: str, ctx: Any) -> None:
+        """Mark *ctx* as the current parent for sub-agent ``task_type``."""
+        if not task_type or ctx is None:
+            return
+        self._subagent_contexts.setdefault(task_type, []).append(ctx)
+
+    def pop_subagent_context(self, task_type: str, ctx: Any) -> None:
+        """Remove *ctx* from sub-agent ``task_type``'s active stack."""
+        if not task_type:
+            return
+        stack = self._subagent_contexts.get(task_type)
+        if not stack:
+            return
+        # Prefer identity-based removal so out-of-order completions do
+        # not pop the wrong context. Fall back to LIFO when the same
+        # ctx was pushed twice (shouldn't happen, but defensive).
+        try:
+            stack.remove(ctx)
+        except ValueError:
+            try:
+                stack.pop()
+            except IndexError:
+                pass
+        if not stack:
+            self._subagent_contexts.pop(task_type, None)
+
+    def _resolve_parent_context(self, payload: dict[str, Any]) -> Any:
+        """Pick the OTEL parent for a gen_ai.chat span based on the request.
+
+        Strategy:
+            1. Flatten the request's ``system`` field.
+            2. Find every registered sub-agent whose signature is a
+               substring of it; pick the one with the longest signature
+               (most specific).
+            3. Use the top of that sub-agent's context stack.
+            4. Fall back to the pinned main-agent context.
+        """
+        if not self._subagent_systems:
+            return self._parent_otel_context
+        sys_text = self._flatten_system(payload.get("system"))
+        if not sys_text:
+            return self._parent_otel_context
+
+        best_name: str | None = None
+        best_len = 0
+        for name, signature in self._subagent_systems.items():
+            if signature and signature in sys_text and len(signature) > best_len:
+                best_name = name
+                best_len = len(signature)
+
+        if best_name:
+            stack = self._subagent_contexts.get(best_name)
+            if stack:
+                return stack[-1]
+        return self._parent_otel_context
 
     # ── lifecycle ─────────────────────────────────────────────────
 
@@ -582,10 +676,16 @@ class LiteLLMAnthropicBridge:
             try:
                 kwargs = self._build_kwargs(payload)
                 route = self._resolve_route(payload.get("model"))
-                # Prefer the in-process pinned parent context (the Claude
-                # Code CLI subprocess cannot inject traceparent), fall back
-                # to header-based extraction for completeness.
-                parent_ctx = self._parent_otel_context or _extract_trace_context(request.headers)
+                # Resolve the parent OTEL context for this request:
+                # sub-agent stack first (so sub-agent LLM calls nest under
+                # their subagent.<name> span), then the pinned main-agent
+                # context, finally header-based extraction. The Claude
+                # Code CLI subprocess cannot inject traceparent so the
+                # header path is essentially never used.
+                parent_ctx = (
+                    self._resolve_parent_context(payload)
+                    or _extract_trace_context(request.headers)
+                )
                 if payload.get("stream"):
                     kwargs["stream"] = True
                     return StreamingResponse(

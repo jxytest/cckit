@@ -359,6 +359,31 @@ class Runner:
             # make gen_ai.chat spans children of cckit.agent.execute, since
             # the Claude Code CLI subprocess cannot inject traceparent.
             state.bridge = prepared_model.bridge
+
+            # Register sub-agent system signatures with the bridge so that
+            # sub-agent LLM observations attach to the right subagent.<name>
+            # span (vs. the main agent span). Each sub-agent has a distinct
+            # instruction string, which the bridge fingerprints against
+            # incoming requests.
+            if prepared_model.bridge is not None and agent.sub_agents:
+                sub_systems: dict[str, str] = {}
+                for sub in agent.sub_agents:
+                    try:
+                        sub_systems[sub.name] = sub.resolve_instruction(ctx) or ""
+                    except Exception:
+                        # Telemetry registration must never break a run.
+                        logger.debug(
+                            "Failed to resolve sub-agent instruction for %s",
+                            sub.name, exc_info=True,
+                        )
+                if sub_systems:
+                    try:
+                        prepared_model.bridge.register_subagent_systems(sub_systems)
+                    except Exception:
+                        logger.debug(
+                            "bridge.register_subagent_systems failed",
+                            exc_info=True,
+                        )
             if self._preflight_check:
                 check_api_connectivity(
                     api_key=prepared_model.api_key or model.api_key,
