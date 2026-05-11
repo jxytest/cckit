@@ -153,39 +153,119 @@ def _try_extract_stream_content(raw: bytes, acc: dict[str, Any]) -> None:
         pass
 
 
+def _compute_cost(usage_data: dict[str, int], route: Any) -> dict[str, float] | None:
+    """Compute USD cost split for one LLM call, mirroring cckit/_cost.py.
+
+    Priority:
+        1. ``ModelConfig.input_cost_per_token`` / ``output_cost_per_token``
+           overrides — applied flat to base input and output (consistent
+           with the cost recalculation pass in ``cckit._cost``).
+        2. ``litellm.cost_per_token(...)`` — handles Anthropic prompt
+           caching markups (×1.25 for creation, ×0.1 for reads) using
+           the provider's published rates.
+
+    Returns ``None`` when no price source is available so the caller can
+    omit ``cost_details`` rather than emit a misleading $0.
+    """
+    cfg = getattr(route, "config", None)
+    if cfg is None:
+        return None
+
+    prompt = int(usage_data.get("prompt_tokens", 0) or 0)
+    completion = int(usage_data.get("completion_tokens", 0) or 0)
+    cache_creation = int(usage_data.get("cache_creation_input_tokens", 0) or 0)
+    cache_read = int(usage_data.get("cache_read_input_tokens", 0) or 0)
+
+    if not (prompt or completion or cache_creation or cache_read):
+        return None
+
+    # Priority 1: explicit per-token overrides on ModelConfig.
+    in_cost = getattr(cfg, "input_cost_per_token", None)
+    out_cost = getattr(cfg, "output_cost_per_token", None)
+    if in_cost is not None and out_cost is not None:
+        # Match cckit/_cost.py: overrides apply to base input and output;
+        # cache tokens are billed at the same input rate (so totals stay
+        # consistent across observation and trace level when overrides
+        # are configured).
+        in_total = (prompt + cache_creation + cache_read) * float(in_cost)
+        out_total = completion * float(out_cost)
+        return {
+            "input": prompt * float(in_cost),
+            "input_cache_creation": cache_creation * float(in_cost),
+            "input_cache_read": cache_read * float(in_cost),
+            "output": out_total,
+            "total": in_total + out_total,
+        }
+
+    # Priority 2: LiteLLM price table (cache-aware).
+    try:
+        litellm = importlib.import_module("litellm")
+        transport_model = getattr(getattr(route, "transport", None), "model", None)
+        for candidate in (transport_model, getattr(cfg, "model", None)):
+            if not candidate:
+                continue
+            try:
+                p_cost, c_cost = litellm.cost_per_token(
+                    model=candidate,
+                    prompt_tokens=prompt,
+                    completion_tokens=completion,
+                    cache_creation_input_tokens=cache_creation,
+                    cache_read_input_tokens=cache_read,
+                )
+                if (p_cost or 0) + (c_cost or 0) > 0:
+                    return {
+                        "input": float(p_cost),
+                        "output": float(c_cost),
+                        "total": float(p_cost) + float(c_cost),
+                    }
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return None
+
+
 def _set_usage_on_span(span: Any, usage_data: dict[str, int], route: Any) -> None:
     """Record token counts and cost on a span (gen_ai + langfuse conventions)."""
-    prompt = usage_data.get("prompt_tokens", 0)
-    completion = usage_data.get("completion_tokens", 0)
-    if prompt:
-        span.set_attribute("gen_ai.usage.prompt_tokens", prompt)
+    prompt = int(usage_data.get("prompt_tokens", 0) or 0)
+    completion = int(usage_data.get("completion_tokens", 0) or 0)
+    cache_creation = int(usage_data.get("cache_creation_input_tokens", 0) or 0)
+    cache_read = int(usage_data.get("cache_read_input_tokens", 0) or 0)
+
+    # Total input includes cache (Anthropic semantics): the model "saw"
+    # all of these tokens. Langfuse aggregates per observation, so we
+    # need an honest total rather than just the non-cache slice.
+    total_input = prompt + cache_creation + cache_read
+
+    # gen_ai semantic-convention attributes (legacy).
+    if total_input:
+        span.set_attribute("gen_ai.usage.prompt_tokens", total_input)
     if completion:
         span.set_attribute("gen_ai.usage.completion_tokens", completion)
-    if prompt or completion:
-        span.set_attribute("gen_ai.usage.total_tokens", prompt + completion)
-        # Langfuse-preferred: usage_details JSON with explicit keys.
+    if total_input or completion:
+        span.set_attribute("gen_ai.usage.total_tokens", total_input + completion)
+
+    # Langfuse-preferred: granular usage_details with cache breakdown.
+    if total_input or completion:
+        details: dict[str, int] = {
+            "input": prompt,
+            "output": completion,
+            "total": total_input + completion,
+        }
+        if cache_creation:
+            details["input_cache_creation"] = cache_creation
+        if cache_read:
+            details["input_cache_read"] = cache_read
         span.set_attribute(
-            "langfuse.observation.usage_details",
-            json.dumps({
-                "input": prompt,
-                "output": completion,
-                "total": prompt + completion,
-            }),
+            "langfuse.observation.usage_details", json.dumps(details),
         )
-    in_cost = getattr(getattr(route, "config", None), "input_cost_per_token", None)
-    out_cost = getattr(getattr(route, "config", None), "output_cost_per_token", None)
-    if in_cost is not None and out_cost is not None and (prompt or completion):
-        in_total = prompt * in_cost
-        out_total = completion * out_cost
-        total_cost = in_total + out_total
-        span.set_attribute("gen_ai.usage.cost", total_cost)
+
+    cost = _compute_cost(usage_data, route)
+    if cost is not None:
+        span.set_attribute("gen_ai.usage.cost", cost["total"])
         span.set_attribute(
-            "langfuse.observation.cost_details",
-            json.dumps({
-                "input": in_total,
-                "output": out_total,
-                "total": total_cost,
-            }),
+            "langfuse.observation.cost_details", json.dumps(cost),
         )
 
 
@@ -219,26 +299,91 @@ def _error_sse_frame(message: str) -> bytes:
     return f"event: error\ndata: {body}\n\n".encode()
 
 
-def _try_extract_usage(raw: bytes, usage_data: dict[str, int]) -> None:
-    """Best-effort parse of Anthropic SSE chunks to accumulate token counts.
+def _absorb_usage_from_obj(obj: Any, usage_data: dict[str, int]) -> None:
+    """Pull token counts out of one Anthropic SSE event payload.
 
-    Anthropic sends ``message_start`` with ``usage.input_tokens`` and
-    ``message_delta`` with ``usage.output_tokens``.
+    Handles both layouts (``message_start`` nests ``usage`` under
+    ``message``; ``message_delta`` keeps it at top level) and also
+    accepts OpenAI-style names so providers whose LiteLLM adapters do
+    not fully translate to Anthropic format are still captured.
+
+    Cache tokens (``cache_creation_input_tokens`` /
+    ``cache_read_input_tokens``) are recorded separately so that
+    pricing — which differs from base input — can be computed
+    correctly downstream.
+    """
+    if not isinstance(obj, dict):
+        return
+
+    usage = obj.get("usage")
+    if not isinstance(usage, dict):
+        msg = obj.get("message")
+        if isinstance(msg, dict):
+            usage = msg.get("usage")
+    if not isinstance(usage, dict):
+        return
+
+    # Accept both Anthropic and OpenAI naming.
+    inp = usage.get("input_tokens")
+    if inp is None:
+        inp = usage.get("prompt_tokens")
+    out = usage.get("output_tokens")
+    if out is None:
+        out = usage.get("completion_tokens")
+
+    if inp is not None:
+        try:
+            usage_data["prompt_tokens"] = int(inp)
+        except (TypeError, ValueError):
+            pass
+    if out is not None:
+        try:
+            usage_data["completion_tokens"] = int(out)
+        except (TypeError, ValueError):
+            pass
+
+    cc = usage.get("cache_creation_input_tokens")
+    if cc is not None:
+        try:
+            usage_data["cache_creation_input_tokens"] = int(cc)
+        except (TypeError, ValueError):
+            pass
+    cr = usage.get("cache_read_input_tokens")
+    if cr is not None:
+        try:
+            usage_data["cache_read_input_tokens"] = int(cr)
+        except (TypeError, ValueError):
+            pass
+
+
+def _try_extract_usage(raw: bytes, usage_data: dict[str, int]) -> None:
+    """Best-effort parse of streaming chunks to accumulate token counts.
+
+    Tries SSE framing first (``data: ...`` lines, the Anthropic format
+    LiteLLM normally emits); falls back to parsing the whole payload
+    as a single JSON object so we still pick up usage when chunks come
+    through as already-decoded objects (some LiteLLM adapter paths).
     """
     try:
         text = raw.decode("utf-8", errors="ignore")
+        sse_seen = False
         for line in text.splitlines():
             if not line.startswith("data:"):
                 continue
+            sse_seen = True
             data_str = line[5:].strip()
             if not data_str or data_str == "[DONE]":
                 continue
-            obj = json.loads(data_str)
-            usage = obj.get("usage") or {}
-            if "input_tokens" in usage:
-                usage_data["prompt_tokens"] = int(usage["input_tokens"])
-            if "output_tokens" in usage:
-                usage_data["completion_tokens"] = int(usage["output_tokens"])
+            try:
+                obj = json.loads(data_str)
+            except Exception:
+                continue
+            _absorb_usage_from_obj(obj, usage_data)
+        if not sse_seen:
+            try:
+                _absorb_usage_from_obj(json.loads(text), usage_data)
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -469,10 +614,28 @@ class LiteLLMAnthropicBridge:
                     try:
                         usage = getattr(resp, "usage", None)
                         if usage:
-                            _set_usage_on_span(span, {
-                                "prompt_tokens": getattr(usage, "input_tokens", 0),
-                                "completion_tokens": getattr(usage, "output_tokens", 0),
-                            }, route)
+                            # Pull every field through the same accessor —
+                            # tolerant of pydantic-like objects, dicts, and
+                            # OpenAI-style naming. Cache tokens included so
+                            # cost matches the streaming path exactly.
+                            def _u(name: str) -> int:
+                                value = (
+                                    getattr(usage, name, None)
+                                    if not isinstance(usage, dict)
+                                    else usage.get(name)
+                                )
+                                try:
+                                    return int(value or 0)
+                                except (TypeError, ValueError):
+                                    return 0
+
+                            usage_data: dict[str, int] = {
+                                "prompt_tokens": _u("input_tokens") or _u("prompt_tokens"),
+                                "completion_tokens": _u("output_tokens") or _u("completion_tokens"),
+                                "cache_creation_input_tokens": _u("cache_creation_input_tokens"),
+                                "cache_read_input_tokens": _u("cache_read_input_tokens"),
+                            }
+                            _set_usage_on_span(span, usage_data, route)
                         output_json = _serialize_output_from_anthropic_response(resp)
                         if output_json:
                             span.set_attribute("langfuse.observation.output", output_json)
