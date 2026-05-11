@@ -226,6 +226,89 @@ def _compute_cost(usage_data: dict[str, int], route: Any) -> dict[str, float] | 
     return None
 
 
+def _backfill_usage_via_token_counter(
+    usage_data: dict[str, int],
+    payload: dict[str, Any],
+    content_acc: dict[str, Any],
+    route: Any,
+) -> None:
+    """Estimate prompt / completion tokens via ``litellm.token_counter``.
+
+    Some upstream providers (or LiteLLM adapter paths for them) do not
+    forward usage information through the streaming SSE channel. When
+    that happens we end the stream with ``usage_data`` empty, which
+    cascades into missing token / cost attributes on the span.
+
+    This helper fills in any zero counters using local tokenization so
+    langfuse still gets non-zero data for cost computation. Estimates
+    are inherently approximate (tokenizer differences from the real
+    provider), but better than nothing.
+
+    Cache-token slots are intentionally NOT estimated — they have no
+    local equivalent.
+    """
+    try:
+        # Skip when at least one of input/output tokens is already known —
+        # we trust the upstream's authoritative counts over local estimates.
+        if usage_data.get("prompt_tokens") and usage_data.get("completion_tokens"):
+            return
+        litellm = importlib.import_module("litellm")
+    except Exception:
+        return
+
+    counter = getattr(litellm, "token_counter", None)
+    if not callable(counter):
+        return
+
+    transport_model = getattr(getattr(route, "transport", None), "model", None)
+    cfg_model = getattr(getattr(route, "config", None), "model", None)
+    candidates = [m for m in (transport_model, cfg_model) if m]
+    if not candidates:
+        return
+
+    # Build a messages list that resembles what the model saw.
+    messages: list[dict[str, Any]] = []
+    system = payload.get("system")
+    if system:
+        try:
+            sys_text = (
+                system if isinstance(system, str)
+                else "\n".join(
+                    item.get("text", "") if isinstance(item, dict) else str(item)
+                    for item in system
+                )
+            )
+            if sys_text:
+                messages.append({"role": "system", "content": sys_text})
+        except Exception:
+            pass
+    payload_msgs = payload.get("messages") or []
+    if isinstance(payload_msgs, list):
+        messages.extend(m for m in payload_msgs if isinstance(m, dict))
+
+    if not usage_data.get("prompt_tokens") and messages:
+        for model_name in candidates:
+            try:
+                count = int(counter(model=model_name, messages=messages))
+                if count > 0:
+                    usage_data["prompt_tokens"] = count
+                    break
+            except Exception:
+                continue
+
+    if not usage_data.get("completion_tokens"):
+        output_text = (content_acc or {}).get("text") or ""
+        if output_text:
+            for model_name in candidates:
+                try:
+                    count = int(counter(model=model_name, text=output_text))
+                    if count > 0:
+                        usage_data["completion_tokens"] = count
+                        break
+                except Exception:
+                    continue
+
+
 def _set_usage_on_span(span: Any, usage_data: dict[str, int], route: Any) -> None:
     """Record token counts and cost on a span (gen_ai + langfuse conventions)."""
     prompt = int(usage_data.get("prompt_tokens", 0) or 0)
@@ -433,10 +516,11 @@ class LiteLLMAnthropicBridge:
         The main agent's :class:`ModelConfig`.  Used as the default route
         when a request's ``model`` field doesn't match any registered route.
     extra_models:
-        Optional mapping of **model name** → :class:`ModelConfig` for
-        sub-agents that need different provider credentials.  The bridge
-        dispatches to the matching route based on the ``model`` field in
-        each incoming request payload.
+        Optional mapping of ``model_name → ModelConfig`` for sub-agents
+        whose models differ from the main agent.  When provided and at
+        least one entry requires a non-Anthropic transport, a multi-model
+        bridge is started so that every model (including Anthropic ones)
+        can be routed through a single local HTTP endpoint.
     """
 
     def __init__(
@@ -480,6 +564,12 @@ class LiteLLMAnthropicBridge:
         # message stream (ToolUseBlock(name="Task") / ToolResultBlock).
         self._subagent_systems: dict[str, str] = {}
         self._subagent_contexts: dict[str, list[Any]] = {}
+        # Primary sub-agent routing signal: prompt text → stack of ctxs.
+        # The Task tool's ``prompt`` input is sent verbatim as the first
+        # user message of every HTTP request the sub-agent makes, so it
+        # is a much stronger fingerprint than the system prompt
+        # (especially for parallel invocations of the same sub-agent).
+        self._task_prompt_routes: dict[str, list[Any]] = {}
 
     # ── tracing wiring ────────────────────────────────────────────
 
@@ -519,9 +609,68 @@ class LiteLLMAnthropicBridge:
         cleaned: dict[str, str] = {}
         for name, signature in (mapping or {}).items():
             sig = self._flatten_system(signature) if signature else ""
-            if name and sig and len(sig) >= 32:
+            # Lowered to 16 chars: the previous 32-char floor was filtering
+            # out short but still distinctive sub-agent instructions.
+            if name and sig and len(sig) >= 16:
                 cleaned[name] = sig
         self._subagent_systems = cleaned
+        logger.debug(
+            "bridge: registered %d sub-agent system signatures: %s",
+            len(cleaned), list(cleaned.keys()),
+        )
+
+    def push_task_prompt(self, prompt: str, ctx: Any) -> None:
+        """Register that *prompt* is currently being processed by *ctx*.
+
+        Called when the tracing middleware sees a ToolUseBlock(name="Task").
+        The prompt text is what the main agent passes as the Task tool's
+        ``prompt`` input; the Claude Code CLI uses it as the first user
+        message in the sub-agent's HTTP requests, which makes it a strong
+        per-invocation routing key.
+        """
+        if not prompt or ctx is None:
+            return
+        key = self._normalize_prompt(prompt)
+        if not key:
+            return
+        self._task_prompt_routes.setdefault(key, []).append(ctx)
+        logger.debug(
+            "bridge: push task prompt route (len=%d, prefix=%r)",
+            len(key), key[:60],
+        )
+
+    def pop_task_prompt(self, prompt: str, ctx: Any) -> None:
+        """Unregister the prompt → ctx binding when the sub-agent finishes."""
+        if not prompt:
+            return
+        key = self._normalize_prompt(prompt)
+        if not key:
+            return
+        stack = self._task_prompt_routes.get(key)
+        if not stack:
+            return
+        try:
+            stack.remove(ctx)
+        except ValueError:
+            try:
+                stack.pop()
+            except IndexError:
+                pass
+        if not stack:
+            self._task_prompt_routes.pop(key, None)
+
+    @staticmethod
+    def _normalize_prompt(prompt: Any) -> str:
+        """Return a comparable prompt string (string or first content text)."""
+        if isinstance(prompt, str):
+            return prompt.strip()
+        if isinstance(prompt, list):
+            for item in prompt:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    return str(item.get("text", "")).strip()
+                if isinstance(item, str):
+                    return item.strip()
+        return ""
 
     def push_subagent_context(self, task_type: str, ctx: Any) -> None:
         """Mark *ctx* as the current parent for sub-agent ``task_type``."""
@@ -552,32 +701,110 @@ class LiteLLMAnthropicBridge:
     def _resolve_parent_context(self, payload: dict[str, Any]) -> Any:
         """Pick the OTEL parent for a gen_ai.chat span based on the request.
 
-        Strategy:
-            1. Flatten the request's ``system`` field.
-            2. Find every registered sub-agent whose signature is a
-               substring of it; pick the one with the longest signature
-               (most specific).
-            3. Use the top of that sub-agent's context stack.
-            4. Fall back to the pinned main-agent context.
+        Routing strategies, in priority order:
+            1. **Task prompt match** — the request's first user message
+               equals (or contains) a registered Task-tool prompt. Most
+               specific; works even for parallel same-sub-agent calls
+               with different prompts.
+            2. **System signature match** — the request's ``system`` text
+               contains a registered sub-agent's instruction as substring;
+               longest match wins.
+            3. **Singleton-active fallback** — exactly one sub-agent
+               context is active across all stacks; attribute the call
+               to it. Fires when the CLI rewrites system/prompt enough
+               that neither (1) nor (2) matched, but only one sub-agent
+               could plausibly have made the request.
+            4. **Main agent** — the pinned root ``cckit.agent.execute``
+               context.
         """
-        if not self._subagent_systems:
-            return self._parent_otel_context
-        sys_text = self._flatten_system(payload.get("system"))
-        if not sys_text:
-            return self._parent_otel_context
+        # ── (1) prompt match ────────────────────────────────────────
+        if self._task_prompt_routes:
+            first_user = self._extract_first_user_text(payload)
+            if first_user:
+                # Try exact key first (cheapest), then substring.
+                stack = self._task_prompt_routes.get(first_user)
+                if stack:
+                    logger.debug(
+                        "bridge: route via prompt-exact (prefix=%r)",
+                        first_user[:60],
+                    )
+                    return stack[-1]
+                best_match: list[Any] | None = None
+                best_len = 0
+                for key, kstack in self._task_prompt_routes.items():
+                    if key in first_user and len(key) > best_len and kstack:
+                        best_match = kstack
+                        best_len = len(key)
+                if best_match:
+                    logger.debug(
+                        "bridge: route via prompt-substring (matched_len=%d)",
+                        best_len,
+                    )
+                    return best_match[-1]
 
-        best_name: str | None = None
-        best_len = 0
-        for name, signature in self._subagent_systems.items():
-            if signature and signature in sys_text and len(signature) > best_len:
-                best_name = name
-                best_len = len(signature)
+        # ── (2) system signature match ──────────────────────────────
+        if self._subagent_systems:
+            sys_text = self._flatten_system(payload.get("system"))
+            if sys_text:
+                best_name: str | None = None
+                best_len = 0
+                for name, signature in self._subagent_systems.items():
+                    if signature and signature in sys_text and len(signature) > best_len:
+                        best_name = name
+                        best_len = len(signature)
+                if best_name:
+                    stack = self._subagent_contexts.get(best_name)
+                    if stack:
+                        logger.debug(
+                            "bridge: route via system-signature (name=%s, len=%d)",
+                            best_name, best_len,
+                        )
+                        return stack[-1]
 
-        if best_name:
-            stack = self._subagent_contexts.get(best_name)
-            if stack:
-                return stack[-1]
+        # ── (3) singleton-active fallback ───────────────────────────
+        active_ctxs = [
+            c for stack in self._subagent_contexts.values() for c in stack
+        ]
+        if len(active_ctxs) == 1:
+            logger.debug("bridge: route via singleton-active fallback")
+            return active_ctxs[0]
+
+        # ── (4) main agent ──────────────────────────────────────────
+        logger.debug(
+            "bridge: route via main fallback "
+            "(active_subagents=%d, registered_systems=%d, registered_prompts=%d)",
+            len(active_ctxs), len(self._subagent_systems),
+            len(self._task_prompt_routes),
+        )
         return self._parent_otel_context
+
+    @staticmethod
+    def _extract_first_user_text(payload: dict[str, Any]) -> str:
+        """Pull the first user message's text out of an Anthropic-style payload."""
+        try:
+            messages = payload.get("messages") or []
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                if msg.get("role") != "user":
+                    continue
+                content = msg.get("content")
+                if isinstance(content, str):
+                    return content.strip()
+                if isinstance(content, list):
+                    parts: list[str] = []
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            parts.append(str(item.get("text", "")))
+                        elif isinstance(item, str):
+                            parts.append(item)
+                    if parts:
+                        return "\n".join(parts).strip()
+                # First user message wins regardless of content shape.
+                break
+        except Exception:
+            pass
+        return ""
 
     # ── lifecycle ─────────────────────────────────────────────────
 
@@ -847,7 +1074,18 @@ class LiteLLMAnthropicBridge:
                 span.record_exception(exc)
                 yield _error_sse_frame(str(exc))
             else:
+                # Fallback: when the upstream provider's SSE stream did
+                # not surface usage at all (some LiteLLM adapters strip
+                # it), count tokens locally so observation-level cost
+                # and tokens are still populated.
+                _backfill_usage_via_token_counter(
+                    usage_data, payload, content_acc, route,
+                )
                 _set_usage_on_span(span, usage_data, route)
+                logger.debug(
+                    "bridge stream done: usage=%s, route=%s",
+                    usage_data, getattr(route.config, "model", "?"),
+                )
                 # Emit accumulated streaming output for langfuse.
                 if content_acc:
                     try:

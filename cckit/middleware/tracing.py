@@ -156,12 +156,14 @@ class _ChildSpanRegistry:
         ctx: Any,
         is_subagent: bool = False,
         task_type: str | None = None,
+        task_prompt: str = "",
     ) -> None:
         self.entries[tool_use_id] = {
             "span": span,
             "ctx": ctx,
             "is_subagent": is_subagent,
             "task_type": task_type,
+            "task_prompt": task_prompt,
         }
 
     def get(self, tool_use_id: str | None) -> dict[str, Any] | None:
@@ -282,6 +284,7 @@ def _open_tool_or_subagent_span(
     tool_input = getattr(block, "input", None)
 
     is_subagent = name == _SUBAGENT_TOOL_NAME
+    task_prompt: str = ""
     if is_subagent and isinstance(tool_input, dict):
         # Standard Task-tool input keys per Claude Agent SDK.
         subagent_type = (
@@ -289,9 +292,14 @@ def _open_tool_or_subagent_span(
             or tool_input.get("agent")
             or tool_input.get("agent_type")
         )
+        # ``prompt`` is the actual text the sub-agent sees as its first
+        # user message — much more distinctive than ``description`` and
+        # therefore the preferred routing key. Keep ``description`` as
+        # a span-name fallback only.
+        task_prompt = str(tool_input.get("prompt") or "")
         description = (
             tool_input.get("description")
-            or tool_input.get("prompt")
+            or task_prompt
             or ""
         )
         first_line = description.strip().splitlines()[0] if description else ""
@@ -337,15 +345,24 @@ def _open_tool_or_subagent_span(
         ctx=span_ctx,
         is_subagent=is_subagent,
         task_type=str(subagent_type) if subagent_type else None,
+        task_prompt=task_prompt,
     )
 
-    # Push onto the bridge's per-task_type stack so sub-agent LLM
-    # requests resolve to this span as their parent.
-    if is_subagent and bridge is not None and subagent_type:
-        try:
-            bridge.push_subagent_context(str(subagent_type), span_ctx)
-        except Exception:
-            pass
+    # Register the sub-agent's invocation with the bridge so its LLM
+    # requests resolve to THIS span as their parent. Both signals are
+    # forwarded — the bridge prefers the prompt match (per-invocation,
+    # disambiguates parallel calls) and falls back to system signature.
+    if is_subagent and bridge is not None:
+        if task_prompt:
+            try:
+                bridge.push_task_prompt(task_prompt, span_ctx)
+            except Exception:
+                pass
+        if subagent_type:
+            try:
+                bridge.push_subagent_context(str(subagent_type), span_ctx)
+            except Exception:
+                pass
 
 
 def _close_tool_or_subagent_span(
@@ -392,14 +409,22 @@ def _close_tool_or_subagent_span(
         except Exception:
             pass
 
-    # Pop the bridge stack BEFORE ending the span — once ended, late
-    # sub-agent requests should fall through to the main parent rather
-    # than attaching to a finished span.
-    if entry.get("is_subagent") and bridge is not None and entry.get("task_type"):
-        try:
-            bridge.pop_subagent_context(entry["task_type"], entry["ctx"])
-        except Exception:
-            pass
+    # Pop bridge routing entries BEFORE ending the span — once ended,
+    # late sub-agent requests should fall through to the main parent
+    # rather than attaching to a finished span.
+    if entry.get("is_subagent") and bridge is not None:
+        prompt = entry.get("task_prompt") or ""
+        if prompt:
+            try:
+                bridge.pop_task_prompt(prompt, entry["ctx"])
+            except Exception:
+                pass
+        task_type = entry.get("task_type")
+        if task_type:
+            try:
+                bridge.pop_subagent_context(task_type, entry["ctx"])
+            except Exception:
+                pass
 
     try:
         span.end()
@@ -663,11 +688,18 @@ class TracingMiddleware(Middleware):
                     leaked = registry.end_all(error=run_error)
                     if bridge is not None:
                         for entry in leaked:
-                            if entry.get("is_subagent") and entry.get("task_type"):
+                            if not entry.get("is_subagent"):
+                                continue
+                            prompt = entry.get("task_prompt") or ""
+                            if prompt:
                                 try:
-                                    bridge.pop_subagent_context(
-                                        entry["task_type"], entry["ctx"],
-                                    )
+                                    bridge.pop_task_prompt(prompt, entry["ctx"])
+                                except Exception:
+                                    pass
+                            tt = entry.get("task_type")
+                            if tt:
+                                try:
+                                    bridge.pop_subagent_context(tt, entry["ctx"])
                                 except Exception:
                                     pass
                 except Exception:

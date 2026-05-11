@@ -110,9 +110,18 @@ class _NoopSpan:
     def is_recording(self) -> bool:
         return False
 
+    def end(self) -> None:
+        pass
+
 
 class _NoopTracer:
     """Returned when ``opentelemetry`` is not installed."""
 
     def start_as_current_span(self, _name: str, **_kw: Any) -> _NoopSpan:
+        return _NoopSpan()
+
+    def start_span(self, _name: str, **_kw: Any) -> _NoopSpan:
+        # Mirrors OpenTelemetry's Tracer.start_span — used by tracing
+        # middleware to open detached child spans (tool/sub-agent) which
+        # are end()-ed manually rather than via context manager.
         return _NoopSpan()
