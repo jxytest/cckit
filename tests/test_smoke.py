@@ -558,6 +558,63 @@ def test_deepseek_reasoning_patch_does_not_affect_non_deepseek_models():
     assert "reasoning_content" not in assistant_msgs[0]
 
 
+def test_deepseek_v4_does_not_auto_inject_thinking_disabled():
+    """patch_deepseek_reasoning should NOT auto-inject thinking; that's the caller's job."""
+    payload = {
+        "messages": [{"role": "user", "content": "hello"}],
+        "tools": [{"name": "my_tool", "description": "A tool", "input_schema": {}}],
+    }
+    patched = patch_deepseek_reasoning(payload, "deepseek-v4-pro")
+    assert "thinking" not in patched
+
+
+def test_deepseek_v4_thinking_disabled_survives_adapter():
+    """thinking={type:disabled} must survive the Anthropic adapter translation for DeepSeek V4."""
+    try:
+        from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
+            LiteLLMAnthropicMessagesAdapter,
+        )
+    except ImportError:
+        pytest.skip("litellm not installed")
+
+    apply_deepseek_reasoning_patch()
+
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    request_data = {
+        "model": "deepseek-v4-pro",
+        "messages": [{"role": "user", "content": "hello"}],
+        "tools": [{"type": "function", "function": {"name": "t", "parameters": {}}}],
+        "thinking": {"type": "disabled"},
+    }
+    openai_request = adapter.translate_anthropic_to_openai(request_data)
+    if isinstance(openai_request, tuple):
+        openai_request = openai_request[0]
+    assert openai_request.get("thinking") == {"type": "disabled"}
+
+
+def test_non_deepseek_thinking_disabled_not_passed_through():
+    """For non-DeepSeek models, thinking=disabled should follow normal adapter logic."""
+    try:
+        from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
+            LiteLLMAnthropicMessagesAdapter,
+        )
+    except ImportError:
+        pytest.skip("litellm not installed")
+
+    apply_deepseek_reasoning_patch()
+
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    request_data = {
+        "model": "qwen-plus",
+        "messages": [{"role": "user", "content": "hello"}],
+        "thinking": {"type": "disabled"},
+    }
+    openai_request = adapter.translate_anthropic_to_openai(request_data)
+    if isinstance(openai_request, tuple):
+        openai_request = openai_request[0]
+    assert "thinking" not in openai_request
+
+
 def test_agent_with_sub_agents():
     """Agent with sub-agents."""
     child = Agent(name="child", description="A child agent", tools=["Read"])
