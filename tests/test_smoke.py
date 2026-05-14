@@ -615,6 +615,53 @@ def test_non_deepseek_thinking_disabled_not_passed_through():
     assert "thinking" not in openai_request
 
 
+def test_deepseek_disable_thinking_routes_to_extra_body():
+    """disable_thinking=True 必须把 thinking 放到 extra_body，而非作为顶层 kwarg。
+
+    顶层 kwarg 会触发 OpenAI SDK 的 AsyncCompletions.create() 抛
+    ``unexpected keyword argument 'thinking'``。extra_body 由 SDK 直接
+    序列化进请求体，DeepSeek 网关从请求体里识别该字段。
+    """
+    bridge = LiteLLMAnthropicBridge(
+        ModelConfig(
+            model="deepseek-v4-pro",
+            api_key="sk-deepseek",
+            base_url="https://api.deepseek.com",
+            disable_thinking=True,
+        )
+    )
+
+    kwargs = bridge._build_kwargs(
+        {"messages": [{"role": "user", "content": "hello"}]}
+    )
+
+    assert "thinking" not in kwargs
+    assert kwargs.get("extra_body", {}).get("thinking") == {"type": "disabled"}
+
+
+def test_non_deepseek_disable_thinking_does_not_set_extra_body():
+    """非 DeepSeek 模型即使 disable_thinking=True 也不应被搬到 extra_body。
+
+    extra_body 路由是 DeepSeek 专属补丁；其他 provider 的 thinking 处理
+    走 litellm 默认路径。
+    """
+    bridge = LiteLLMAnthropicBridge(
+        ModelConfig(
+            model="qwen-plus",
+            api_key="sk-qwen",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            disable_thinking=True,
+        )
+    )
+
+    kwargs = bridge._build_kwargs(
+        {"messages": [{"role": "user", "content": "hello"}]}
+    )
+
+    assert kwargs.get("thinking") == {"type": "disabled"}
+    assert "thinking" not in kwargs.get("extra_body", {})
+
+
 def test_agent_with_sub_agents():
     """Agent with sub-agents."""
     child = Agent(name="child", description="A child agent", tools=["Read"])
