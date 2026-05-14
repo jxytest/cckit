@@ -162,5 +162,33 @@ def apply_deepseek_reasoning_patch() -> None:
     LiteLLMAnthropicMessagesAdapter.translate_anthropic_messages_to_openai = (
         _patched_translate
     )
+
+    # Phase 2b: patch _translate_thinking_to_openai so that DeepSeek V4's
+    # ``thinking: {"type": "disabled"}`` is carried through as-is instead
+    # of being silently consumed (the default adapter converts "disabled"
+    # to None which means nothing reaches the DeepSeek API).
+    _original_thinking = LiteLLMAnthropicMessagesAdapter._translate_thinking_to_openai
+
+    def _patched_translate_thinking(
+        self: Any,
+        anthropic_message_request: Any,
+        new_kwargs: dict,
+    ) -> None:
+        thinking = anthropic_message_request.get("thinking")
+        model = new_kwargs.get("model", "")
+        if (
+            thinking
+            and isinstance(thinking, dict)
+            and thinking.get("type") == "disabled"
+            and _is_deepseek_v4(model)
+        ):
+            new_kwargs["thinking"] = thinking
+            return
+        return _original_thinking(self, anthropic_message_request, new_kwargs)
+
+    LiteLLMAnthropicMessagesAdapter._translate_thinking_to_openai = (
+        _patched_translate_thinking
+    )
+
     _PATCHED = True
-    logger.debug("Applied DeepSeek reasoning_content adapter patch")
+    logger.debug("Applied DeepSeek reasoning_content and thinking adapter patches")

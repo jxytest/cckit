@@ -1066,6 +1066,10 @@ class LiteLLMAnthropicBridge:
             kwargs["api_key"] = cfg.api_key
         if transport.api_base:
             kwargs["api_base"] = transport.api_base
+        if cfg.disable_thinking and not kwargs.get("thinking"):
+            kwargs["thinking"] = {"type": "disabled"}
+        if kwargs.get("thinking") and "deepseek" in transport.model.lower():
+            kwargs.setdefault("allowed_openai_params", []).append("thinking")
         return kwargs
 
     # ── streaming ─────────────────────────────────────────────────

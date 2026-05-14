@@ -107,6 +107,7 @@ class ModelConfig(CustomModel):
     # Example: $1/M input, $2/M output → input_cost_per_token=1e-6, output_cost_per_token=2e-6
     input_cost_per_token: float | None = None
     output_cost_per_token: float | None = None
+    disable_thinking: bool = False
 
     @model_validator(mode="before")
     @classmethod
