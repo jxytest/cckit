@@ -1069,7 +1069,13 @@ class LiteLLMAnthropicBridge:
         if cfg.disable_thinking and not kwargs.get("thinking"):
             kwargs["thinking"] = {"type": "disabled"}
         if kwargs.get("thinking") and "deepseek" in transport.model.lower():
-            kwargs.setdefault("allowed_openai_params", []).append("thinking")
+            # DeepSeek 网关识别请求体里的 thinking，但 OpenAI SDK 的
+            # AsyncCompletions.create 不接受这个 kwarg，仅放进
+            # allowed_openai_params 让 litellm 透传是不够的，会触发
+            # ``unexpected keyword argument 'thinking'``。塞进 extra_body
+            # 由 OpenAI SDK 序列化进请求体，才能真正到达上游。
+            extra_body = kwargs.setdefault("extra_body", {})
+            extra_body["thinking"] = kwargs.pop("thinking")
         return kwargs
 
     # ── streaming ─────────────────────────────────────────────────
