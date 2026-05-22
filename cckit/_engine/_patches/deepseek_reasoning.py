@@ -41,7 +41,7 @@ def _is_deepseek_v4(model: str) -> bool:
 
 
 def _sanitize_text_blocks_in_messages(messages: Any) -> int:
-    """Repair text content blocks missing the ``text`` field.
+    """Repair text content blocks missing or with null ``text`` field.
 
     Strict upstream gateways (e.g. NetEase's Rust/serde-based gateway in
     front of DeepSeek V4) reject requests when a block declares
@@ -50,36 +50,78 @@ def _sanitize_text_blocks_in_messages(messages: Any) -> int:
         Failed to deserialize the JSON body into the target type:
         messages[N]: missing field `text`
 
-    LiteLLM's Anthropic↔OpenAI translation occasionally drops ``None``
-    text values (especially when assistant messages mix ``thinking`` /
-    ``tool_use`` / ``text`` blocks). We backfill missing ``text`` with
-    an empty string — empty text blocks are valid in the OpenAI/Anthropic
-    schemas, just unwelcome to the strictest deserializers — and coerce
-    non-string values to ``str`` for safety.
+    The malformation can hide in any of these places:
+
+    * ``message.content[i]`` — top-level user/assistant text blocks
+    * ``message.content[i].content[j]`` — text blocks **nested inside
+      tool_result blocks**. LiteLLM's translator reads
+      ``c.get("text", "")`` which returns ``None`` when the upstream
+      message had an explicit ``"text": null`` (the default only kicks
+      in for missing keys, not null values), so the malformed block
+      survives translation and reaches the wire.
+    * ``system[i]`` — Anthropic system prompt as a list of text blocks
+    * ``message.tool_calls[i].function.arguments`` is JSON, not text;
+      we don't touch it.
+
+    We backfill missing/null ``text`` with an empty string and coerce
+    non-string values to ``str`` for safety. Empty text blocks are
+    valid in OpenAI/Anthropic schemas, just unwelcome to the strictest
+    deserializers.
 
     Returns the number of blocks repaired (for debug logging).
     """
-    if not isinstance(messages, list):
-        return 0
     fixed = 0
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-        for block in content:
+
+    def _walk(blocks: Any) -> None:
+        nonlocal fixed
+        if not isinstance(blocks, list):
+            return
+        for block in blocks:
             if not isinstance(block, dict):
                 continue
-            if block.get("type") != "text":
+            btype = block.get("type")
+            if btype == "text":
+                text = block.get("text")
+                if text is None:
+                    block["text"] = ""
+                    fixed += 1
+                elif not isinstance(text, str):
+                    block["text"] = str(text)
+                    fixed += 1
+            # Recurse into tool_result blocks — their nested content
+            # array can contain its own text blocks that the translator
+            # passes through with ``c.get("text", "")`` (which returns
+            # None when text is explicitly null in the input).
+            inner = block.get("content")
+            if isinstance(inner, list):
+                _walk(inner)
+
+    if isinstance(messages, list):
+        for msg in messages:
+            if not isinstance(msg, dict):
                 continue
-            text = block.get("text")
-            if text is None:
-                block["text"] = ""
-                fixed += 1
-            elif not isinstance(text, str):
-                block["text"] = str(text)
-                fixed += 1
+            _walk(msg.get("content"))
+
+    return fixed
+
+
+def _sanitize_text_blocks_in_system(system: Any) -> int:
+    """Repair the Anthropic ``system`` field when it's a list of text blocks."""
+    if not isinstance(system, list):
+        return 0
+    fixed = 0
+    for block in system:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") != "text":
+            continue
+        text = block.get("text")
+        if text is None:
+            block["text"] = ""
+            fixed += 1
+        elif not isinstance(text, str):
+            block["text"] = str(text)
+            fixed += 1
     return fixed
 
 
@@ -121,9 +163,13 @@ def patch_deepseek_reasoning(payload: dict[str, Any], model: str) -> dict[str, A
     OpenAI/Anthropic schemas tolerate them.
     """
     messages = payload.get("messages")
-    repaired = _sanitize_text_blocks_in_messages(messages)
-    if repaired:
-        logger.debug("Sanitized %d text content block(s) missing `text`", repaired)
+    try:
+        repaired = _sanitize_text_blocks_in_messages(messages)
+        repaired += _sanitize_text_blocks_in_system(payload.get("system"))
+        if repaired:
+            logger.debug("Sanitized %d text content block(s) missing `text`", repaired)
+    except Exception:
+        logger.debug("Pre-translation sanitize raised", exc_info=True)
 
     if not _is_deepseek_v4(model):
         return payload
@@ -213,11 +259,16 @@ def apply_deepseek_reasoning_patch() -> None:
         # ``text`` field. Strict serde-based gateways (NetEase) reject
         # these. Operates on every model — the bug is independent of
         # whether we're talking to DeepSeek.
-        repaired = _sanitize_text_blocks_in_messages(result)
-        if repaired:
-            logger.debug(
-                "Post-translation sanitize fixed %d text block(s)", repaired
-            )
+        # Wrapped in try/except: this is a best-effort defensive patch on
+        # the LLM critical path, must never break translation itself.
+        try:
+            repaired = _sanitize_text_blocks_in_messages(result)
+            if repaired:
+                logger.debug(
+                    "Post-translation sanitize fixed %d text block(s)", repaired
+                )
+        except Exception:
+            logger.debug("Post-translation sanitize raised", exc_info=True)
 
         return result
 

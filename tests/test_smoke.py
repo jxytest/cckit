@@ -749,6 +749,57 @@ def test_adapter_translation_output_text_blocks_sanitized():
                 assert isinstance(block["text"], str)
 
 
+def test_sanitizer_recurses_into_tool_result_content():
+    """tool_result 块内嵌 content 数组里的 text 块也必须被修复。
+
+    这是真实事故触发点：长对话历史里的 tool_result 回填 text=None，
+    LiteLLM 翻译器读 ``c.get("text", "")`` 返回 None（默认值只对缺
+    key 生效，不对显式 null 生效），残缺块原样到达上游网关被 serde
+    拒掉。sanitizer 必须递归走进 tool_result.content。
+    """
+    payload = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "abc",
+                        "content": [
+                            {"type": "text"},                  # 缺 text
+                            {"type": "text", "text": None},    # text=null
+                            {"type": "text", "text": "good"},  # 正常
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+
+    patched = patch_deepseek_reasoning(payload, "deepseek-v4-flash")
+    inner = patched["messages"][0]["content"][0]["content"]
+    assert inner[0]["text"] == ""
+    assert inner[1]["text"] == ""
+    assert inner[2]["text"] == "good"
+
+
+def test_sanitizer_repairs_system_text_blocks():
+    """system 字段为 list[text] 时也要清洗。"""
+    payload = {
+        "system": [
+            {"type": "text"},
+            {"type": "text", "text": None},
+            {"type": "text", "text": "valid system prompt"},
+        ],
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    patched = patch_deepseek_reasoning(payload, "deepseek-v4-flash")
+    sys_blocks = patched["system"]
+    assert sys_blocks[0]["text"] == ""
+    assert sys_blocks[1]["text"] == ""
+    assert sys_blocks[2]["text"] == "valid system prompt"
+
+
 def test_agent_with_sub_agents():
     """Agent with sub-agents."""
     child = Agent(name="child", description="A child agent", tools=["Read"])
