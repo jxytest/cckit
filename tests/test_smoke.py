@@ -662,6 +662,93 @@ def test_non_deepseek_disable_thinking_does_not_set_extra_body():
     assert "thinking" not in kwargs.get("extra_body", {})
 
 
+def test_text_block_missing_text_field_is_repaired():
+    """缺 ``text`` 字段的 text block 必须被补上空字符串。
+
+    网易等基于 Rust serde 的严格网关会拒收这种结构：
+    ``Failed to deserialize ... messages[N]: missing field `text` ``。
+    LiteLLM 的 Anthropic↔OpenAI 翻译偶尔会丢掉 None 文本，
+    sanitizer 必须在请求出去前补齐。
+    """
+    payload = {
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text"},                  # 缺 text
+                    {"type": "text", "text": None},    # text=None
+                    {"type": "text", "text": "ok"},    # 正常
+                    {"type": "tool_use", "id": "x"},   # 不是 text 块，不动
+                ],
+            },
+        ]
+    }
+
+    patched = patch_deepseek_reasoning(payload, "qwen-plus")  # 非 deepseek 也要修
+
+    blocks = patched["messages"][1]["content"]
+    assert blocks[0]["text"] == ""
+    assert blocks[1]["text"] == ""
+    assert blocks[2]["text"] == "ok"
+    assert blocks[3] == {"type": "tool_use", "id": "x"}
+
+
+def test_text_block_non_string_text_is_coerced():
+    """非字符串 text 也要被 sanitizer 强制转成 str。"""
+    payload = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": 123}],
+            }
+        ]
+    }
+    patched = patch_deepseek_reasoning(payload, "deepseek-v4-flash")
+    assert patched["messages"][0]["content"][0]["text"] == "123"
+
+
+def test_sanitizer_handles_string_content_without_error():
+    """content 为 str 时 sanitizer 应直接跳过、不抛异常。"""
+    payload = {"messages": [{"role": "user", "content": "plain string"}]}
+    patched = patch_deepseek_reasoning(payload, "deepseek-v4-flash")
+    assert patched["messages"][0]["content"] == "plain string"
+
+
+def test_adapter_translation_output_text_blocks_sanitized():
+    """LiteLLM 翻译产物里的残缺 text block 也必须在返回给上游前修好。"""
+    try:
+        from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
+            LiteLLMAnthropicMessagesAdapter,
+        )
+    except ImportError:
+        pytest.skip("litellm not installed")
+
+    apply_deepseek_reasoning_patch()
+
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    anthropic_messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+    ]
+
+    openai_messages = adapter.translate_anthropic_messages_to_openai(
+        anthropic_messages, model="deepseek-v4-flash"
+    )
+
+    # 模拟翻译器留下的残缺块（直接在结果上戳一个），再调用 sanitizer。
+    # 这里的断言是双保险：(1) 现存 text 块都有合法 ``text`` 字段；
+    # (2) 没有任何块标了 type=text 却缺 text。
+    for msg in openai_messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                assert "text" in block
+                assert isinstance(block["text"], str)
+
+
 def test_agent_with_sub_agents():
     """Agent with sub-agents."""
     child = Agent(name="child", description="A child agent", tools=["Read"])

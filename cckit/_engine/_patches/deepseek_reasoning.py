@@ -40,6 +40,49 @@ def _is_deepseek_v4(model: str) -> bool:
     return _DEEPSEEK_V4_RE.search(model) is not None
 
 
+def _sanitize_text_blocks_in_messages(messages: Any) -> int:
+    """Repair text content blocks missing the ``text`` field.
+
+    Strict upstream gateways (e.g. NetEase's Rust/serde-based gateway in
+    front of DeepSeek V4) reject requests when a block declares
+    ``"type": "text"`` but the ``text`` field is missing or ``None``::
+
+        Failed to deserialize the JSON body into the target type:
+        messages[N]: missing field `text`
+
+    LiteLLM's Anthropic↔OpenAI translation occasionally drops ``None``
+    text values (especially when assistant messages mix ``thinking`` /
+    ``tool_use`` / ``text`` blocks). We backfill missing ``text`` with
+    an empty string — empty text blocks are valid in the OpenAI/Anthropic
+    schemas, just unwelcome to the strictest deserializers — and coerce
+    non-string values to ``str`` for safety.
+
+    Returns the number of blocks repaired (for debug logging).
+    """
+    if not isinstance(messages, list):
+        return 0
+    fixed = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") != "text":
+                continue
+            text = block.get("text")
+            if text is None:
+                block["text"] = ""
+                fixed += 1
+            elif not isinstance(text, str):
+                block["text"] = str(text)
+                fixed += 1
+    return fixed
+
+
 def _extract_reasoning_from_content(content: Any) -> str | None:
     """Extract reasoning text from Anthropic ``thinking`` content blocks.
 
@@ -71,11 +114,20 @@ def patch_deepseek_reasoning(payload: dict[str, Any], model: str) -> dict[str, A
 
     This is a **request-level** transform applied in the bridge's ``_build_kwargs``
     pipeline, right after ``sanitize_payload`` / ``clamp_max_tokens``.
+
+    Also runs an unconditional content-block sanitizer that repairs
+    ``{"type": "text"}`` blocks missing the ``text`` field — strict
+    gateways (NetEase Rust/serde) reject these even though the upstream
+    OpenAI/Anthropic schemas tolerate them.
     """
+    messages = payload.get("messages")
+    repaired = _sanitize_text_blocks_in_messages(messages)
+    if repaired:
+        logger.debug("Sanitized %d text content block(s) missing `text`", repaired)
+
     if not _is_deepseek_v4(model):
         return payload
 
-    messages = payload.get("messages")
     if not messages:
         return payload
 
@@ -156,6 +208,16 @@ def apply_deepseek_reasoning_patch() -> None:
                     if parts:
                         msg["reasoning_content"] = "\n".join(parts)
             assistant_idx += 1
+
+        # Phase 2c: repair text blocks the translator produced without a
+        # ``text`` field. Strict serde-based gateways (NetEase) reject
+        # these. Operates on every model — the bug is independent of
+        # whether we're talking to DeepSeek.
+        repaired = _sanitize_text_blocks_in_messages(result)
+        if repaired:
+            logger.debug(
+                "Post-translation sanitize fixed %d text block(s)", repaired
+            )
 
         return result
 
