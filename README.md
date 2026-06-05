@@ -419,7 +419,7 @@ agent = Agent(
     hooks={"PreToolUse": [HookMatcher(matcher="Bash", hooks=[block_rm])]},
 )
 ```
-
+1
 ### TaskBudget（Token 预算）
 
 声明 token 总预算，模型会在接近上限时主动收尾，避免硬截断。

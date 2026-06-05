@@ -375,6 +375,58 @@ def _load_module(name: str) -> Any:
         ) from exc
 
 
+_VISION_STRIPPED_PLACEHOLDER = "[图片已省略：当前模型不支持视觉输入]"
+
+
+def _strip_image_blocks(messages: Any) -> tuple[Any, int]:
+    """Replace Anthropic ``image`` content blocks with a text placeholder.
+
+    Non-vision providers (e.g. deepseek behind the LiteLLM bridge) reject any
+    request carrying an ``image`` block — LiteLLM translates it to an OpenAI
+    ``image_url`` block that the upstream gateway cannot deserialize, poisoning
+    the whole conversation since the screenshot stays in history forever.
+
+    This walks every message and rewrites image blocks (including those nested
+    inside ``tool_result`` content) into ``{"type": "text", ...}`` placeholders.
+    Returns the (possibly new) messages list and the number of blocks replaced.
+    """
+    if not isinstance(messages, list):
+        return messages, 0
+
+    replaced = 0
+
+    def _scrub_block(block: Any) -> Any:
+        nonlocal replaced
+        if not isinstance(block, dict):
+            return block
+        if block.get("type") == "image":
+            replaced += 1
+            return {"type": "text", "text": _VISION_STRIPPED_PLACEHOLDER}
+        # tool_result blocks carry their own nested content list.
+        if block.get("type") == "tool_result" and isinstance(block.get("content"), list):
+            new_block = dict(block)
+            new_block["content"] = [_scrub_block(b) for b in block["content"]]
+            return new_block
+        return block
+
+    new_messages: list[Any] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            new_messages.append(msg)
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            scrubbed = [_scrub_block(b) for b in content]
+            if scrubbed != content:
+                new_msg = dict(msg)
+                new_msg["content"] = scrubbed
+                new_messages.append(new_msg)
+                continue
+        new_messages.append(msg)
+
+    return new_messages, replaced
+
+
 def _error_sse_frame(message: str) -> bytes:
     """Encode an Anthropic-style error SSE frame."""
     payload = {"type": "error", "error": {"type": "api_error", "message": message}}
@@ -1053,6 +1105,18 @@ class LiteLLMAnthropicBridge:
         route = self._resolve_route(payload.get("model"))
         transport = route.transport
         cfg = route.config
+
+        # Strip image blocks for non-vision models before any other handling,
+        # so screenshots cannot poison the request (or the persisted history).
+        if not getattr(cfg, "supports_vision", True) and payload.get("messages"):
+            new_messages, n = _strip_image_blocks(payload["messages"])
+            if n:
+                payload = dict(payload)
+                payload["messages"] = new_messages
+                logger.debug(
+                    "bridge: stripped %d image block(s) for non-vision model %s",
+                    n, cfg.model,
+                )
 
         kwargs = sanitize_payload(payload, transport)
         kwargs = clamp_max_tokens(kwargs, transport, cfg.max_tokens)

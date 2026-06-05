@@ -108,6 +108,12 @@ class ModelConfig(CustomModel):
     input_cost_per_token: float | None = None
     output_cost_per_token: float | None = None
     disable_thinking: bool = False
+    # Whether the target model accepts image content blocks. When False, the
+    # bridge strips/replaces ``image`` blocks (e.g. browser screenshots) with a
+    # text placeholder before forwarding, so non-vision providers do not reject
+    # the request with "unknown variant image_url". Defaults to True so existing
+    # vision-capable models are unaffected.
+    supports_vision: bool = True
 
     @model_validator(mode="before")
     @classmethod
