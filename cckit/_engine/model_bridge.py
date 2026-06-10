@@ -21,6 +21,7 @@ import importlib
 import json
 import logging
 import socket
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from dataclasses import dataclass
@@ -1130,6 +1131,14 @@ class LiteLLMAnthropicBridge:
             kwargs["api_key"] = cfg.api_key
         if transport.api_base:
             kwargs["api_base"] = transport.api_base
+        # Forward caller-supplied static headers plus a fresh per-request
+        # requestid. Caller values win over the auto-generated requestid so an
+        # explicit override is still honoured.
+        headers = dict(kwargs.get("extra_headers") or {})
+        headers.setdefault("requestid", str(uuid.uuid4()))
+        if cfg.extra_headers:
+            headers.update(cfg.extra_headers)
+        kwargs["extra_headers"] = headers
         if cfg.disable_thinking and not kwargs.get("thinking"):
             kwargs["thinking"] = {"type": "disabled"}
         if kwargs.get("thinking") and "deepseek" in transport.model.lower():

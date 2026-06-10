@@ -114,6 +114,13 @@ class ModelConfig(CustomModel):
     # the request with "unknown variant image_url". Defaults to True so existing
     # vision-capable models are unaffected.
     supports_vision: bool = True
+    # Extra HTTP headers forwarded verbatim on every model request that goes
+    # through the LiteLLM bridge (OpenAI-compatible / gateway transports).
+    # Values are sent as-is — the caller is responsible for any encoding
+    # (e.g. base64). ``authorization`` is normally driven by ``api_key`` and
+    # need not be set here. Has no effect on the direct-Anthropic path (which
+    # talks to the Claude CLI subprocess, not the bridge).
+    extra_headers: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod
