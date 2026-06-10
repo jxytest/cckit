@@ -376,6 +376,19 @@ def _load_module(name: str) -> Any:
         ) from exc
 
 
+def _encode_custom_model_name(model: str) -> str:
+    """Base64-encode the bare model name (provider prefix stripped).
+
+    e.g. ``openai/deepseek-v4-flash`` → base64(``deepseek-v4-flash``). Used for
+    the CW gateway ``custom-model-name`` header, which expects the bare upstream
+    model id rather than the LiteLLM-prefixed routing name.
+    """
+    import base64
+
+    bare = model.rsplit("/", 1)[-1] if model else model
+    return base64.b64encode(bare.encode("utf-8")).decode("ascii")
+
+
 _VISION_STRIPPED_PLACEHOLDER = "[图片已省略：当前模型不支持视觉输入]"
 
 
@@ -1138,6 +1151,13 @@ class LiteLLMAnthropicBridge:
         headers.setdefault("requestid", str(uuid.uuid4()))
         if cfg.extra_headers:
             headers.update(cfg.extra_headers)
+        # CW gateway: carry the (bare, base64-encoded) model name in
+        # ``custom-model-name`` so the gateway routes to the right upstream
+        # model. setdefault so an explicit caller-supplied header still wins.
+        if getattr(cfg, "cw_gateway", False):
+            headers.setdefault(
+                "custom-model-name", _encode_custom_model_name(cfg.model),
+            )
         kwargs["extra_headers"] = headers
         if cfg.disable_thinking and not kwargs.get("thinking"):
             kwargs["thinking"] = {"type": "disabled"}

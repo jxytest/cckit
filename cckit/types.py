@@ -121,6 +121,12 @@ class ModelConfig(CustomModel):
     # need not be set here. Has no effect on the direct-Anthropic path (which
     # talks to the Claude CLI subprocess, not the bridge).
     extra_headers: dict[str, str] = Field(default_factory=dict)
+    # CW gateway mode. When True, the bridge auto-injects a ``custom-model-name``
+    # header carrying the base64-encoded bare model name (provider prefix
+    # stripped) on every request for this route, unless the caller already set
+    # ``custom-model-name`` in ``extra_headers`` (explicit values win). Only
+    # affects bridge transports; no effect on the direct-Anthropic path.
+    cw_gateway: bool = False
 
     @model_validator(mode="before")
     @classmethod

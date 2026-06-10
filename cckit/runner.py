@@ -690,6 +690,13 @@ class Runner:
             max_tokens=agent_model.max_tokens,
             max_turns=agent_model.max_turns if agent_model.max_turns > 0 else base.max_turns,
             timeout_seconds=agent_model.timeout_seconds or base.timeout_seconds,
+            # Inherit gateway mode + platform static headers (dimension,
+            # feature-phase-name, …) from the runner default so sub-agent
+            # requests carry the same gateway routing/identity. The bridge
+            # derives a per-route ``custom-model-name`` from each sub's own
+            # model, so it is intentionally not part of extra_headers here.
+            cw_gateway=agent_model.cw_gateway or base.cw_gateway,
+            extra_headers=agent_model.extra_headers or dict(base.extra_headers),
         )
 
     def _resolve_sandbox(self, agent: Agent) -> SandboxOptions:
