@@ -1,5 +1,7 @@
-"""Patch for LiteLLM's ``AnthropicStreamWrapper`` trigger-chunk argument loss.
+"""Patch for LiteLLM's ``AnthropicStreamWrapper`` — two bugs fixed.
 
+Bug 1: trigger-chunk argument loss
+------------------------------------
 LiteLLM's ``AnthropicStreamWrapper.__anext__`` (streaming_iterator.py:306-332)
 discards the ``processed_chunk`` when a content-block type transition occurs
 (``should_start_new_block == True``).  The comment says "the content_block_start
@@ -7,11 +9,29 @@ already carries the relevant information", but ``content_block_start.input``
 is always ``{}``.  When a provider batches ``id + name + arguments`` in one
 chunk (common with Chinese LLM gateways), the entire tool input is lost.
 
-This module provides :func:`apply_stream_patch` which monkey-patches
-``AnthropicAdapter.translate_completion_output_params_streaming`` to use a
-fixed subclass that queues the ``processed_chunk`` after ``content_block_start``.
+Bug 2: thinking_delta under wrong content block type
+----------------------------------------------------
+LiteLLM's ``_translate_streaming_openai_chunk_to_anthropic_content_block``
+only inspects ``thinking_blocks`` — it never checks ``reasoning_content``.
+DeepSeek V4 models (v4-pro, v4-flash) emit thinking via ``reasoning_content``
+in the streaming delta, so the block-type detector always returns ``"text"``
+and never triggers a thinking → text transition.  The adapter then emits
+``thinking_delta`` events under a ``type: "text"`` content block, which
+violates the Anthropic protocol (thinking must live under ``type: "thinking"``).
+The Claude Code CLI silently drops these deltas, producing an empty streaming
+response.  The CLI then retries with ``stream:false``, causing:
 
-The patch is idempotent and safe to call multiple times.
+* Two duplicate ``gen_ai.chat`` spans in Langfuse (one streaming with empty
+  output and zero usage, one non-streaming with the real response).
+* Cost / usage statistics at zero for the streaming span.
+
+The fix detects the mismatch at the delta level (where ``reasoning_content``
+IS checked) and emits proper ``content_block_stop`` / ``content_block_start``
+events to switch between text and thinking blocks, keeping indices consistent.
+
+Both fixes are applied via :func:`apply_stream_patch` which monkey-patches
+``AnthropicAdapter.translate_completion_output_params_streaming`` to use a
+fixed subclass.  The patch is idempotent and safe to call multiple times.
 """
 
 from __future__ import annotations
@@ -43,7 +63,25 @@ def apply_stream_patch() -> None:
         return
 
     class PatchedStreamWrapper(AnthropicStreamWrapper):
-        """Fixed version that does NOT discard trigger-chunk deltas."""
+        """Fixed version that does NOT discard trigger-chunk deltas.
+
+        Also fixes a LiteLLM adapter bug where ``thinking_delta`` events are
+        emitted under a ``type: "text"`` content block.  The adapter's
+        ``_translate_streaming_openai_chunk_to_anthropic_content_block`` only
+        checks ``thinking_blocks`` (not ``reasoning_content``) so it never
+        detects DeepSeek-style thinking → text transitions.  The Anthropic
+        protocol requires ``thinking_delta`` to live under a
+        ``type: "thinking"`` block; the Claude Code CLI silently discards
+        them when they appear under ``type: "text"``, producing an empty
+        response that triggers a stream→non-stream retry (and duplicated
+        Langfuse spans with zero usage on the streaming one).
+        """
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            # Track the type of the currently OPEN content block so we can
+            # detect thinking/text mismatches that the adapter misses.
+            self._cckit_opened_block_type: str = "text"
 
         async def __anext__(self):  # noqa: PLR0915
             try:
@@ -72,6 +110,7 @@ def apply_stream_patch() -> None:
 
                 if self.sent_content_block_start is False:
                     self.sent_content_block_start = True
+                    self._cckit_opened_block_type = "text"
                     self.chunk_queue.append({
                         "type": "content_block_start",
                         "index": self.current_content_block_index,
@@ -134,6 +173,63 @@ def apply_stream_patch() -> None:
                         self.holding_stop_reason_chunk = None
                         return self.chunk_queue.popleft()
 
+                    # ── Block type switching for thinking/text mismatch ──
+                    # LiteLLM's _translate_streaming_openai_chunk_to_anthropic_content_block
+                    # only checks ``thinking_blocks`` (not ``reasoning_content``),
+                    # so DeepSeek-style thinking never triggers a new block.
+                    # The adapter emits thinking_delta under a text block, which
+                    # the Anthropic protocol forbids and the Claude Code CLI
+                    # silently drops (causing empty streaming output and a
+                    # stream→non-stream retry that creates duplicate Langfuse
+                    # spans).  Fix by closing the current block and opening
+                    # one with the correct type when we detect the mismatch.
+                    if processed_chunk.get("type") == "content_block_delta":
+                        delta_type = (processed_chunk.get("delta") or {}).get("type")
+                        # thinking_delta under a text block → switch to thinking
+                        if (
+                            delta_type == "thinking_delta"
+                            and self._cckit_opened_block_type == "text"
+                        ):
+                            self.chunk_queue.append({
+                                "type": "content_block_stop",
+                                "index": self.current_content_block_index,
+                            })
+                            self.current_content_block_index += 1
+                            self.chunk_queue.append({
+                                "type": "content_block_start",
+                                "index": self.current_content_block_index,
+                                "content_block": {
+                                    "type": "thinking",
+                                    "thinking": "",
+                                },
+                            })
+                            self._cckit_opened_block_type = "thinking"
+                            # Fix the index to point to the new thinking block
+                            processed_chunk["index"] = self.current_content_block_index
+                            self.chunk_queue.append(processed_chunk)
+                            return self.chunk_queue.popleft()
+                        # text_delta under a thinking block → switch to text
+                        if (
+                            delta_type == "text_delta"
+                            and self._cckit_opened_block_type == "thinking"
+                        ):
+                            self.chunk_queue.append({
+                                "type": "content_block_stop",
+                                "index": self.current_content_block_index,
+                            })
+                            self.current_content_block_index += 1
+                            self.chunk_queue.append({
+                                "type": "content_block_start",
+                                "index": self.current_content_block_index,
+                                "content_block": {"type": "text", "text": ""},
+                            })
+                            self._cckit_opened_block_type = "text"
+                            # Fix the index to point to the new text block
+                            processed_chunk["index"] = self.current_content_block_index
+                            self.chunk_queue.append(processed_chunk)
+                            return self.chunk_queue.popleft()
+                    # ─────────────────────────────────────────────────────
+
                     if not self.queued_usage_chunk:
                         if should_start_new_block and not self.sent_content_block_finish:
                             # 1. Stop current content block
@@ -147,6 +243,12 @@ def apply_stream_patch() -> None:
                                 "index": self.current_content_block_index,
                                 "content_block": self.current_content_block_start,
                             })
+                            # Track the opened block type for thinking/text
+                            # mismatch detection below.
+                            new_block_type = (
+                                self.current_content_block_start.get("type", "text")
+                            )
+                            self._cckit_opened_block_type = new_block_type
                             # ── FIX: also queue the trigger chunk's delta ──
                             if processed_chunk.get("type") == "content_block_delta":
                                 self.chunk_queue.append(processed_chunk)
