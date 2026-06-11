@@ -35,8 +35,10 @@ _TRACE_PROPAGATED_KEYS = (
     "langfuse.trace.name",
 )
 
-# Name of the Claude Agent SDK tool used to spawn sub-agents.
-_SUBAGENT_TOOL_NAME = "Task"
+# Tool names the Claude Agent SDK uses to spawn sub-agents. Newer SDKs
+# (>=2.x) emit "Agent"; older ones used "Task". Accept both so sub-agent
+# spans are detected regardless of SDK version.
+_SUBAGENT_TOOL_NAMES = ("Agent", "Task")
 
 
 def _truncate(value: str) -> str:
@@ -283,7 +285,7 @@ def _open_tool_or_subagent_span(
     name = getattr(block, "name", "tool") or "tool"
     tool_input = getattr(block, "input", None)
 
-    is_subagent = name == _SUBAGENT_TOOL_NAME
+    is_subagent = name in _SUBAGENT_TOOL_NAMES
     task_prompt: str = ""
     if is_subagent and isinstance(tool_input, dict):
         # Standard Task-tool input keys per Claude Agent SDK.

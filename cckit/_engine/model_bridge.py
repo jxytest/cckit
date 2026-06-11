@@ -125,8 +125,11 @@ def _serialize_output_from_anthropic_response(resp: Any) -> str:
 def _try_extract_stream_content(raw: bytes, acc: dict[str, Any]) -> None:
     """Best-effort accumulation of streamed Anthropic SSE deltas.
 
-    Populates ``acc["text"]`` (concatenated text chunks) and
-    ``acc["stop_reason"]`` if present.
+    Populates ``acc["text"]`` (concatenated text chunks), ``acc["thinking"]``,
+    ``acc["stop_reason"]``, and ``acc["tool_uses"]`` (per-index tool_use blocks
+    with their streamed JSON input). Tool calls must be captured here too —
+    otherwise a turn whose only output is a tool_use yields an empty
+    ``langfuse.observation.output``.
     """
     try:
         text = raw.decode("utf-8", errors="ignore")
@@ -138,14 +141,32 @@ def _try_extract_stream_content(raw: bytes, acc: dict[str, Any]) -> None:
                 continue
             obj = json.loads(data_str)
             ev = obj.get("type")
-            if ev == "content_block_delta":
+            if ev == "content_block_start":
+                block = obj.get("content_block") or {}
+                if block.get("type") == "tool_use":
+                    index = obj.get("index")
+                    tool_uses = acc.setdefault("tool_uses", {})
+                    tool_uses[index] = {
+                        "id": block.get("id"),
+                        "name": block.get("name"),
+                        "input_json": "",
+                    }
+            elif ev == "content_block_delta":
                 delta = obj.get("delta") or {}
-                if delta.get("type") == "text_delta":
+                dtype = delta.get("type")
+                if dtype == "text_delta":
                     acc.setdefault("text", "")
                     acc["text"] += str(delta.get("text", ""))
-                elif delta.get("type") == "thinking_delta":
+                elif dtype == "thinking_delta":
                     acc.setdefault("thinking", "")
                     acc["thinking"] += str(delta.get("thinking", ""))
+                elif dtype == "input_json_delta":
+                    index = obj.get("index")
+                    tool_uses = acc.get("tool_uses")
+                    if tool_uses and index in tool_uses:
+                        tool_uses[index]["input_json"] += str(
+                            delta.get("partial_json", "")
+                        )
             elif ev == "message_delta":
                 delta = obj.get("delta") or {}
                 if delta.get("stop_reason"):
@@ -1239,10 +1260,32 @@ class LiteLLMAnthropicBridge:
                 if content_acc:
                     try:
                         slim: dict[str, Any] = {}
+                        content_blocks: list[dict[str, Any]] = []
                         if content_acc.get("text"):
-                            slim["content"] = [
+                            content_blocks.append(
                                 {"type": "text", "text": content_acc["text"]},
-                            ]
+                            )
+                        # Include tool_use blocks so turns whose only output is
+                        # a tool call still produce a non-empty observation.
+                        tool_uses = content_acc.get("tool_uses")
+                        if tool_uses:
+                            for _idx in sorted(tool_uses):
+                                tu = tool_uses[_idx]
+                                raw_input = tu.get("input_json") or ""
+                                try:
+                                    parsed_input = (
+                                        json.loads(raw_input) if raw_input else {}
+                                    )
+                                except Exception:
+                                    parsed_input = raw_input
+                                content_blocks.append({
+                                    "type": "tool_use",
+                                    "id": tu.get("id"),
+                                    "name": tu.get("name"),
+                                    "input": parsed_input,
+                                })
+                        if content_blocks:
+                            slim["content"] = content_blocks
                         if content_acc.get("thinking"):
                             slim["thinking"] = content_acc["thinking"]
                         if content_acc.get("stop_reason"):
