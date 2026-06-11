@@ -18,9 +18,6 @@ from cckit.types import RunContext
 # SDK message types — imported lazily to avoid hard dependency.
 _sdk_types: dict[str, type] | None = None
 
-# Soft truncation cap for trace-level input/output attributes (langfuse).
-_TRACE_ATTR_MAX_BYTES = 100_000
-
 # Trace-level attribute keys that langfuse recommends propagating to every
 # observation in the trace (so server-side filters/aggregations work).
 _TRACE_PROPAGATED_KEYS = (
@@ -39,12 +36,6 @@ _TRACE_PROPAGATED_KEYS = (
 # (>=2.x) emit "Agent"; older ones used "Task". Accept both so sub-agent
 # spans are detected regardless of SDK version.
 _SUBAGENT_TOOL_NAMES = ("Agent", "Task")
-
-
-def _truncate(value: str) -> str:
-    if len(value) <= _TRACE_ATTR_MAX_BYTES:
-        return value
-    return value[:_TRACE_ATTR_MAX_BYTES] + "...[truncated]"
 
 
 def _current_otel_context() -> Any:
@@ -107,16 +98,19 @@ def _load_sdk_types() -> dict[str, type]:
 
 
 def _serialize_tool_value(value: Any) -> str:
-    """Serialize a tool input/output for ``langfuse.observation.input/output``."""
+    """Serialize a tool input/output for ``langfuse.observation.input/output``.
+
+    Reports the full value without truncation.
+    """
     if value is None:
         return ""
     if isinstance(value, str):
-        return _truncate(value)
+        return value
     try:
-        return _truncate(json.dumps(value, ensure_ascii=False, default=str))
+        return json.dumps(value, ensure_ascii=False, default=str)
     except Exception:
         try:
-            return _truncate(str(value))
+            return str(value)
         except Exception:
             return ""
 
@@ -593,7 +587,7 @@ class TracingMiddleware(Middleware):
         # Capture the agent prompt as the trace-level input. Without this
         # the langfuse UI shows an empty Input column on the trace row.
         if prompt:
-            attributes["langfuse.trace.input"] = _truncate(str(prompt))
+            attributes["langfuse.trace.input"] = str(prompt)
 
         # Honour user-supplied session.id — never overwrite it with the
         # Claude SDK's session id later. Same for user.id.
@@ -721,7 +715,7 @@ class TracingMiddleware(Middleware):
                     output_text = getattr(final_msg, "result", None) or ""
                     if output_text:
                         span.set_attribute(
-                            "langfuse.trace.output", _truncate(str(output_text)),
+                            "langfuse.trace.output", str(output_text),
                         )
 
                 # Detach the bridge binding so the bridge does not leak

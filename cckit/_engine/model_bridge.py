@@ -72,52 +72,32 @@ def _span_attrs_for_route(route: Any, model_str: str) -> dict[str, Any]:
     }
 
 
-# Soft cap to keep span attributes within OTLP exporter limits.
-_MAX_ATTR_BYTES = 100_000
-
-
-def _truncate_for_attr(value: str) -> str:
-    """Clip an attribute value to a safe size."""
-    if len(value) <= _MAX_ATTR_BYTES:
-        return value
-    return value[:_MAX_ATTR_BYTES] + "...[truncated]"
-
-
 def _serialize_input(payload: dict[str, Any]) -> str:
-    """Build a JSON string suitable for langfuse.observation.input.
+    """Serialize the full request payload for langfuse.observation.input.
 
-    Includes both ``system`` and ``messages`` so reviewers see the full prompt.
+    The entire payload is reported as-is (no field selection, no length cap)
+    so the trace carries the complete prompt. ``json.dumps`` is required only
+    because OTLP attribute values must be strings.
     """
     try:
-        body = {
-            "system": payload.get("system"),
-            "messages": payload.get("messages"),
-            # Generation parameters help debugging.
-            "temperature": payload.get("temperature"),
-            "max_tokens": payload.get("max_tokens"),
-            "tools": payload.get("tools"),
-        }
-        body = {k: v for k, v in body.items() if v is not None}
-        return _truncate_for_attr(json.dumps(body, ensure_ascii=False, default=str))
+        return json.dumps(payload, ensure_ascii=False, default=str)
     except Exception:
         return ""
 
 
 def _serialize_output_from_anthropic_response(resp: Any) -> str:
-    """Convert an Anthropic non-streaming response to a JSON string."""
+    """Serialize the full Anthropic non-streaming response as JSON.
+
+    Reports the complete response body (including ``usage``, ``id``, ``model``,
+    …) without dropping fields or truncating.
+    """
     try:
         body = (
             resp.model_dump(mode="json", exclude_none=True)
             if hasattr(resp, "model_dump")
             else resp
         )
-        # Keep only the user-relevant pieces to avoid bloat.
-        slim = {
-            "stop_reason": body.get("stop_reason") if isinstance(body, dict) else None,
-            "content": body.get("content") if isinstance(body, dict) else body,
-        }
-        slim = {k: v for k, v in slim.items() if v is not None}
-        return _truncate_for_attr(json.dumps(slim, ensure_ascii=False, default=str))
+        return json.dumps(body, ensure_ascii=False, default=str)
     except Exception:
         return ""
 
@@ -1293,9 +1273,7 @@ class LiteLLMAnthropicBridge:
                         if slim:
                             span.set_attribute(
                                 "langfuse.observation.output",
-                                _truncate_for_attr(
-                                    json.dumps(slim, ensure_ascii=False, default=str),
-                                ),
+                                json.dumps(slim, ensure_ascii=False, default=str),
                             )
                     except Exception:
                         pass
