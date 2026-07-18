@@ -264,20 +264,36 @@ class Runner:
             await agent.before_execute(ctx)
 
             # Claude Code rejects --dangerously-skip-permissions under root/sudo.
-            # Instead of failing, transparently downgrade to ``dontAsk`` for this
-            # run and notify the caller via a system event so the UI can surface
-            # that auto-approval is in effect. ``dontAsk`` enforces
-            # permissions.deny rules (unlike bypassPermissions, which skips all
-            # checks), so this is the safe equivalent for a non-isolated root env.
+            # Instead of failing, transparently enable the sandbox and downgrade
+            # to ``dontAsk`` for this run, then notify the caller via a system
+            # event. Two things must happen together:
+            #
+            #   1. Enable the sandbox so ``SandboxConfigBuilder`` emits the
+            #      unified settings JSON (``sandbox.*`` + ``permissions.*`` +
+            #      ``autoAllowBashIfSandboxed``). Without these settings, a bare
+            #      ``dontAsk`` run still prompts for MCP/Bash tool authorization
+            #      under root — the sandbox settings are what actually lets
+            #      tools run without per-call approval.
+            #   2. Switch the effective permission mode to ``dontAsk``. The
+            #      sandbox branch in ``_build_options`` would do this anyway,
+            #      but setting it here keeps the downgraded state explicit and
+            #      makes the ``permission_degraded`` event accurate.
+            #
+            # ``dontAsk`` still enforces ``permissions.deny`` rules (unlike
+            # ``bypassPermissions``, which skips all checks), so this is the
+            # safe equivalent for a root env — isolated by the sandbox rather
+            # than by privilege.
             if (
-                    not effective_sandbox.enabled
-                    and effective_permission_mode == "bypassPermissions"
+                    effective_permission_mode == "bypassPermissions"
                     and _is_root_user()
             ):
+                if not effective_sandbox.enabled:
+                    effective_sandbox = SandboxOptions(enabled=True)
                 effective_permission_mode = "dontAsk"
                 logger.warning(
                     "Agent %s running as root with permission_mode='bypassPermissions' "
-                    "is not supported by Claude Code; downgrading to 'dontAsk' for this run.",
+                    "is not supported by Claude Code; enabling sandbox and downgrading "
+                    "to 'dontAsk' for this run.",
                     agent.name,
                 )
                 from claude_agent_sdk import SystemMessage  # noqa: WPS433
@@ -287,9 +303,11 @@ class Runner:
                         "original": "bypassPermissions",
                         "effective": "dontAsk",
                         "reason": "root_user",
+                        "sandbox_auto_enabled": True,
                         "detail": (
                             "Claude Code rejects --dangerously-skip-permissions when "
-                            "running as root/sudo; auto-downgraded to dontAsk for this run."
+                            "running as root/sudo; auto-enabled sandbox and downgraded "
+                            "to dontAsk for this run."
                         ),
                     },
                 )
