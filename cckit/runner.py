@@ -235,6 +235,12 @@ class Runner:
         start = time.monotonic()
         git_cfg = ctx.resolved_git()
         effective_sandbox = self._resolve_sandbox(agent)
+        # Effective permission mode for THIS run. Defaults to the configured
+        # mode; downgraded to ``dontAsk`` when running as root with
+        # ``bypassPermissions`` (Claude Code rejects --dangerously-skip-permissions
+        # under root/sudo). Local variable so a downgraded run never mutates the
+        # reusable RunnerConfig — see the root check below.
+        effective_permission_mode: str = self._config.permission_mode
         prepared_model: PreparedModelEndpoint | None = None
         sdk_stream: AsyncIterator[Any] | None = None
 
@@ -258,20 +264,34 @@ class Runner:
             await agent.before_execute(ctx)
 
             # Claude Code rejects --dangerously-skip-permissions under root/sudo.
-            # Fail fast here so callers get a clear error without needing debug logs.
+            # Instead of failing, transparently downgrade to ``dontAsk`` for this
+            # run and notify the caller via a system event so the UI can surface
+            # that auto-approval is in effect. ``dontAsk`` enforces
+            # permissions.deny rules (unlike bypassPermissions, which skips all
+            # checks), so this is the safe equivalent for a non-isolated root env.
             if (
                     not effective_sandbox.enabled
-                    and self._config.permission_mode == "bypassPermissions"
+                    and effective_permission_mode == "bypassPermissions"
                     and _is_root_user()
             ):
-                raise AgentExecutionError(
-                    "Root execution does not support permission_mode='bypassPermissions'",
-                    detail=(
-                        "Claude Code rejects --dangerously-skip-permissions when "
-                        "running as root/sudo. Set RunnerConfig.permission_mode to "
-                        "'default' or 'acceptEdits', or enable sandbox so cckit "
-                        "switches to 'dontAsk'."
-                    ),
+                effective_permission_mode = "dontAsk"
+                logger.warning(
+                    "Agent %s running as root with permission_mode='bypassPermissions' "
+                    "is not supported by Claude Code; downgrading to 'dontAsk' for this run.",
+                    agent.name,
+                )
+                from claude_agent_sdk import SystemMessage  # noqa: WPS433
+                yield SystemMessage(
+                    subtype="permission_degraded",
+                    data={
+                        "original": "bypassPermissions",
+                        "effective": "dontAsk",
+                        "reason": "root_user",
+                        "detail": (
+                            "Claude Code rejects --dangerously-skip-permissions when "
+                            "running as root/sudo; auto-downgraded to dontAsk for this run."
+                        ),
+                    },
                 )
 
             if effective_sandbox.enabled and _is_windows():
@@ -389,6 +409,7 @@ class Runner:
                 model,
                 prepared_model,
                 effective_sandbox,
+                effective_permission_mode,
                 holder.workspace_dir,
                 instruction,
                 state,
@@ -863,6 +884,7 @@ class Runner:
             model: ModelConfig,
             prepared_model: PreparedModelEndpoint,
             sandbox: SandboxOptions,
+            permission_mode: str,
             workspace_dir: Path | None,
             instruction: str,
             state: RunState,
@@ -1097,10 +1119,13 @@ class Runner:
             # When sandbox is enabled, switch to dontAsk so that permissions.deny
             # rules are enforced. bypassPermissions skips all permission checks
             # (including deny rules) and is only safe inside pre-isolated envs.
+            # Otherwise honor the effective permission mode (which may already
+            # have been downgraded from bypassPermissions to dontAsk when
+            # running as root — see Runner._execute).
             permission_mode=(
                 "dontAsk"
                 if sandbox.enabled
-                else self._config.permission_mode
+                else permission_mode
             ),
             env=env,
             stderr=_stderr_cb,

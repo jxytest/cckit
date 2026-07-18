@@ -938,6 +938,7 @@ def test_build_options_bridge_env_overrides_ctx_env():
         model,
         prepared,
         SandboxOptions(),
+        "bypassPermissions",
         None,
         "",
         RunState("bridgeenv"),
