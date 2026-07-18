@@ -290,6 +290,7 @@ class AuditMiddleware(Middleware):
 ## 沙箱隔离
 
 > **平台支持**：沙箱依赖 macOS Seatbelt / Linux bubblewrap，**Windows 原生不支持**（cckit 会在启动时打印警告）。WSL2 可正常使用。
+> **物理机支持**： 沙箱只能跑在物理机器上，pod、docker等容器话环境支持不完整！物理机需要apt安装bubblewrap/socat依赖才会自动生效。
 
 ### 默认行为说明
 
