@@ -28,6 +28,7 @@ __version__ = "0.1.0"
 
 # Core classes
 from cckit._cli import check_api_connectivity
+from cckit._engine.session_store_adapter import FileSessionStore
 from cckit.agent import Agent
 
 # Exceptions
@@ -64,6 +65,7 @@ from cckit.types import (
     StreamResult,
     TaskBudgetConfig,
     TaskStatus,
+    ThinkingConfig,
     WorkspaceConfig,
 )
 
@@ -75,6 +77,7 @@ __all__ = [
     # Types
     "AgentResult",
     "ContextConfig",
+    "FileSessionStore",
     "GitConfig",
     "ModelConfig",
     "RunContext",
@@ -83,6 +86,7 @@ __all__ = [
     "StreamResult",
     "TaskBudgetConfig",
     "TaskStatus",
+    "ThinkingConfig",
     "WorkspaceConfig",
     # Exceptions
     "CckitError",

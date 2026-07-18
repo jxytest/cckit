@@ -92,6 +92,20 @@ def _load_sdk_types() -> dict[str, type]:
             _sdk_types["UserMessage"] = UserMessage
         except ImportError:
             pass
+        # RateLimitEvent + TaskUpdatedMessage are newer SDK message types
+        # (added in the 0.2.x line). Load defensively so older SDKs still work.
+        try:
+            from claude_agent_sdk.types import RateLimitEvent  # type: ignore
+
+            _sdk_types["RateLimitEvent"] = RateLimitEvent
+        except ImportError:
+            pass
+        try:
+            from claude_agent_sdk.types import TaskUpdatedMessage  # type: ignore
+
+            _sdk_types["TaskUpdatedMessage"] = TaskUpdatedMessage
+        except ImportError:
+            pass
     except ImportError:
         _sdk_types = {}
     return _sdk_types
@@ -234,6 +248,8 @@ def _record_message_event(
     TaskNotificationMessage = types.get("TaskNotificationMessage")
     ToolUseBlock = types.get("ToolUseBlock")
     ToolResultBlock = types.get("ToolResultBlock")
+    RateLimitEvent = types.get("RateLimitEvent")
+    TaskUpdatedMessage = types.get("TaskUpdatedMessage")
 
     # Tool blocks may show up on assistant messages (the model emitting a
     # tool_use) or on user messages (the SDK feeding the tool_result back).
@@ -263,6 +279,22 @@ def _record_message_event(
 
     if TaskNotificationMessage and isinstance(message, TaskNotificationMessage):
         _decorate_task_notification(registry, message)
+        return
+
+    # Rate-limit events are run-level signals, not child operations — record
+    # them as span events on the main span so they surface in the trace UI.
+    if RateLimitEvent and isinstance(message, RateLimitEvent):
+        _record_rate_limit_event(main_span, message)
+        return
+
+    # TaskUpdatedMessage carries incremental task state changes (newer SDKs).
+    # Unlike TaskNotificationMessage it has no ``tool_use_id`` and may arrive
+    # without a matching ToolUseBlock, so there is often no child span to
+    # decorate. Record it as a span event on the main span (with the status
+    # from ``patch`` / ``status``) so the lifecycle is still observable.
+    if TaskUpdatedMessage and isinstance(message, TaskUpdatedMessage):
+        _record_task_updated_event(main_span, message)
+        return
 
 
 def _open_tool_or_subagent_span(
@@ -538,6 +570,61 @@ def _decorate_task_notification(
             except Exception:
                 pass
     except Exception:
+        pass
+
+
+def _record_rate_limit_event(main_span: Any, message: Any) -> None:
+    """Record a ``RateLimitEvent`` as a span event on the main run span.
+
+    Rate-limit state is a property of the whole run, not a child operation,
+    so it is surfaced as a span event (with the status / utilization /
+    window) rather than opening a child span. ``RateLimitEvent`` carries a
+    nested ``rate_limit_info`` whose fields are pulled out for visibility.
+    """
+    try:
+        info = getattr(message, "rate_limit_info", None)
+        attrs: dict[str, Any] = {}
+        if info is not None:
+            for field in ("status", "rate_limit_type", "utilization", "resets_at"):
+                value = getattr(info, field, None)
+                if value is not None:
+                    attrs[f"rate_limit.{field}"] = str(value)
+        level = attrs.get("rate_limit.status", "")
+        if level:
+            try:
+                main_span.set_attribute("cckit.rate_limit_status", level)
+            except Exception:
+                pass
+        main_span.add_event("rate_limit", attrs or {"rate_limit.event": "received"})
+    except Exception:
+        # Telemetry must never block the message stream.
+        pass
+
+
+def _record_task_updated_event(main_span: Any, message: Any) -> None:
+    """Record a ``TaskUpdatedMessage`` as a span event on the main run span.
+
+    ``TaskUpdatedMessage`` may arrive without a matching ToolUseBlock (e.g. a
+    background task stopped via TaskStop reports ``status="killed"`` only here),
+    so there is often no child span to decorate. The status is taken from
+    ``message.status`` first, falling back to ``message.patch["status"]`` (the
+    SDK populates ``patch`` with the changed fields; ``status`` may be None).
+    """
+    try:
+        status = getattr(message, "status", None)
+        if not status:
+            patch = getattr(message, "patch", None) or {}
+            if isinstance(patch, dict):
+                status = patch.get("status")
+        attrs: dict[str, Any] = {"task.updated": "received"}
+        task_id = getattr(message, "task_id", None)
+        if task_id:
+            attrs["task.id"] = str(task_id)
+        if status:
+            attrs["task.status"] = str(status)
+        main_span.add_event("task_updated", attrs)
+    except Exception:
+        # Telemetry must never block the message stream.
         pass
 
 

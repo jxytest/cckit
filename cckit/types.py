@@ -108,6 +108,14 @@ class ModelConfig(CustomModel):
     input_cost_per_token: float | None = None
     output_cost_per_token: float | None = None
     disable_thinking: bool = False
+    # Extended thinking configuration. When set, takes precedence over the
+    # deprecated ``disable_thinking`` flag and is forwarded to
+    # ``ClaudeAgentOptions.thinking`` on the direct-Anthropic CLI path. The
+    # LiteLLM bridge path continues to honour ``disable_thinking`` separately
+    # (it operates on the HTTP request, not the CLI subprocess). Use
+    # :class:`ThinkingConfig` for explicit control (adaptive / enabled /
+    # disabled).
+    thinking: ThinkingConfig | None = None
     # Whether the target model accepts image content blocks. When False, the
     # bridge strips/replaces ``image`` blocks (e.g. browser screenshots) with a
     # text placeholder before forwarding, so non-vision providers do not reject
@@ -346,6 +354,20 @@ class RunContext(CustomModel):
     # Session resume
     resume_session_id: str = ""  # when set, resumes a previous SDK session
     fork_session: bool = False  # when resuming, create a new branch session
+    # Optional pluggable session persistence backend. When set, forwarded to
+    # ``ClaudeAgentOptions.session_store`` so the SDK persists conversation
+    # history through this store instead of the default ``~/.claude/projects/``
+    # JSONL files. Accepts any object implementing the SDK's ``SessionStore``
+    # protocol (e.g. ``claude_agent_sdk.InMemorySessionStore`` or cckit's
+    # ``FileSessionStore``). When ``None`` (default), behavior is unchanged —
+    # the SDK's built-in file-based persistence is used. Per-run value takes
+    # precedence over ``RunnerConfig.session_store``.
+    session_store: Any | None = None
+    # Flush mode for the session store: ``"eager"`` (default — flush after every
+    # frame, safest for single-shot runs) or ``"batched"`` (higher throughput,
+    # one flush per turn / at 500 entries). Ignored when ``session_store`` is
+    # None. Per-run value takes precedence over ``RunnerConfig.session_store_flush``.
+    session_store_flush: str | None = None
 
     # Caller-supplied OpenTelemetry span attributes.
     # Keys and values are passed verbatim to the span; cckit does not interpret them.
@@ -641,6 +663,74 @@ class TaskBudgetConfig(CustomModel):
 
 
 # ---------------------------------------------------------------------------
+# Thinking configuration
+# ---------------------------------------------------------------------------
+
+
+class ThinkingConfig(CustomModel):
+    """Controls Claude's extended thinking / reasoning behavior.
+
+    Mirrors the SDK's ``ThinkingConfig`` TypedDict and is translated to
+    ``ClaudeAgentOptions.thinking`` at option-build time. Takes precedence
+    over the deprecated :attr:`ModelConfig.disable_thinking` flag.
+
+    Variants
+    --------
+    adaptive:
+        Claude decides when and how much to think (Opus 4.6+). Default for
+        models that support it.
+    enabled:
+        Fixed thinking token budget (older models). Requires ``budget_tokens``.
+    disabled:
+        No extended thinking.
+
+    Usage::
+
+        from cckit import ThinkingConfig, ModelConfig
+
+        ModelConfig(model="claude-sonnet-4-5", thinking=ThinkingConfig.adaptive())
+        ModelConfig(thinking=ThinkingConfig.enabled(budget_tokens=4096))
+        ModelConfig(thinking=ThinkingConfig.disabled())
+    """
+
+    type: Literal["adaptive", "enabled", "disabled"]
+    budget_tokens: int | None = None  # only meaningful for "enabled"
+    display: Literal["summarized", "omitted"] | None = None
+
+    @classmethod
+    def adaptive(cls) -> "ThinkingConfig":
+        return cls(type="adaptive")
+
+    @classmethod
+    def enabled(cls, budget_tokens: int) -> "ThinkingConfig":
+        return cls(type="enabled", budget_tokens=budget_tokens)
+
+    @classmethod
+    def disabled(cls) -> "ThinkingConfig":
+        return cls(type="disabled")
+
+    @model_validator(mode="after")
+    def _validate_enabled_budget(self) -> "ThinkingConfig":
+        """``enabled`` thinking requires a positive ``budget_tokens``."""
+        if self.type == "enabled" and (self.budget_tokens is None or self.budget_tokens <= 0):
+            raise ValueError(
+                "ThinkingConfig(type='enabled') requires budget_tokens > 0; "
+                "use ThinkingConfig.enabled(budget_tokens=N) or type='adaptive'."
+            )
+        return self
+
+    def to_sdk(self) -> dict[str, Any]:
+        """Translate to the SDK's ThinkingConfig dict form."""
+        d: dict[str, Any] = {"type": self.type}
+        if self.type == "enabled":
+            # _validate_enabled_budget guarantees budget_tokens is a positive int
+            d["budget_tokens"] = self.budget_tokens
+        if self.display is not None:
+            d["display"] = self.display
+        return d
+
+
+# ---------------------------------------------------------------------------
 # Sandbox options
 # ---------------------------------------------------------------------------
 
@@ -717,6 +807,13 @@ class RunnerConfig(CustomModel):
     debug: bool = False
     log_level: str = "INFO"
     permission_mode: PermissionMode = "bypassPermissions"
+    # Optional runner-level default session store. Used when a RunContext does
+    # not supply its own ``session_store``. ``None`` (default) preserves the
+    # SDK's built-in file-based persistence. See :attr:`RunContext.session_store`.
+    session_store: Any | None = None
+    # Runner-level default flush mode for the session store. ``None`` (default)
+    # means cckit uses ``"eager"``. See :attr:`RunContext.session_store_flush`.
+    session_store_flush: str | None = None
 
     @classmethod
     def from_env(cls) -> RunnerConfig:

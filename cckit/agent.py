@@ -11,7 +11,7 @@ Two usage modes:
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -162,6 +162,24 @@ class Agent:
         hooks: dict[HookEvent, list[HookMatcher]] | None = None,
         task_budget: TaskBudgetConfig | None = None,
         context: ContextConfig | None = None,
+        # --- Claude Agent SDK capability passthrough (all optional, None = SDK default) ---
+        # Custom permission handler — SDK's can_use_tool. Invoked when the CLI's
+        # permission rules evaluate to "ask" for a tool call. Signature:
+        #   async def handler(tool_name: str, tool_input: dict, context: ToolPermissionContext)
+        #       -> PermissionResultAllow | PermissionResultDeny
+        # i.e. return {"behavior": "allow"} or {"behavior": "deny", "message": "..."}.
+        permission_handler: Callable[..., Awaitable[Any]] | None = None,
+        # Structured output schema, e.g. {"type": "json_schema", "schema": {...}}.
+        # When set, the agent returns structured data on ResultMessage.structured_output.
+        output_format: dict[str, Any] | None = None,
+        # Hard USD cost cap for the query. The query stops (error_max_budget_usd)
+        # if exceeded. Complements task_budget (token budget).
+        max_budget_usd: float | None = None,
+        # SDK beta features, e.g. ["context-1m-2025-08-07"] for 1M token context.
+        betas: list[str] | None = None,
+        # Local plugins to load. Each entry is a path (str) or an inline
+        # {"type": "local", "path": str} dict.
+        plugins: list[str | dict[str, Any]] | None = None,
         # Lifecycle callbacks
         on_before: LifecycleBeforeFn | None = None,
         on_prepare_workspace: LifecycleBeforeFn | None = None,
@@ -184,6 +202,12 @@ class Agent:
         self.hooks: dict[str, list[Any]] | None = hooks  # type: ignore[assignment]
         self.task_budget: TaskBudgetConfig | None = task_budget
         self.context: ContextConfig | None = context
+        # SDK capability passthrough (translated in Runner._build_options)
+        self.permission_handler: Callable[..., Awaitable[Any]] | None = permission_handler
+        self.output_format: dict[str, Any] | None = output_format
+        self.max_budget_usd: float | None = max_budget_usd
+        self.betas: list[str] | None = betas
+        self.plugins: list[str | dict[str, Any]] | None = plugins
 
         # Normalize model → ModelConfig | None
         if model is None:

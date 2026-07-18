@@ -9,7 +9,7 @@
 ### 前置条件
 
 - Python >= 3.12
-- [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) 已安装（`claude-agent-sdk` 通过 subprocess 调用 Claude CLI）
+- `claude-agent-sdk` 自带 bundled Claude CLI（无需单独安装）；若需使用系统已装的 `claude`，通过 `ClaudeAgentOptions.cli_path` 指定
 
 ### 安装 cckit
 
@@ -106,6 +106,34 @@ fix_agent = Agent(
 )
 ```
 
+### 进阶能力
+
+以下能力都是可选的，不配置时走 SDK 默认行为：
+
+| 能力 | 参数 | 用途 |
+|------|------|------|
+| 结构化输出 | `output_format={"type":"json_schema","schema":{...}}` | 让 Agent 直接产出符合 schema 的结构化数据，结果落在 `result.structured_output` |
+| 推理强度 | `effort="high"`（`low`/`medium`/`high`/`xhigh`/`max`） | 控制思考深度，主会话与子代理均生效 |
+| USD 预算上限 | `max_budget_usd=1.0` | 超出即停止，与 `task_budget`（token 预算）互补 |
+| 工具权限回调 | `permission_handler=async fn` | 自定义工具审批，替代静态 `permission_mode` |
+| Beta 特性 | `betas=["context-1m-2025-08-07"]` | 启用 1M 上下文等 beta 能力 |
+| 本地插件 | `plugins=["/path/to/plugin"]` | 加载本地插件扩展能力 |
+
+```python
+agent = Agent(
+    name="structured",
+    model="anthropic/claude-sonnet-4-6",
+    effort="high",
+    output_format={
+        "type": "json_schema",
+        "schema": {"type": "object", "properties": {"summary": {"type": "string"}}},
+    },
+    max_budget_usd=0.5,
+)
+```
+
+`permission_handler` 签名为 `async def(tool_name, tool_input, context) -> {"behavior":"allow"} | {"behavior":"deny","message":"..."}`。
+
 ### 模型配置
 
 配置仅需三个字段：`model`、`api_key` 和 `base_url`（大部分情况不填）。
@@ -160,6 +188,20 @@ proxy = ModelConfig(model="openai/gpt-4o", base_url="https://api.proxy.com/v1", 
 | **本地 Ollama** | `ollama/qwen2.5` | ✅必填局域网地址：`http://localhost:11434` |
 | **云托管服务** | `azure/`、`bedrock/`、`vertex_ai/` | ✅按厂商规范必填真实资源端点和专属格式配置 |
 
+#### 扩展思考（thinking）
+
+通过 `ModelConfig.thinking` 控制 Claude 的扩展思考行为，直连 Anthropic 与 LiteLLM 桥接路径均生效：
+
+```python
+from cckit import ModelConfig, ThinkingConfig
+
+ModelConfig(model="anthropic/claude-sonnet-4-6", thinking=ThinkingConfig.adaptive())        # 模型自决
+ModelConfig(model="anthropic/claude-sonnet-4-6", thinking=ThinkingConfig.enabled(4096))     # 固定预算
+ModelConfig(model="anthropic/claude-sonnet-4-6", thinking=ThinkingConfig.disabled())        # 关闭
+```
+
+> 旧的 `ModelConfig(disable_thinking=True)` 仍然支持（等价于 `ThinkingConfig.disabled()`），`thinking` 优先级更高。
+
 
 ## 运行上下文
 
@@ -187,7 +229,18 @@ ctx = RunContext(
     resume_session_id="abc-123",
     workspace_dir=prev_dir,
 )
+
+# 可插拔会话存储 — 跨机器/跨进程恢复（默认走本地文件持久化，无需配置）
+from cckit import FileSessionStore
+ctx = RunContext(
+    prompt="Continue",
+    resume_session_id="abc-123",
+    session_store=FileSessionStore(),   # 也可传自定义 SessionStore（DB/Redis）
+)
 ```
+
+> `session_store` 不传时，SDK 使用内置的 `~/.claude/projects/` 文件持久化。`FileSessionStore` 是同一布局的协议实现，便于测试或作为自定义远程存储的参考。
+
 
 ## Runner 与中间件
 
@@ -201,7 +254,7 @@ runner = Runner(
     ),
     middlewares=[
         ConcurrencyMiddleware(max_concurrent=5),   # Semaphore 限流
-        RetryMiddleware(max_retries=3),             # 指数退避重试
+        RetryMiddleware(max_retries=3),             # 指数退避重试（自动识别 429/overloaded，更长退避）
         LoggingMiddleware(),                        # 耗时、费用记录
     ],
 )
@@ -419,7 +472,7 @@ agent = Agent(
     hooks={"PreToolUse": [HookMatcher(matcher="Bash", hooks=[block_rm])]},
 )
 ```
-1
+
 ### TaskBudget（Token 预算）
 
 声明 token 总预算，模型会在接近上限时主动收尾，避免硬截断。
@@ -474,4 +527,4 @@ agent = Agent(
 
 
 ## 已知问题
-- [ ] `Windows`下，系统提示词设置无法生效， 属于`claude-agent-sdk`本身问题
+- [ ] 部分 LiteLLM 桥接的第三方模型不支持扩展思考（`thinking`），配置后会被静默忽略而非报错。

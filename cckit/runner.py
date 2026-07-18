@@ -683,6 +683,25 @@ class Runner:
             max_tokens=agent_model.max_tokens,
             max_turns=agent_model.max_turns if agent_model.max_turns > 0 else base.max_turns,
             timeout_seconds=agent_model.timeout_seconds or base.timeout_seconds,
+            # Thinking config: agent wins, else inherit runner default. Both the
+            # new ``thinking`` field and the deprecated ``disable_thinking`` flag
+            # are propagated so sub-agents keep their reasoning configuration.
+            thinking=agent_model.thinking or base.thinking,
+            disable_thinking=agent_model.disable_thinking or base.disable_thinking,
+            supports_vision=agent_model.supports_vision and base.supports_vision,
+            # Cost overrides use ``is None`` (not ``or``) so an explicit 0.0
+            # (free model) is honoured instead of being masked by the base's
+            # non-zero cost — ``0.0 or x`` would wrongly fall through to ``x``.
+            input_cost_per_token=(
+                agent_model.input_cost_per_token
+                if agent_model.input_cost_per_token is not None
+                else base.input_cost_per_token
+            ),
+            output_cost_per_token=(
+                agent_model.output_cost_per_token
+                if agent_model.output_cost_per_token is not None
+                else base.output_cost_per_token
+            ),
             # Inherit gateway mode + platform static headers (dimension,
             # feature-phase-name, …) from the runner default so sub-agent
             # requests carry the same gateway routing/identity. The bridge
@@ -1126,6 +1145,19 @@ class Runner:
         if ctx.resume_session_id and not ctx.fork_session:
             opts.continue_conversation = True
 
+        # -- pluggable session store (optional) --
+        # Per-run value takes precedence over the runner-level default. When
+        # both are None (the default), opts.session_store is left unset so the
+        # SDK falls back to its built-in ~/.claude/projects/ file persistence —
+        # identical to prior behavior. Flush defaults to "eager" (safest for
+        # single-shot runs); override via ctx/RunnerConfig.session_store_flush
+        # = "batched" for higher throughput.
+        session_store = ctx.session_store or self._config.session_store
+        if session_store is not None:
+            opts.session_store = session_store
+            flush = ctx.session_store_flush or self._config.session_store_flush or "eager"
+            opts.session_store_flush = flush
+
         # -- Claude native hooks --
         if agent.hooks:
             opts.hooks = agent.hooks  # type: ignore[assignment]
@@ -1134,6 +1166,51 @@ class Runner:
         if agent.task_budget is not None:
             from claude_agent_sdk.types import TaskBudget  # noqa: WPS433
             opts.task_budget = TaskBudget(total=agent.task_budget.total)
+
+        # -- effort (top-level agent) --
+        # Historically agent.effort was only passed to sub-agents
+        # (AgentDefinition.effort) and dropped for the main session. Wire it
+        # into the top-level options too. Default None leaves opts.effort unset
+        # (SDK default), so existing behavior is unchanged when not specified.
+        if agent.effort:
+            opts.effort = agent.effort
+
+        # -- thinking (direct-Anthropic CLI path) --
+        # Priority: ModelConfig.thinking > deprecated disable_thinking > unset.
+        # The LiteLLM bridge path handles disable_thinking separately
+        # (model_bridge.py sets kwargs["thinking"] on the HTTP request); this
+        # only governs the CLI subprocess via opts.thinking. Both paths are
+        # non-conflicting. Default (None + disable_thinking=False) leaves
+        # opts.thinking unset, matching prior behavior.
+        thinking_cfg = getattr(model, "thinking", None)
+        if thinking_cfg is None and getattr(model, "disable_thinking", False):
+            from cckit.types import ThinkingConfig  # noqa: WPS433
+            thinking_cfg = ThinkingConfig.disabled()
+        if thinking_cfg is not None:
+            opts.thinking = thinking_cfg.to_sdk()
+
+        # -- custom permission handler (can_use_tool) --
+        if agent.permission_handler is not None:
+            opts.can_use_tool = agent.permission_handler
+
+        # -- structured output --
+        if agent.output_format:
+            opts.output_format = agent.output_format
+
+        # -- USD budget hard cap --
+        if agent.max_budget_usd is not None:
+            opts.max_budget_usd = agent.max_budget_usd
+
+        # -- SDK beta features (e.g. 1M context) --
+        if agent.betas:
+            opts.betas = list(agent.betas)
+
+        # -- local plugins --
+        if agent.plugins:
+            opts.plugins = [
+                p if isinstance(p, dict) else {"type": "local", "path": p}
+                for p in agent.plugins
+            ]
 
         # -- log agent startup configuration --
         _safe_env = {
