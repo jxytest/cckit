@@ -1019,6 +1019,37 @@ class Runner:
                 # --- Claude Code internals ---
                 "CLAUDE_CONFIG_DIR",
                 "CLAUDE_CODE_TMPDIR",
+                # --- Windows system variables ---
+                # The bundled Claude Code CLI (>= 2.x, shipped with
+                # claude-agent-sdk 0.2.x) crashes with STATUS_STACK_BUFFER_OVERRUN
+                # (0xC0000409) when these are blanked to "". The older 1.x CLI
+                # tolerated empty values; 2.x does not. These are non-secret
+                # system identifiers (system root, processor, standard dirs) and
+                # must be inherited as-is on Windows so the CLI subprocess can
+                # initialise. They are absent on macOS/Linux, so listing them is
+                # harmless there.
+                "SYSTEMROOT",  # %SystemRoot% — required by the Windows C runtime
+                "WINDIR",  # %WinDir% — Windows directory
+                "COMSPEC",  # %ComSpec% — default shell (cmd.exe) path
+                "OS",  # "Windows_NT"
+                "PROCESSOR_ARCHITECTURE",
+                "PROCESSOR_IDENTIFIER",
+                "PROCESSOR_LEVEL",
+                "PROCESSOR_REVISION",
+                "NUMBER_OF_PROCESSORS",
+                # --- Windows user / app directories ---
+                "USERPROFILE",  # Windows home directory (equivalent of $HOME)
+                "APPDATA",  # roaming app data (CLI writes config here)
+                "LOCALAPPDATA",  # local app data
+                "HOMEDRIVE",  # drive of user home, e.g. "C:"
+                "HOMEPATH",  # path of user home, e.g. "\Users\name"
+                "PROGRAMDATA",  # all-users app data
+                "ALLUSERSPROFILE",  # alias of PROGRAMDATA on some Windows
+                "PROGRAMFILES",  # 64-bit Program Files
+                "PROGRAMFILES(X86)",  # 32-bit Program Files
+                "COMMONPROGRAMFILES",
+                "COMMONPROGRAMFILES(X86)",
+                "PUBLIC",  # %PUBLIC% shared user directory
             }
         )
         for _k in os.environ:
