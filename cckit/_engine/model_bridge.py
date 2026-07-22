@@ -1170,6 +1170,19 @@ class LiteLLMAnthropicBridge:
             # 由 OpenAI SDK 序列化进请求体，才能真正到达上游。
             extra_body = kwargs.setdefault("extra_body", {})
             extra_body["thinking"] = kwargs.pop("thinking")
+        # Provider-specific generation / sampling params (temperature, top_p,
+        # do_sample, repetition_penalty, …). The Claude CLI speaks Anthropic
+        # protocol and never emits these, so non-Anthropic gateways that need
+        # them (e.g. making Qwen deterministic) get them via extra_body, which
+        # the OpenAI SDK serializes verbatim into the request body. Caller-
+        # supplied extra_body keys win over ModelConfig.extra_body so an
+        # explicit per-request override still takes precedence.
+        if cfg.extra_body:
+            merged = dict(cfg.extra_body)
+            caller_body = kwargs.get("extra_body")
+            if isinstance(caller_body, dict):
+                merged.update(caller_body)
+            kwargs["extra_body"] = merged
         return kwargs
 
     # ── streaming ─────────────────────────────────────────────────

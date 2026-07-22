@@ -135,6 +135,18 @@ class ModelConfig(CustomModel):
     # ``custom-model-name`` in ``extra_headers`` (explicit values win). Only
     # affects bridge transports; no effect on the direct-Anthropic path.
     cw_gateway: bool = False
+    # Provider-specific generation / sampling parameters forwarded verbatim
+    # into the LiteLLM request body via the OpenAI SDK ``extra_body`` mechanism.
+    # This is the escape hatch for sampling knobs the Claude CLI never sends
+    # (it speaks Anthropic protocol, which has no ``temperature``/``top_p``/
+    # ``do_sample``) but non-Anthropic gateways require — e.g. making a Qwen
+    # model deterministic with ``{"do_sample": False, "temperature": 0,
+    # "top_p": 1}``. Values are merged on top of any caller-supplied
+    # ``extra_body`` and only affect bridge transports (chat / responses);
+    # no effect on the direct-Anthropic path. Non-standard keys (``do_sample``,
+    # ``repetition_penalty``, ``enable_thinking``, …) ride through untouched
+    # to the upstream gateway.
+    extra_body: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod
