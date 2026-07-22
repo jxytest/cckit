@@ -1109,10 +1109,26 @@ class Runner:
                 "COMMONPROGRAMFILES",
                 "COMMONPROGRAMFILES(X86)",
                 "PUBLIC",  # %PUBLIC% shared user directory
+                # --- plugin-declared business env (not statically discoverable) ---
+                # Agent/Spec/ContextConfig declare no "required env names" field;
+                # plugins inject these via ContextProvider at runtime (os.environ
+                # or ctx.env). Listing them here keeps the isolation loop from
+                # blanking them so the agent subprocess + subagents inherit them.
+                # See EvaluatorContextProvider in output/ui_rubric_evaluator/context.py.
+                # NOTE: append new plugin env var names here as plugins are added;
+                # alternatively write them into RunContext.env, which is auto-passthrough.
+                "PLAYWRIGHT_LIVE_SESSION",  # browser subagent live session id
+                "WAVE_EVALUATION_RUBRIC_DIR",  # rubric pack abs path
+                "WAVE_EVALUATION_OUTPUT_DIR",  # evaluation output dir
             }
         )
+        # ctx.env keys are plugin-declared and explicitly forwarded — treat them
+        # as passthrough too so the isolation loop never blanks them. (env already
+        # contains ctx.env via dict(ctx.env) above, so this is a semantic guard:
+        # it makes the intent explicit and survives any future reordering.)
+        _ctx_env_keys = frozenset(ctx.env.keys())
         for _k in os.environ:
-            if _k not in env and _k not in _AGENT_ENV_PASSTHROUGH:
+            if _k not in env and _k not in _AGENT_ENV_PASSTHROUGH and _k not in _ctx_env_keys:
                 env[_k] = ""
 
         # -- configurable SDK params --
