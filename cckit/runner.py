@@ -1,70 +1,50 @@
 """Runner — executes agents and yields streaming SDK messages.
 
-This is the orchestration layer that replaces ``AgentExecutor``.
-It is the only class that ties together workspace management,
-git cloning, skill provisioning, middleware, and the SDK bridge.
+This is the orchestration layer.  It is the only class that ties together
+workspace management, git cloning, skill provisioning, middleware, and the
+SDK bridge.  The mechanical work is delegated to focused modules:
+
+===============================  ===========================================
+Module                           Responsibility
+===============================  ===========================================
+``_engine.options_builder``      ``ClaudeAgentOptions`` construction
+``_engine.model_resolver``       Agent model ⨯ Runner default merge
+``_engine.runtime_env``          Subprocess env + host-env isolation
+``_engine.tracing``              SDK message logging, cost recalculation
+``_engine.session_files``        Session JSONL read/restore
+``skill.planner``                Skill collection / provisioning / repair
+``middleware.chain``             Middleware stack assembly
+===============================  ===========================================
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any
 
 from cckit._cli import check_api_connectivity, check_claude_cli
-from cckit._cost import recalculate_model_usage_costs
+from cckit._engine import session_files
 from cckit._engine.model_bridge import PreparedModelEndpoint, prepare_model_endpoint
-
-
-def _patch_result_message_costs(
-        message: Any,
-        all_configs: dict[str, "ModelConfig"],
-) -> Any:
-    """Patch ``model_usage`` and ``total_cost_usd`` on a ``ResultMessage`` in-place.
-
-    If *message* is not a ``ResultMessage`` or has no ``model_usage``, it is
-    returned unchanged.  The patch is applied via ``object.__setattr__`` so it
-    works on frozen dataclasses too.
-    """
-    try:
-        from claude_agent_sdk import ResultMessage  # noqa: WPS433
-    except ImportError:
-        return message
-
-    if not isinstance(message, ResultMessage):
-        return message
-
-    model_usage = getattr(message, "model_usage", None)
-    if not model_usage or not isinstance(model_usage, dict):
-        return message
-
-    try:
-        recalculated = recalculate_model_usage_costs(model_usage, all_configs)
-        new_total_cost = sum(
-            u.get("costUSD", 0.0) for u in recalculated.values()
-            if isinstance(u, dict)
-        )
-        object.__setattr__(message, "model_usage", recalculated)
-        object.__setattr__(message, "total_cost_usd", new_total_cost)
-    except Exception:
-        logger.debug("Could not patch ResultMessage costs", exc_info=True)
-
-    return message
-
-
-from cckit._engine.model_transport import resolve_model_transport
-from cckit._engine.sdk_bridge import run_sdk_query
+from cckit._engine.model_resolver import resolve_model as _resolve_model_config
+from cckit._engine.options_builder import build_options
+from cckit._engine.runtime_env import is_root_user, is_windows
 from cckit._engine.state import RunState
+from cckit._engine.tracing import (
+    log_run_summary,
+    log_sdk_message,
+    patch_result_message_costs,
+)
 from cckit.agent import Agent
-from cckit.exceptions import AgentExecutionError, HookError
+from cckit.exceptions import HookError
 from cckit.git import operations as git_ops
 from cckit.middleware.base import Middleware
-from cckit.sandbox.config import SandboxConfigBuilder
+from cckit.middleware.chain import build_middleware_chain
 from cckit.sandbox.workspace import WorkspaceManager
+from cckit.skill import planner as skill_planner
 from cckit.skill.provisioner import SkillProvisioner
 from cckit.types import (
     AgentResult,
@@ -78,18 +58,6 @@ from cckit.types import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _is_windows() -> bool:
-    import sys
-    return sys.platform == "win32"
-
-
-def _is_root_user() -> bool:
-    geteuid = getattr(os, "geteuid", None)
-    if geteuid is None:
-        return False
-    return geteuid() == 0
 
 
 class Runner:
@@ -263,56 +231,15 @@ class Runner:
             # --- lifecycle: before ---
             await agent.before_execute(ctx)
 
-            # Claude Code rejects --dangerously-skip-permissions under root/sudo.
-            # Instead of failing, transparently enable the sandbox and downgrade
-            # to ``dontAsk`` for this run, then notify the caller via a system
-            # event. Two things must happen together:
-            #
-            #   1. Enable the sandbox so ``SandboxConfigBuilder`` emits the
-            #      unified settings JSON (``sandbox.*`` + ``permissions.*`` +
-            #      ``autoAllowBashIfSandboxed``). Without these settings, a bare
-            #      ``dontAsk`` run still prompts for MCP/Bash tool authorization
-            #      under root — the sandbox settings are what actually lets
-            #      tools run without per-call approval.
-            #   2. Switch the effective permission mode to ``dontAsk``. The
-            #      sandbox branch in ``_build_options`` would do this anyway,
-            #      but setting it here keeps the downgraded state explicit and
-            #      makes the ``permission_degraded`` event accurate.
-            #
-            # ``dontAsk`` still enforces ``permissions.deny`` rules (unlike
-            # ``bypassPermissions``, which skips all checks), so this is the
-            # safe equivalent for a root env — isolated by the sandbox rather
-            # than by privilege.
-            if (
-                    effective_permission_mode == "bypassPermissions"
-                    and _is_root_user()
-            ):
-                if not effective_sandbox.enabled:
-                    effective_sandbox = SandboxOptions(enabled=True)
-                effective_permission_mode = "dontAsk"
-                logger.warning(
-                    "Agent %s running as root with permission_mode='bypassPermissions' "
-                    "is not supported by Claude Code; enabling sandbox and downgrading "
-                    "to 'dontAsk' for this run.",
-                    agent.name,
+            effective_sandbox, effective_permission_mode, _downgrade_event = (
+                self._apply_root_permission_downgrade(
+                    agent, effective_sandbox, effective_permission_mode,
                 )
-                from claude_agent_sdk import SystemMessage  # noqa: WPS433
-                yield SystemMessage(
-                    subtype="permission_degraded",
-                    data={
-                        "original": "bypassPermissions",
-                        "effective": "dontAsk",
-                        "reason": "root_user",
-                        "sandbox_auto_enabled": True,
-                        "detail": (
-                            "Claude Code rejects --dangerously-skip-permissions when "
-                            "running as root/sudo; auto-enabled sandbox and downgraded "
-                            "to dontAsk for this run."
-                        ),
-                    },
-                )
+            )
+            if _downgrade_event is not None:
+                yield _downgrade_event
 
-            if effective_sandbox.enabled and _is_windows():
+            if effective_sandbox.enabled and is_windows():
                 logger.warning(
                     "Sandbox is enabled for agent %s, but native Windows does not support "
                     "OS-level sandbox enforcement. Use macOS, Linux, or WSL2 for full isolation.",
@@ -321,48 +248,7 @@ class Runner:
 
             # --- workspace ---
             if ctx.workspace.enabled:
-                needs_init = False
-                if ctx.resume_session_id and ctx.workspace_dir:
-                    # Resume: reuse existing workspace, or recreate at the
-                    # same path when the directory was cleaned up.
-                    holder.workspace_dir, was_recreated = (
-                        await self._workspace.resume(
-                            ctx.workspace_dir, recreate=True
-                        )
-                    )
-                    needs_init = was_recreated
-                else:
-                    # First execution: create a fresh workspace
-                    holder.workspace_dir = await self._workspace.create(ctx.task_id)
-                    ctx.workspace_dir = holder.workspace_dir
-                    needs_init = True
-
-                if needs_init:
-                    if git_cfg.clone and git_cfg.repo_url:
-                        git_env = git_cfg.build_git_env() or None
-                        async with self._clone_semaphore:
-                            await git_ops.clone(
-                                git_cfg.repo_url,
-                                holder.workspace_dir,
-                                branch=git_cfg.branch,
-                                depth=git_cfg.depth,
-                                extra_env=git_env,
-                            )
-
-                    # --- provision skills (top-level + sub-agents) ---
-                    await self._provision_agent_skills(agent, holder.workspace_dir)
-
-                    # --- lifecycle: prepare_workspace ---
-                    await agent.prepare_workspace(ctx)
-                elif ctx.resume_session_id:
-                    # Self-heal: the workspace dir survived resume (was_recreated
-                    # = False) so the needs_init block above skipped provisioning.
-                    # But the host may have wiped the tmpdir between turns and
-                    # recreated an empty dir before cckit ran (or otherwise left
-                    # .claude/skills/ absent). Re-provision so the agent can still
-                    # discover its skills on a resumed turn.
-                    if self._agent_needs_skill_repair(agent, holder.workspace_dir):
-                        await self._provision_agent_skills(agent, holder.workspace_dir)
+                await self._setup_workspace(agent, ctx, holder, git_cfg)
 
             # --- instruction ---
             instruction = agent.resolve_instruction(ctx)
@@ -391,30 +277,8 @@ class Runner:
             # the Claude Code CLI subprocess cannot inject traceparent.
             state.bridge = prepared_model.bridge
 
-            # Register sub-agent system signatures with the bridge so that
-            # sub-agent LLM observations attach to the right subagent.<name>
-            # span (vs. the main agent span). Each sub-agent has a distinct
-            # instruction string, which the bridge fingerprints against
-            # incoming requests.
-            if prepared_model.bridge is not None and agent.sub_agents:
-                sub_systems: dict[str, str] = {}
-                for sub in agent.sub_agents:
-                    try:
-                        sub_systems[sub.name] = sub.resolve_instruction(ctx) or ""
-                    except Exception:
-                        # Telemetry registration must never break a run.
-                        logger.debug(
-                            "Failed to resolve sub-agent instruction for %s",
-                            sub.name, exc_info=True,
-                        )
-                if sub_systems:
-                    try:
-                        prepared_model.bridge.register_subagent_systems(sub_systems)
-                    except Exception:
-                        logger.debug(
-                            "bridge.register_subagent_systems failed",
-                            exc_info=True,
-                        )
+            self._register_subagent_systems(agent, ctx, prepared_model)
+
             if self._preflight_check:
                 check_api_connectivity(
                     api_key=prepared_model.api_key or model.api_key,
@@ -438,16 +302,20 @@ class Runner:
             sdk_stream = query_fn(prompt, options, state)
 
             # Build short-name → ModelConfig map once for cost recalculation
-            _short = lambda m: m.split("/")[-1] if "/" in m else m
-            _all_configs: dict[str, ModelConfig] = {_short(model.model): model}
-            for sub_cfg in extra_models.values():
-                _all_configs[_short(sub_cfg.model)] = sub_cfg
+            all_configs = self._build_cost_config_map(model, extra_models)
 
             async for message in sdk_stream:
+                # Trace every SDK message (tool calls, tool results, text,
+                # result summary).  This is the only place the full agent↔CLI
+                # interaction is observable from the Python side, so keep it
+                # unconditional — it is what turns "the tool returned nothing"
+                # into an actionable log line.
+                log_sdk_message(message, ctx)
+
                 # Recalculate costUSD on ResultMessage before yielding so that
                 # downstream consumers (event serialisers, loggers, etc.) always
                 # receive accurate pricing without needing their own patches.
-                message = _patch_result_message_costs(message, _all_configs)
+                message = patch_result_message_costs(message, all_configs)
 
                 # Lifecycle: on_message
                 try:
@@ -457,39 +325,11 @@ class Runner:
                 yield message
 
             # --- build result ---
-            duration = time.monotonic() - start
-            final_message = state.final_message
-            # final_message is the same object already patched above when it was
-            # yielded, so no second recalculation is needed here.
-
-            if final_message is None:
-                holder.result = AgentResult(
-                    task_id=ctx.task_id,
-                    agent_type=agent.name,
-                    status=TaskStatus.FAILED,
-                    is_error=True,
-                    error_message="SDK stream completed without a ResultMessage",
-                    duration_seconds=round(duration, 2),
-                    session_id=state.session_id,
-                )
-            else:
-                output_text = final_message.result or ""
-                is_error = bool(final_message.is_error)
-                holder.result = AgentResult(
-                    task_id=ctx.task_id,
-                    agent_type=agent.name,
-                    status=TaskStatus.FAILED if is_error else TaskStatus.COMPLETED,
-                    output_text=output_text,
-                    cost_usd=final_message.total_cost_usd or 0.0,
-                    duration_seconds=round(duration, 2),
-                    is_error=is_error,
-                    error_message=output_text if is_error else "",
-                    session_id=final_message.session_id or state.session_id,
-                    stop_reason=final_message.stop_reason or "",
-                    usage=final_message.usage,
-                    structured_output=final_message.structured_output,
-                    final_message=final_message,
-                )
+            # state.final_message is the same object already patched above when
+            # it was yielded, so no second recalculation is needed here.
+            holder.result = self._build_result(
+                agent, ctx, state, duration=time.monotonic() - start,
+            )
 
         except Exception as exc:
             duration = time.monotonic() - start
@@ -535,32 +375,7 @@ class Runner:
                     )
                     raise HookError("after_execute", hook_exc) from hook_exc
 
-                # --- log final summary ---
-                # Aggregate token counts from model_usage (accurate) rather than
-                # result.usage which is the raw SDK usage object (often zeroed for
-                # non-Anthropic providers).
-                _model_usage: dict = {}
-                _fm = getattr(holder.result, "final_message", None)
-                if _fm is not None:
-                    _model_usage = getattr(_fm, "model_usage", None) or {}
-                _inp = sum(int(u.get("inputTokens", 0)) for u in _model_usage.values() if isinstance(u, dict))
-                _out = sum(int(u.get("outputTokens", 0)) for u in _model_usage.values() if isinstance(u, dict))
-                logger.info(
-                    (
-                        "Agent %s completed: task_id=%s session_id=%s "
-                        "status=%s cost=$%.4f duration=%.2fs "
-                        "input_tokens=%d output_tokens=%d total_tokens=%d"
-                    ),
-                    agent.name,
-                    holder.result.task_id,
-                    holder.result.session_id,
-                    holder.result.status,
-                    holder.result.cost_usd,
-                    holder.result.duration_seconds,
-                    _inp,
-                    _out,
-                    _inp + _out,
-                )
+                log_run_summary(agent.name, holder.result)
 
             # --- cleanup temporary askpass script ---
             try:
@@ -568,120 +383,255 @@ class Runner:
             except Exception:
                 logger.exception("Failed to cleanup git askpass for task %s", ctx.task_id)
 
-            # --- cleanup or suspend workspace ---
-            # Cleanup policy:
-            #   - workspace.keep=True  → always suspend (caller wants to resume later)
-            #   - task failed          → suspend (preserve for debugging / resume)
-            #   - task succeeded       → cleanup (delete) by default
-            if holder.workspace_dir:
-                should_suspend = (
-                        ctx.workspace.keep
-                        or holder.result is None
-                        or holder.result.status != TaskStatus.COMPLETED
-                )
-                if should_suspend:
-                    await self._workspace.suspend(holder.workspace_dir)
-                else:
-                    await self._workspace.cleanup(holder.workspace_dir)
+            await self._finalize_workspace(ctx, holder)
+
             if prepared_model is not None:
                 await prepared_model.aclose()
 
     # ------------------------------------------------------------------
-    # Session persistence helpers
+    # Execution steps
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _apply_root_permission_downgrade(
+            agent: Agent,
+            sandbox: SandboxOptions,
+            permission_mode: str,
+    ) -> tuple[SandboxOptions, str, Any | None]:
+        """Downgrade ``bypassPermissions`` → ``dontAsk`` when running as root.
+
+        Claude Code rejects ``--dangerously-skip-permissions`` under root/sudo.
+        Instead of failing, transparently enable the sandbox and downgrade for
+        this run, then notify the caller via a system event.  Two things must
+        happen together:
+
+          1. Enable the sandbox so ``SandboxConfigBuilder`` emits the unified
+             settings JSON (``sandbox.*`` + ``permissions.*`` +
+             ``autoAllowBashIfSandboxed``). Without these settings, a bare
+             ``dontAsk`` run still prompts for MCP/Bash tool authorization
+             under root — the sandbox settings are what actually lets tools
+             run without per-call approval.
+          2. Switch the effective permission mode to ``dontAsk``. The sandbox
+             branch in the options builder would do this anyway, but setting it
+             here keeps the downgraded state explicit and makes the
+             ``permission_degraded`` event accurate.
+
+        ``dontAsk`` still enforces ``permissions.deny`` rules (unlike
+        ``bypassPermissions``, which skips all checks), so this is the safe
+        equivalent for a root env — isolated by the sandbox rather than by
+        privilege.
+
+        Returns ``(sandbox, permission_mode, event)``; *event* is ``None``
+        when no downgrade applies, and the caller yields it otherwise.
+        """
+        if permission_mode != "bypassPermissions" or not is_root_user():
+            return sandbox, permission_mode, None
+
+        if not sandbox.enabled:
+            sandbox = SandboxOptions(enabled=True)
+        logger.warning(
+            "Agent %s running as root with permission_mode='bypassPermissions' "
+            "is not supported by Claude Code; enabling sandbox and downgrading "
+            "to 'dontAsk' for this run.",
+            agent.name,
+        )
+        from claude_agent_sdk import SystemMessage  # noqa: WPS433
+        event = SystemMessage(
+            subtype="permission_degraded",
+            data={
+                "original": "bypassPermissions",
+                "effective": "dontAsk",
+                "reason": "root_user",
+                "sandbox_auto_enabled": True,
+                "detail": (
+                    "Claude Code rejects --dangerously-skip-permissions when "
+                    "running as root/sudo; auto-enabled sandbox and downgraded "
+                    "to dontAsk for this run."
+                ),
+            },
+        )
+        return sandbox, "dontAsk", event
+
+    async def _setup_workspace(
+            self,
+            agent: Agent,
+            ctx: RunContext,
+            holder: _ResultHolder,
+            git_cfg: Any,
+    ) -> None:
+        """Create or resume the workspace, then clone / provision as needed."""
+        needs_init = False
+        if ctx.resume_session_id and ctx.workspace_dir:
+            # Resume: reuse existing workspace, or recreate at the
+            # same path when the directory was cleaned up.
+            holder.workspace_dir, was_recreated = await self._workspace.resume(
+                ctx.workspace_dir, recreate=True
+            )
+            needs_init = was_recreated
+        else:
+            # First execution: create a fresh workspace
+            holder.workspace_dir = await self._workspace.create(ctx.task_id)
+            ctx.workspace_dir = holder.workspace_dir
+            needs_init = True
+
+        if needs_init:
+            if git_cfg.clone and git_cfg.repo_url:
+                git_env = git_cfg.build_git_env() or None
+                async with self._clone_semaphore:
+                    await git_ops.clone(
+                        git_cfg.repo_url,
+                        holder.workspace_dir,
+                        branch=git_cfg.branch,
+                        depth=git_cfg.depth,
+                        extra_env=git_env,
+                    )
+
+            # --- provision skills (top-level + sub-agents) ---
+            await self._provision_agent_skills(agent, holder.workspace_dir)
+
+            # --- lifecycle: prepare_workspace ---
+            await agent.prepare_workspace(ctx)
+        elif ctx.resume_session_id:
+            # Self-heal: the workspace dir survived resume (was_recreated
+            # = False) so the needs_init block above skipped provisioning.
+            # But the host may have wiped the tmpdir between turns and
+            # recreated an empty dir before cckit ran (or otherwise left
+            # .claude/skills/ absent). Re-provision so the agent can still
+            # discover its skills on a resumed turn.
+            if self._agent_needs_skill_repair(agent, holder.workspace_dir):
+                await self._provision_agent_skills(agent, holder.workspace_dir)
+
+    @staticmethod
+    def _register_subagent_systems(
+            agent: Agent,
+            ctx: RunContext,
+            prepared_model: PreparedModelEndpoint,
+    ) -> None:
+        """Register sub-agent system signatures with the model bridge.
+
+        Sub-agent LLM observations then attach to the right
+        ``subagent.<name>`` span (vs. the main agent span). Each sub-agent has
+        a distinct instruction string, which the bridge fingerprints against
+        incoming requests.  Telemetry registration must never break a run.
+        """
+        if prepared_model.bridge is None or not agent.sub_agents:
+            return
+
+        sub_systems: dict[str, str] = {}
+        for sub in agent.sub_agents:
+            try:
+                sub_systems[sub.name] = sub.resolve_instruction(ctx) or ""
+            except Exception:
+                logger.debug(
+                    "Failed to resolve sub-agent instruction for %s",
+                    sub.name, exc_info=True,
+                )
+        if not sub_systems:
+            return
+        try:
+            prepared_model.bridge.register_subagent_systems(sub_systems)
+        except Exception:
+            logger.debug("bridge.register_subagent_systems failed", exc_info=True)
+
+    @staticmethod
+    def _build_cost_config_map(
+            model: ModelConfig,
+            extra_models: dict[str, ModelConfig],
+    ) -> dict[str, ModelConfig]:
+        """Map short model name → ModelConfig for cost recalculation."""
+
+        def _short(name: str) -> str:
+            return name.split("/")[-1] if "/" in name else name
+
+        all_configs: dict[str, ModelConfig] = {_short(model.model): model}
+        for sub_cfg in extra_models.values():
+            all_configs[_short(sub_cfg.model)] = sub_cfg
+        return all_configs
+
+    @staticmethod
+    def _build_result(
+            agent: Agent,
+            ctx: RunContext,
+            state: RunState,
+            *,
+            duration: float,
+    ) -> AgentResult:
+        """Assemble the final :class:`AgentResult` from the run state."""
+        final_message = state.final_message
+        if final_message is None:
+            return AgentResult(
+                task_id=ctx.task_id,
+                agent_type=agent.name,
+                status=TaskStatus.FAILED,
+                is_error=True,
+                error_message="SDK stream completed without a ResultMessage",
+                duration_seconds=round(duration, 2),
+                session_id=state.session_id,
+            )
+
+        output_text = final_message.result or ""
+        is_error = bool(final_message.is_error)
+        return AgentResult(
+            task_id=ctx.task_id,
+            agent_type=agent.name,
+            status=TaskStatus.FAILED if is_error else TaskStatus.COMPLETED,
+            output_text=output_text,
+            cost_usd=final_message.total_cost_usd or 0.0,
+            duration_seconds=round(duration, 2),
+            is_error=is_error,
+            error_message=output_text if is_error else "",
+            session_id=final_message.session_id or state.session_id,
+            stop_reason=final_message.stop_reason or "",
+            usage=final_message.usage,
+            structured_output=final_message.structured_output,
+            final_message=final_message,
+        )
+
+    async def _finalize_workspace(
+            self, ctx: RunContext, holder: _ResultHolder,
+    ) -> None:
+        """Suspend or delete the workspace according to the cleanup policy.
+
+        Policy:
+          - workspace.keep=True  → always suspend (caller wants to resume later)
+          - task failed          → suspend (preserve for debugging / resume)
+          - task succeeded       → cleanup (delete) by default
+        """
+        if not holder.workspace_dir:
+            return
+        should_suspend = (
+                ctx.workspace.keep
+                or holder.result is None
+                or holder.result.status != TaskStatus.COMPLETED
+        )
+        if should_suspend:
+            await self._workspace.suspend(holder.workspace_dir)
+        else:
+            await self._workspace.cleanup(holder.workspace_dir)
+
+    # ------------------------------------------------------------------
+    # Session persistence helpers (delegated to _engine.session_files)
     # ------------------------------------------------------------------
 
     @staticmethod
     def read_session(session_id: str, workspace_dir: Path) -> str | None:
         """Read a Claude Code session JSONL from ~/.claude/projects/."""
-        try:
-            from claude_agent_sdk._internal.sessions import (
-                _canonicalize_path,
-                _find_project_dir,
-            )
-            project_dir = _find_project_dir(_canonicalize_path(str(workspace_dir)))
-            if project_dir is None:
-                return None
-            session_file = project_dir / f'{session_id}.jsonl'
-            if session_file.exists():
-                return session_file.read_text(encoding='utf-8')
-        except Exception:
-            logger.debug('Failed to read session JSONL for %s', session_id, exc_info=True)
-        return None
+        return session_files.read_session(session_id, workspace_dir)
 
     @staticmethod
     def restore_session(session_id: str, workspace_dir: Path, content: str) -> None:
         """Restore a persisted session JSONL so --resume works."""
-        try:
-            from claude_agent_sdk._internal.sessions import (
-                _canonicalize_path,
-                _get_project_dir,
-            )
-            project_dir = _get_project_dir(_canonicalize_path(str(workspace_dir)))
-            project_dir.mkdir(parents=True, exist_ok=True)
-            session_file = project_dir / f'{session_id}.jsonl'
-            if not session_file.exists():
-                session_file.write_text(content, encoding='utf-8')
-                logger.info('Restored session JSONL for %s to %s', session_id, session_file)
-        except Exception:
-            logger.warning('Failed to restore session JSONL for %s', session_id, exc_info=True)
+        session_files.restore_session(session_id, workspace_dir, content)
 
     @staticmethod
     def read_session_dir(workspace_dir: Path) -> dict[str, bytes] | None:
-        """Read all session files from the project directory (recursively).
-
-        Returns ``{relative_posix_path: content}`` for every ``.jsonl``
-        and ``.meta.json`` file (including subagent files in
-        subdirectories), or *None* when the directory does not exist or
-        contains no files.
-        """
-        try:
-            from claude_agent_sdk._internal.sessions import (
-                _canonicalize_path,
-                _find_project_dir,
-            )
-            project_dir = _find_project_dir(_canonicalize_path(str(workspace_dir)))
-            if project_dir is None:
-                return None
-            files: dict[str, bytes] = {}
-            for entry in project_dir.rglob('*'):
-                if entry.is_file() and entry.suffix in ('.jsonl', '.json'):
-                    # Use forward-slash relative path as key to preserve
-                    # subdirectory structure (e.g. subagent sessions).
-                    rel = entry.relative_to(project_dir).as_posix()
-                    files[rel] = entry.read_bytes()
-            return files or None
-        except Exception:
-            logger.debug('Failed to read session dir for %s', workspace_dir, exc_info=True)
-        return None
+        """Read all session files from the project directory (recursively)."""
+        return session_files.read_session_dir(workspace_dir)
 
     @staticmethod
     def restore_session_dir(workspace_dir: Path, files: dict[str, bytes]) -> None:
-        """Restore multiple session files to the project directory.
-
-        Keys may contain forward-slash separated relative paths for
-        subagent files stored in subdirectories.  Parent directories are
-        created automatically.  Skips files that already exist
-        (idempotent).
-        """
-        try:
-            from claude_agent_sdk._internal.sessions import (
-                _canonicalize_path,
-                _get_project_dir,
-            )
-            project_dir = _get_project_dir(_canonicalize_path(str(workspace_dir)))
-            project_dir.mkdir(parents=True, exist_ok=True)
-            for name, content in files.items():
-                target = project_dir / name
-                target.parent.mkdir(parents=True, exist_ok=True)
-                if not target.exists():
-                    target.write_bytes(content)
-            logger.info(
-                'Restored %d session file(s) to %s', len(files), project_dir,
-            )
-        except Exception:
-            logger.warning(
-                'Failed to restore session dir for %s', workspace_dir, exc_info=True,
-            )
+        """Restore multiple session files to the project directory."""
+        session_files.restore_session_dir(workspace_dir, files)
 
     # ------------------------------------------------------------------
     # Model resolution
@@ -694,60 +644,12 @@ class Runner:
         *,
         is_sub_agent: bool = False,
     ) -> ModelConfig:
-        """Merge agent model_config with runner defaults.
-
-        ``ctx.model`` is a caller-level override intended for the **top-level**
-        agent only.  Sub-agents that declare their own ``model`` should honour
-        that declaration; ``ctx.model`` must NOT shadow it.
-        """
-        agent_model = agent.model_config
-        base = self._config.default_model
-        # ctx.model is only applied to the top-level agent, never to sub-agents
-        # that explicitly declare their own model.
-        override_model = (
-            ""
-            if is_sub_agent and agent_model is not None
-            else (ctx.model if ctx is not None else "").strip()
-        )
-
-        if agent_model is None:
-            if not override_model:
-                return base
-            return base.model_copy(update={"model": override_model})
-
-        return ModelConfig(
-            model=override_model or agent_model.model or base.model,
-            api_key=agent_model.api_key or base.api_key,
-            base_url=agent_model.base_url or base.base_url,
-            max_tokens=agent_model.max_tokens,
-            max_turns=agent_model.max_turns if agent_model.max_turns > 0 else base.max_turns,
-            timeout_seconds=agent_model.timeout_seconds or base.timeout_seconds,
-            # Thinking config: agent wins, else inherit runner default. Both the
-            # new ``thinking`` field and the deprecated ``disable_thinking`` flag
-            # are propagated so sub-agents keep their reasoning configuration.
-            thinking=agent_model.thinking or base.thinking,
-            disable_thinking=agent_model.disable_thinking or base.disable_thinking,
-            supports_vision=agent_model.supports_vision and base.supports_vision,
-            # Cost overrides use ``is None`` (not ``or``) so an explicit 0.0
-            # (free model) is honoured instead of being masked by the base's
-            # non-zero cost — ``0.0 or x`` would wrongly fall through to ``x``.
-            input_cost_per_token=(
-                agent_model.input_cost_per_token
-                if agent_model.input_cost_per_token is not None
-                else base.input_cost_per_token
-            ),
-            output_cost_per_token=(
-                agent_model.output_cost_per_token
-                if agent_model.output_cost_per_token is not None
-                else base.output_cost_per_token
-            ),
-            # Inherit gateway mode + platform static headers (dimension,
-            # feature-phase-name, …) from the runner default so sub-agent
-            # requests carry the same gateway routing/identity. The bridge
-            # derives a per-route ``custom-model-name`` from each sub's own
-            # model, so it is intentionally not part of extra_headers here.
-            cw_gateway=agent_model.cw_gateway or base.cw_gateway,
-            extra_headers=agent_model.extra_headers or dict(base.extra_headers),
+        """Merge agent model_config with runner defaults."""
+        return _resolve_model_config(
+            agent,
+            ctx,
+            self._config.default_model,
+            is_sub_agent=is_sub_agent,
         )
 
     def _resolve_sandbox(self, agent: Agent) -> SandboxOptions:
@@ -755,72 +657,26 @@ class Runner:
         return agent.sandbox_config or SandboxOptions()
 
     # ------------------------------------------------------------------
-    # Skill collection
+    # Skill collection (delegated to skill.planner)
     # ------------------------------------------------------------------
 
     @staticmethod
     def _collect_all_skills(agent: Agent) -> list[str]:
         """Collect deduplicated skill names from agent and its sub-agents."""
-        seen: set[str] = set()
-        result: list[str] = []
-        for name in agent.skills:
-            if name not in seen:
-                seen.add(name)
-                result.append(name)
-        for sub in agent.sub_agents:
-            for name in sub.skills:
-                if name not in seen:
-                    seen.add(name)
-                    result.append(name)
-        return result
+        return skill_planner.collect_all_skills(agent)
 
     async def _provision_agent_skills(
         self, agent: Agent, workspace_dir: Path,
     ) -> None:
-        """Provision all declared skills (top-level + sub-agents) into the
-        workspace's ``.claude/skills/``. No-op when the agent declares none.
-
-        Collects ALL skills across the agent tree first, then provisions
-        once — ``SkillProvisioner.provision()`` purges ``.claude/`` on each
-        call, so multiple calls would wipe earlier results.
-        """
-        all_skills = self._collect_all_skills(agent)
-        if not all_skills:
-            return
-        # Use the agent-level skills_dir if specified; otherwise fall back to
-        # the first sub-agent that declares one.
-        effective_dir = agent.skills_dir
-        if not effective_dir:
-            for sub in agent.sub_agents:
-                if sub.skills_dir:
-                    effective_dir = sub.skills_dir
-                    break
-        provisioner = (
-            SkillProvisioner(skills_dir=effective_dir)
-            if effective_dir
-            else self._skill_provisioner
+        """Provision all declared skills into the workspace's ``.claude/skills/``."""
+        await skill_planner.provision_agent_skills(
+            agent, workspace_dir, self._skill_provisioner,
         )
-        await provisioner.provision(all_skills, workspace_dir)
 
     @staticmethod
     def _agent_needs_skill_repair(agent: Agent, workspace_dir: Path) -> bool:
-        """True when the agent declares skills but any is missing from the
-        workspace's ``.claude/skills/``.
-
-        This detects a resumed turn whose workspace dir survived (so cckit
-        did not recreate it and skipped provisioning) yet the skills are
-        absent — typically because the host wiped the tmpdir between turns
-        and recreated an empty dir before cckit ran.
-        """
-        skills = Runner._collect_all_skills(agent)
-        if not skills:
-            return False
-        base = workspace_dir / ".claude" / "skills"
-        if not base.is_dir():
-            return True
-        return not all(
-            (base / name / "SKILL.md").is_file() for name in skills
-        )
+        """True when a declared skill is missing from the workspace."""
+        return skill_planner.needs_skill_repair(agent, workspace_dir)
 
     # ------------------------------------------------------------------
     # Context validation
@@ -852,48 +708,15 @@ class Runner:
         return missing
 
     # ------------------------------------------------------------------
-    # Middleware chain builder
+    # Delegating builders
     # ------------------------------------------------------------------
 
-    def _build_middleware_chain(
-            self,
-            ctx: RunContext,
-    ) -> Any:
+    def _build_middleware_chain(self, ctx: RunContext) -> Any:
         """Wrap ``run_sdk_query`` with the middleware stack.
 
         Returns a callable with signature ``(prompt, options, state)``.
         """
-
-        # The innermost function — actual SDK call
-        async def inner(
-                prompt: str, options: Any, state: Any
-        ) -> AsyncIterator[Any]:
-            async for message in run_sdk_query(prompt, options, state):
-                yield message
-
-        current = inner
-
-        # Wrap from inside out (last middleware wraps first)
-        for mw in reversed(self._middlewares):
-
-            def make_wrapper(middleware: Middleware, next_fn: Any) -> Any:
-                async def wrapper(
-                        prompt: str, options: Any, state: Any
-                ) -> AsyncIterator[Any]:
-                    async for message in middleware.wrap(
-                            next_fn, prompt, options, state, ctx
-                    ):
-                        yield message
-
-                return wrapper
-
-            current = make_wrapper(mw, current)
-
-        return current
-
-    # ------------------------------------------------------------------
-    # SDK options builder
-    # ------------------------------------------------------------------
+        return build_middleware_chain(self._middlewares, ctx)
 
     def _build_options(
             self,
@@ -908,411 +731,16 @@ class Runner:
             state: RunState,
     ) -> Any:
         """Construct ``ClaudeAgentOptions`` from Agent + RunContext + resolved model."""
-        from claude_agent_sdk import (  # noqa: WPS433
-            AgentDefinition,
-            ClaudeAgentOptions,
+        return build_options(
+            agent,
+            ctx,
+            model,
+            prepared_model,
+            sandbox,
+            permission_mode,
+            workspace_dir,
+            instruction,
+            state,
+            config=self._config,
+            resolve_model=self._resolve_model,
         )
-
-        # -- allowed tools --
-        allowed_tools = list(agent.tools)
-        if agent.sub_agents and "Agent" not in allowed_tools:
-            allowed_tools.append("Agent")
-        if agent.skills and "Skill" not in allowed_tools:
-            allowed_tools.append("Skill")
-
-        # -- sub-agents → SDK AgentDefinition --
-        agents: dict[str, AgentDefinition] = {}
-        for sub in agent.sub_agents:
-            # Auto-inject "Skill" tool for sub-agents that declare skills
-            sub_tools = list(sub.tools) if sub.tools else None
-            if sub.skills and sub_tools is not None and "Skill" not in sub_tools:
-                sub_tools.append("Skill")
-
-            # Resolve the model name that gets passed to AgentDefinition.
-            # When a bridge is active, sub-agents keep their full LiteLLM model
-            # name (e.g. "openai/gpt-4o-mini") so the bridge can route the
-            # request to the correct provider.  Without a bridge (all models use
-            # Anthropic), strip the LiteLLM prefix so the CLI receives a bare
-            # Anthropic model ID it understands (e.g. "claude-haiku-4-5").
-            sub_cfg = self._resolve_model(sub, ctx, is_sub_agent=True)
-            if prepared_model.bridge is not None:
-                # Bridge is active — keep the full model name for routing.
-                agent_model_name: str | None = sub_cfg.model
-            else:
-                # No bridge — all models are Anthropic.  Strip provider prefix
-                # so the CLI gets a native model ID (e.g. "claude-haiku-4-5").
-                sub_transport = resolve_model_transport(sub_cfg)
-                agent_model_name = sub_transport.model
-
-            sub_def = AgentDefinition(
-                description=sub.description,
-                prompt=sub.resolve_instruction(ctx),
-                tools=sub_tools,
-                disallowedTools=list(sub.disallowed_tools) if sub.disallowed_tools else None,
-                model=agent_model_name,
-                skills=list(sub.skills) if sub.skills else None,
-                mcpServers=(
-                    [
-                        {name: cfg} if isinstance(cfg, dict) else name
-                        for name, cfg in sub.mcp_servers.items()
-                    ]
-                    if sub.mcp_servers
-                    else None
-                ),
-                maxTurns=sub.max_turns if sub.max_turns > 0 else None,
-                effort=sub.effort,
-            )
-            agents[sub.name] = sub_def
-
-        # -- MCP servers --
-        mcp_servers = agent.mcp_servers
-
-        # -- sandbox --
-        # build() returns a unified settings JSON string (or None when disabled).
-        # ClaudeAgentOptions.sandbox must be None to avoid the SDK overwriting
-        # the sandbox section in settings JSON with a SandboxSettings TypedDict.
-        settings_json = SandboxConfigBuilder(
-            enabled=sandbox.enabled,
-            allow_write=list(sandbox.allow_write),
-            deny_write=list(sandbox.deny_write),
-            allow_read=list(sandbox.allow_read),
-            deny_read=list(sandbox.deny_read),
-            allowed_domains=list(sandbox.allowed_domains),
-            denied_domains=list(sandbox.denied_domains),
-            auto_allow_bash=sandbox.auto_allow_bash,
-            excluded_commands=list(sandbox.excluded_commands),
-            allow_unsandboxed_commands=sandbox.allow_unsandboxed_commands,
-            enable_weaker_nested_sandbox=sandbox.enable_weaker_nested_sandbox,
-        ).build(workspace_dir)
-
-        # -- environment (Agent subprocess only — NO git credentials) --
-        # Start from caller-provided env, then inject ContextConfig env vars,
-        # then let the resolved model endpoint override Anthropic transport
-        # settings. Bridge mode relies on this to force the CLI through the
-        # local compatibility server.
-        env: dict[str, str] = dict(ctx.env)
-
-        # -- ContextConfig → CLI env vars (auto-compact threshold, etc.) --
-        context_cfg = agent.context
-        if context_cfg is not None:
-            env.update(context_cfg.to_env())
-
-        # -- ModelConfig.max_tokens → CLAUDE_CODE_MAX_OUTPUT_TOKENS --
-        # When the user explicitly sets max_tokens on ModelConfig, propagate it
-        # to the Claude CLI subprocess so getMaxOutputTokensForModel() uses the
-        # same limit.  This is critical for CLAUDE_CODE_AUTO_COMPACT_WINDOW to
-        # work correctly: effectiveContextWindow = window - min(maxOutputTokens, 20000).
-        # With max_tokens=None (default) we leave CLAUDE_CODE_MAX_OUTPUT_TOKENS
-        # unset so the CLI falls back to its own model-specific defaults.
-        if model.max_tokens is not None:
-            env.setdefault("CLAUDE_CODE_MAX_OUTPUT_TOKENS", str(model.max_tokens))
-
-        if prepared_model.api_key:
-            # ANTHROPIC_API_KEY  → sent as X-Api-Key header (direct Anthropic API)
-            # ANTHROPIC_AUTH_TOKEN → sent as Authorization: Bearer header (LLM gateway / proxy)
-            # Both are injected so the CLI authenticates correctly regardless of
-            # whether the endpoint is a first-party Anthropic host or a third-party proxy.
-            env["ANTHROPIC_API_KEY"] = prepared_model.api_key
-            env["ANTHROPIC_AUTH_TOKEN"] = prepared_model.api_key
-        if prepared_model.base_url:
-            env["ANTHROPIC_BASE_URL"] = prepared_model.base_url
-            # Third-party proxies often reject Anthropic-specific beta headers
-            # and non-essential traffic (telemetry, autoupdater, etc.)
-            env.setdefault("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "0")
-            env.setdefault("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "0")
-            env.setdefault("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "0")
-            # Disable extended thinking — many proxies don't support it
-            env.setdefault("MAX_THINKING_TOKENS", "0")
-            # 打开agent team功能
-            env.setdefault("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1")
-
-        # -- env isolation: blank-out os.environ keys not in the explicit env dict --
-        # The SDK's SubprocessCLITransport unconditionally inherits the host
-        # process's os.environ before merging options.env on top.  Since
-        # options.env is merged last, writing "" for every host variable that
-        # is NOT explicitly allowed effectively clears its value in the CLI
-        # subprocess (and transitively in every Bash child it spawns).
-        #
-        # Limitation: the variable name is still visible via `env`; only the
-        # value is wiped.  This is the best we can do within the SDK's
-        # dict[str, str] interface (None / unset is not supported upstream).
-        #
-        # _AGENT_ENV_PASSTHROUGH: variables that must be inherited as-is from the
-        # host process so that basic shell tooling (ls, git, python, node …) works
-        # correctly inside the Claude CLI subprocess.
-        _AGENT_ENV_PASSTHROUGH: frozenset[str] = frozenset(
-            {
-                # --- shell / filesystem ---
-                "PATH",  # binary lookup — without this ls/git/python are gone
-                "HOME",  # many tools write config to $HOME
-                "USER",  # username (git author, some CLIs)
-                "LOGNAME",  # POSIX alias of USER
-                "SHELL",  # default shell for subprocess spawning
-                "TERM",  # terminal type (colour output, readline)
-                "LANG",  # locale — affects sort order, file encoding
-                "LC_ALL",  # overrides all LC_* at once
-                "LC_CTYPE",  # character classification / encoding
-                "TMPDIR",  # POSIX temp dir ($TMPDIR on macOS)
-                "TMP",  # Windows / some Linux tools
-                "TEMP",  # Windows alias
-                "PWD",  # current working directory
-                "OLDPWD",  # previous directory (cd -)
-                "SHLVL",  # shell nesting counter
-                # --- Python runtime (Claude CLI runs on Node but subprocesses may use py) ---
-                "PYTHONPATH",  # extra Python module search paths
-                "PYTHONUNBUFFERED",  # flush stdout/stderr immediately
-                "VIRTUAL_ENV",  # active venv (affects pip, python binary)
-                # --- Node.js / Claude CLI runtime ---
-                "NODE_PATH",  # Node module search path
-                "NODE_OPTIONS",  # Node JVM flags
-                "NVM_DIR",  # nvm installation root
-                "NVM_BIN",  # nvm active bin dir
-                # --- git ---
-                "GIT_AUTHOR_NAME",
-                "GIT_AUTHOR_EMAIL",
-                "GIT_COMMITTER_NAME",
-                "GIT_COMMITTER_EMAIL",
-                "GIT_SSH_COMMAND",  # custom SSH wrapper for git
-                "GIT_CONFIG_GLOBAL",
-                "GIT_CONFIG_NOSYSTEM",
-                # --- Claude Code internals ---
-                "CLAUDE_CONFIG_DIR",
-                "CLAUDE_CODE_TMPDIR",
-                # --- Windows system variables ---
-                # The bundled Claude Code CLI (>= 2.x, shipped with
-                # claude-agent-sdk 0.2.x) crashes with STATUS_STACK_BUFFER_OVERRUN
-                # (0xC0000409) when these are blanked to "". The older 1.x CLI
-                # tolerated empty values; 2.x does not. These are non-secret
-                # system identifiers (system root, processor, standard dirs) and
-                # must be inherited as-is on Windows so the CLI subprocess can
-                # initialise. They are absent on macOS/Linux, so listing them is
-                # harmless there.
-                "SYSTEMROOT",  # %SystemRoot% — required by the Windows C runtime
-                "WINDIR",  # %WinDir% — Windows directory
-                "COMSPEC",  # %ComSpec% — default shell (cmd.exe) path
-                "OS",  # "Windows_NT"
-                "PROCESSOR_ARCHITECTURE",
-                "PROCESSOR_IDENTIFIER",
-                "PROCESSOR_LEVEL",
-                "PROCESSOR_REVISION",
-                "NUMBER_OF_PROCESSORS",
-                # --- Windows user / app directories ---
-                "USERPROFILE",  # Windows home directory (equivalent of $HOME)
-                "APPDATA",  # roaming app data (CLI writes config here)
-                "LOCALAPPDATA",  # local app data
-                "HOMEDRIVE",  # drive of user home, e.g. "C:"
-                "HOMEPATH",  # path of user home, e.g. "\Users\name"
-                "PROGRAMDATA",  # all-users app data
-                "ALLUSERSPROFILE",  # alias of PROGRAMDATA on some Windows
-                "PROGRAMFILES",  # 64-bit Program Files
-                "PROGRAMFILES(X86)",  # 32-bit Program Files
-                "COMMONPROGRAMFILES",
-                "COMMONPROGRAMFILES(X86)",
-                "PUBLIC",  # %PUBLIC% shared user directory
-                # --- plugin-declared business env (not statically discoverable) ---
-                # Agent/Spec/ContextConfig declare no "required env names" field;
-                # plugins inject these via ContextProvider at runtime (os.environ
-                # or ctx.env). Listing them here keeps the isolation loop from
-                # blanking them so the agent subprocess + subagents inherit them.
-                # See EvaluatorContextProvider in output/ui_rubric_evaluator/context.py.
-                # NOTE: append new plugin env var names here as plugins are added;
-                # alternatively write them into RunContext.env, which is auto-passthrough.
-                "PLAYWRIGHT_LIVE_SESSION",  # browser subagent live session id
-                "WAVE_EVALUATION_RUBRIC_DIR",  # rubric pack abs path
-                "WAVE_EVALUATION_OUTPUT_DIR",  # evaluation output dir
-            }
-        )
-        # ctx.env keys are plugin-declared and explicitly forwarded — treat them
-        # as passthrough too so the isolation loop never blanks them. (env already
-        # contains ctx.env via dict(ctx.env) above, so this is a semantic guard:
-        # it makes the intent explicit and survives any future reordering.)
-        _ctx_env_keys = frozenset(ctx.env.keys())
-        for _k in os.environ:
-            if _k not in env and _k not in _AGENT_ENV_PASSTHROUGH and _k not in _ctx_env_keys:
-                env[_k] = ""
-
-        # -- configurable SDK params --
-        max_turns = agent.max_turns if agent.max_turns > 0 else model.max_turns
-
-        # -- assemble --
-        def _stderr_cb(line: str) -> None:
-            state.observe_stderr(line)
-            logger.debug("[CLI stderr] %s", line.rstrip())
-
-        system_prompt: dict[str, str] = {
-            "type": "preset",
-            "preset": "claude_code",
-        }
-        if instruction:
-            system_prompt["append"] = instruction
-
-        opts = ClaudeAgentOptions(
-            system_prompt=system_prompt,
-            max_turns=max_turns,
-            model=prepared_model.model,
-            # When sandbox is enabled, switch to dontAsk so that permissions.deny
-            # rules are enforced. bypassPermissions skips all permission checks
-            # (including deny rules) and is only safe inside pre-isolated envs.
-            # Otherwise honor the effective permission mode (which may already
-            # have been downgraded from bypassPermissions to dontAsk when
-            # running as root — see Runner._execute).
-            permission_mode=(
-                "dontAsk"
-                if sandbox.enabled
-                else permission_mode
-            ),
-            env=env,
-            stderr=_stderr_cb,
-            sandbox=None,
-            settings=settings_json,
-            extra_args={"debug-to-stderr": None},
-            user=ctx.user,
-            include_partial_messages=ctx.include_partial_messages,
-        )
-
-        if allowed_tools and allowed_tools != []:
-            opts.tools = allowed_tools
-            opts.allowed_tools = allowed_tools
-
-        # Set optional fields only when non-empty (SDK may reject empty dicts)
-        if agents:
-            opts.agents = agents
-        if mcp_servers:
-            opts.mcp_servers = mcp_servers
-        if workspace_dir:
-            opts.cwd = str(workspace_dir)
-
-        # -- skills: enable SDK filesystem-based skill discovery --
-        # Always set setting_sources explicitly to avoid SDK passing an empty
-        # string for ``--setting-sources`` when the value is ``None``.  On
-        # Windows the empty-string argument is silently dropped by the OS,
-        # causing the CLI to swallow the next flag as the option value and
-        # ultimately time-out.  "local" is the safe default (no project-level
-        # settings); "project" enables skill discovery from ``.claude/``.
-        any_skills = agent.skills or any(sub.skills for sub in agent.sub_agents)
-        opts.setting_sources = cast(
-            list[Literal["user", "project", "local"]],
-            ["user", "project", "local"],
-        )
-
-        # -- resume: restore a previous session's conversation context --
-        if ctx.resume_session_id:
-            opts.resume = ctx.resume_session_id
-            opts.fork_session = ctx.fork_session
-
-        # -- resume implies continue_conversation (unless forking) --
-        if ctx.resume_session_id and not ctx.fork_session:
-            opts.continue_conversation = True
-
-        # -- pluggable session store (optional) --
-        # Per-run value takes precedence over the runner-level default. When
-        # both are None (the default), opts.session_store is left unset so the
-        # SDK falls back to its built-in ~/.claude/projects/ file persistence —
-        # identical to prior behavior. Flush defaults to "eager" (safest for
-        # single-shot runs); override via ctx/RunnerConfig.session_store_flush
-        # = "batched" for higher throughput.
-        session_store = ctx.session_store or self._config.session_store
-        if session_store is not None:
-            opts.session_store = session_store
-            flush = ctx.session_store_flush or self._config.session_store_flush or "eager"
-            opts.session_store_flush = flush
-
-        # -- Claude native hooks --
-        if agent.hooks:
-            opts.hooks = agent.hooks  # type: ignore[assignment]
-
-        # -- task budget --
-        if agent.task_budget is not None:
-            from claude_agent_sdk.types import TaskBudget  # noqa: WPS433
-            opts.task_budget = TaskBudget(total=agent.task_budget.total)
-
-        # -- effort (top-level agent) --
-        # Historically agent.effort was only passed to sub-agents
-        # (AgentDefinition.effort) and dropped for the main session. Wire it
-        # into the top-level options too. Default None leaves opts.effort unset
-        # (SDK default), so existing behavior is unchanged when not specified.
-        if agent.effort:
-            opts.effort = agent.effort
-
-        # -- thinking (direct-Anthropic CLI path) --
-        # Priority: ModelConfig.thinking > deprecated disable_thinking > unset.
-        # The LiteLLM bridge path handles disable_thinking separately
-        # (model_bridge.py sets kwargs["thinking"] on the HTTP request); this
-        # only governs the CLI subprocess via opts.thinking. Both paths are
-        # non-conflicting. Default (None + disable_thinking=False) leaves
-        # opts.thinking unset, matching prior behavior.
-        thinking_cfg = getattr(model, "thinking", None)
-        if thinking_cfg is None and getattr(model, "disable_thinking", False):
-            from cckit.types import ThinkingConfig  # noqa: WPS433
-            thinking_cfg = ThinkingConfig.disabled()
-        if thinking_cfg is not None:
-            opts.thinking = thinking_cfg.to_sdk()
-
-        # -- custom permission handler (can_use_tool) --
-        if agent.permission_handler is not None:
-            opts.can_use_tool = agent.permission_handler
-
-        # -- structured output --
-        if agent.output_format:
-            opts.output_format = agent.output_format
-
-        # -- USD budget hard cap --
-        if agent.max_budget_usd is not None:
-            opts.max_budget_usd = agent.max_budget_usd
-
-        # -- SDK beta features (e.g. 1M context) --
-        if agent.betas:
-            opts.betas = list(agent.betas)
-
-        # -- local plugins --
-        if agent.plugins:
-            opts.plugins = [
-                p if isinstance(p, dict) else {"type": "local", "path": p}
-                for p in agent.plugins
-            ]
-
-        # -- log agent startup configuration --
-        _safe_env = {
-            k: ("***" if any(s in k.upper() for s in
-                             ("API_KEY", "AUTH_TOKEN", "SECRET", "PASSWORD", "_AUTH", "GPG_KEY", "INVITE_CODE")) else v)
-            for k, v in env.items()
-        }
-        logger.info(
-            "Agent startup config: name=%s task_id=%s model=%s "
-            "permission_mode=%s max_turns=%d workspace=%s "
-            "tools=%s sub_agents=%s skills=%s "
-            "sandbox_enabled=%s env_keys=%s",
-            agent.name,
-            ctx.task_id,
-            prepared_model.model,
-            opts.permission_mode,
-            max_turns,
-            str(workspace_dir) if workspace_dir else None,
-            allowed_tools,
-            list(agents.keys()) if agents else [],
-            agent.skills or [],
-            sandbox.enabled,
-            _safe_env,
-        )
-
-        # -- log each sub-agent's configuration --
-        for sub in agent.sub_agents:
-            sub_def = agents.get(sub.name)
-            sub_cfg = self._resolve_model(sub, ctx, is_sub_agent=True)
-            logger.info(
-                "  Sub-agent config: name=%s model=%s "
-                "description=%s tools=%s disallowed_tools=%s "
-                "skills=%s max_turns=%s effort=%s "
-                "mcp_servers=%s",
-                sub.name,
-                sub_def.model if sub_def else sub_cfg.model,
-                sub.description or "(none)",
-                sub_def.tools if sub_def else sub.tools,
-                sub_def.disallowedTools if sub_def else sub.disallowed_tools,
-                sub_def.skills if sub_def else sub.skills,
-                sub_def.maxTurns if sub_def else sub.max_turns,
-                sub_def.effort if sub_def else sub.effort,
-                list(sub.mcp_servers.keys()) if sub.mcp_servers else [],
-            )
-
-        return opts
