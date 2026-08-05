@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -104,6 +105,15 @@ class Runner:
         # to control all cckit.* child loggers uniformly.
         _level = getattr(logging, self._config.log_level.upper(), logging.INFO)
         logging.getLogger("cckit").setLevel(_level)
+
+        # LiteLLM's own loggers default to DEBUG and emit a line per
+        # completion() call, which floods the stream when cckit runs at INFO.
+        # Align them with the configured log_level so one setting governs the
+        # whole run. LITELLM_LOG is LiteLLM's documented override: when the
+        # caller set it explicitly, leave their choice alone.
+        if not os.environ.get("LITELLM_LOG"):
+            for _name in ("LiteLLM", "LiteLLM Router", "LiteLLM Proxy"):
+                logging.getLogger(_name).setLevel(_level)
         self._middlewares: list[Middleware] = middlewares or []
         self._preflight_check = preflight_check
 

@@ -19,6 +19,21 @@ logger = logging.getLogger(__name__)
 
 TRACE_MAX = 2000
 
+# SystemMessage subtypes that fire at near-token frequency and carry no
+# diagnostic payload. Dropped from tracing entirely at any log level.
+NOISY_SYSTEM_SUBTYPES: frozenset[str] = frozenset(
+    {
+        "thinking_tokens",  # emitted per reasoning step — tens per turn
+        "background_tasks_changed",  # internal task-registry bookkeeping
+    }
+)
+
+# Tools whose input is a full sub-agent prompt (hundreds of lines). The prompt
+# is already visible in the startup sub-agent config, so trace only enough to
+# identify which invocation this is.
+_PROMPT_HEAVY_TOOLS: frozenset[str] = frozenset({"Agent", "Task"})
+_PROMPT_HEAVY_INPUT_MAX = 200
+
 
 def patch_result_message_costs(
         message: Any,
@@ -102,6 +117,37 @@ def render_content(content: Any) -> str:
     return truncate(str(content))
 
 
+def _log_system_message(message: Any, task: str) -> None:
+    """Log one ``SystemMessage``, keeping INFO reserved for ``init``.
+
+    Only the ``init`` subtype carries the CLI's own view of what got wired up
+    (mcp_servers, tools, model) — the ground truth to compare against the
+    startup config.  Every other subtype has an empty ``data`` for those keys,
+    so printing them at INFO produced a stream of ``mcp_servers=None
+    tools=None model=None`` lines that drown out the useful ones.
+
+    High-frequency internal subtypes (``thinking_tokens`` fires per reasoning
+    step) are dropped entirely rather than merely demoted — they carry no
+    diagnostic content at any level.
+    """
+    subtype = getattr(message, "subtype", None)
+    if subtype in NOISY_SYSTEM_SUBTYPES:
+        return
+
+    data = getattr(message, "data", None)
+    if subtype == "init" and isinstance(data, dict):
+        logger.info(
+            "[%s] system subtype=%s mcp_servers=%s tools=%s model=%s",
+            task,
+            subtype,
+            truncate(repr(data.get("mcp_servers")), 800),
+            truncate(repr(data.get("tools")), 800),
+            data.get("model"),
+        )
+    else:
+        logger.debug("[%s] system subtype=%s", task, subtype)
+
+
 def log_sdk_message(message: Any, ctx: RunContext) -> None:
     """Log one SDK message: tool uses, tool results, assistant text, result.
 
@@ -118,12 +164,18 @@ def log_sdk_message(message: Any, ctx: RunContext) -> None:
             for block in blocks:
                 btype = type(block).__name__
                 if btype == "ToolUseBlock":
+                    tool_name = getattr(block, "name", "?")
+                    limit = (
+                        _PROMPT_HEAVY_INPUT_MAX
+                        if tool_name in _PROMPT_HEAVY_TOOLS
+                        else TRACE_MAX
+                    )
                     logger.info(
                         "[%s] tool_use name=%s id=%s input=%s",
                         task,
-                        getattr(block, "name", "?"),
+                        tool_name,
                         getattr(block, "id", "?"),
-                        truncate(repr(getattr(block, "input", None))),
+                        truncate(repr(getattr(block, "input", None)), limit),
                     )
                 elif btype == "ToolResultBlock":
                     content = getattr(block, "content", None)
@@ -156,23 +208,7 @@ def log_sdk_message(message: Any, ctx: RunContext) -> None:
                 getattr(message, "total_cost_usd", None),
             )
         elif kind == "SystemMessage":
-            data = getattr(message, "data", None)
-            if isinstance(data, dict):
-                # The init message carries the CLI's own view of what got wired
-                # up (mcp_servers, tools, model) — the ground truth to compare
-                # against the startup config logged above.
-                logger.info(
-                    "[%s] system subtype=%s mcp_servers=%s tools=%s model=%s",
-                    task,
-                    getattr(message, "subtype", None),
-                    truncate(repr(data.get("mcp_servers")), 800),
-                    truncate(repr(data.get("tools")), 800),
-                    data.get("model"),
-                )
-            else:
-                logger.info(
-                    "[%s] system subtype=%s", task, getattr(message, "subtype", None),
-                )
+            _log_system_message(message, task)
     except Exception:  # noqa: BLE001 - tracing must never break a run
         logger.debug("SDK message tracing failed", exc_info=True)
 
