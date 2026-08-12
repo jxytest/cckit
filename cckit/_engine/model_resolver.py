@@ -38,6 +38,21 @@ def resolve_model(
             return base
         return base.model_copy(update={"model": override_model})
 
+    # Sub-agent vision gate ("连坐"). A sub-agent that passed a bare model
+    # string (or inherits) is "undeclared" → its supports_vision is AND-gated
+    # by the base (main) model so images are stripped whenever the main model
+    # can't handle them — conservative default. A sub-agent that passed an
+    # explicit ModelConfig has declared its own capabilities, so
+    # ``supports_vision`` is honoured directly (NOT gated): this makes
+    # supports_vision symmetric with the model name (both come from the
+    # sub-agent's own config), and lets a dedicated vision sub-agent keep
+    # vision even when the main model is non-vision (e.g. main=flash text-only,
+    # vision sub-agent=vision-capable model).
+    if getattr(agent, "_model_explicitly_configured", False):
+        resolved_supports_vision = agent_model.supports_vision
+    else:
+        resolved_supports_vision = agent_model.supports_vision and base.supports_vision
+
     return ModelConfig(
         model=override_model or agent_model.model or base.model,
         api_key=agent_model.api_key or base.api_key,
@@ -50,7 +65,7 @@ def resolve_model(
         # are propagated so sub-agents keep their reasoning configuration.
         thinking=agent_model.thinking or base.thinking,
         disable_thinking=agent_model.disable_thinking or base.disable_thinking,
-        supports_vision=agent_model.supports_vision and base.supports_vision,
+        supports_vision=resolved_supports_vision,
         # Cost overrides use ``is None`` (not ``or``) so an explicit 0.0
         # (free model) is honoured instead of being masked by the base's
         # non-zero cost — ``0.0 or x`` would wrongly fall through to ``x``.

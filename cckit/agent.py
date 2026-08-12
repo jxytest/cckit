@@ -210,6 +210,13 @@ class Agent:
         self.plugins: list[str | dict[str, Any]] | None = plugins
 
         # Normalize model → ModelConfig | None
+        # Track whether the caller passed an explicit ModelConfig (vs a bare
+        # model string or None). model_resolver uses this to decide whether
+        # the agent's ``supports_vision`` is an explicit capability declaration
+        # (honoured directly) or an implicit default (AND-gated by the runner
+        # main model — the "连坐" conservative behaviour for bare-string
+        # sub-agents). See resolve_model.
+        self._model_explicitly_configured: bool = isinstance(model, ModelConfig)
         if model is None:
             self._model_config: ModelConfig | None = None
         elif isinstance(model, str):
