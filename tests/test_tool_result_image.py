@@ -19,6 +19,7 @@ import pytest
 from cckit._engine._patches.tool_result_image import (
     _IMAGE_MOVED_PLACEHOLDER,
     _extract_image_url,
+    _flatten_text_only_content,
     _relocate_tool_result_images,
     apply_tool_result_image_patch,
 )
@@ -273,5 +274,116 @@ def test_patch_composes_with_deepseek_patch(adapter) -> None:
         part.get("type") == "image_url"
         for m in result
         if isinstance(m.get("content"), list)
+        for part in m["content"]
+    )
+
+
+# ── text-only tool results must reach the model as a string ───────
+
+
+def test_flattens_multi_text_tool_result() -> None:
+    """A Task sub-agent returns description + agentId — two text blocks."""
+    msg = {
+        "role": "tool",
+        "tool_call_id": "call_A",
+        "content": [
+            {"type": "text", "text": "the description"},
+            {"type": "text", "text": "agentId: abc"},
+        ],
+    }
+
+    assert _flatten_text_only_content(msg) is True
+    assert msg["content"] == "the description\n\nagentId: abc"
+    assert msg["tool_call_id"] == "call_A"
+
+
+def test_flattens_single_text_tool_result() -> None:
+    msg = {"role": "tool", "content": [{"type": "text", "text": "only"}]}
+
+    assert _flatten_text_only_content(msg) is True
+    assert msg["content"] == "only"
+
+
+@pytest.mark.parametrize(
+    ("name", "message"),
+    [
+        ("already a string", {"role": "tool", "content": "plain"}),
+        ("empty list", {"role": "tool", "content": []}),
+        ("non-tool role", {"role": "user", "content": [{"type": "text", "text": "x"}]}),
+        (
+            "contains an image",
+            {
+                "role": "tool",
+                "content": [
+                    {"type": "text", "text": "here:"},
+                    {"type": "image_url", "image_url": {"url": _PNG_URI}},
+                ],
+            },
+        ),
+        (
+            "image only",
+            {"role": "tool", "content": [{"type": "image_url", "image_url": {"url": _PNG_URI}}]},
+        ),
+    ],
+)
+def test_flatten_leaves_other_shapes_alone(name: str, message: dict) -> None:
+    before = repr(message)
+    assert _flatten_text_only_content(message) is False, name
+    assert repr(message) == before, f"{name}: message was mutated"
+
+
+def test_flatten_is_idempotent() -> None:
+    msg = {"role": "tool", "content": [{"type": "text", "text": "a"}]}
+
+    assert _flatten_text_only_content(msg) is True
+    assert _flatten_text_only_content(msg) is False
+    assert msg["content"] == "a"
+
+
+def test_end_to_end_subagent_text_result_reaches_model(adapter) -> None:
+    """The Task sub-agent regression: two text blocks must arrive as a string."""
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "look at it"}]},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "call_1", "name": "Task", "input": {}}],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call_1",
+                    "content": [
+                        {"type": "text", "text": "full description"},
+                        {"type": "text", "text": "agentId: abc <usage>…</usage>"},
+                    ],
+                },
+            ],
+        },
+    ]
+
+    result = adapter.translate_anthropic_messages_to_openai(messages)
+
+    tool_messages = [m for m in result if m.get("role") == "tool"]
+    assert len(tool_messages) == 1
+    content = tool_messages[0]["content"]
+    assert isinstance(content, str), "text result stayed a list; providers read it as empty"
+    assert "full description" in content
+    assert "agentId: abc" in content
+
+
+def test_end_to_end_image_result_still_relocates(adapter) -> None:
+    """Flattening must not undo the image relocation."""
+    result = adapter.translate_anthropic_messages_to_openai(
+        _anthropic_messages(_IMAGE_BLOCK),
+    )
+
+    tool_messages = [m for m in result if m.get("role") == "tool"]
+    assert tool_messages[0]["content"] == _IMAGE_MOVED_PLACEHOLDER
+    assert any(
+        part.get("type") == "image_url"
+        for m in result
+        if m.get("role") == "user" and isinstance(m.get("content"), list)
         for part in m["content"]
     )

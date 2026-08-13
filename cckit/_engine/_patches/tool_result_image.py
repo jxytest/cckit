@@ -1,8 +1,12 @@
-"""Tool-result image fix — keep single-image tool results visible as images.
+"""Tool-result fixes — keep tool output visible to OpenAI-compatible models.
 
-LiteLLM's ``translate_anthropic_messages_to_openai`` flattens a
-``tool_result`` whose content list holds exactly **one** ``image`` block into
-a plain data-URI **string**::
+Two related defects in LiteLLM's ``translate_anthropic_messages_to_openai``,
+both of which end with the model insisting a tool returned nothing.
+
+Defect 1 — a single image block is flattened to text
+----------------------------------------------------
+A ``tool_result`` whose content list holds exactly **one** ``image`` block
+becomes a plain data-URI **string**::
 
     # transformation.py (single-item branch)
     tool_result = ChatCompletionToolMessage(
@@ -28,10 +32,38 @@ This is the exact path taken by the Claude Code CLI's ``Read`` tool on a
 local image file, which is how cckit's vision sub-agent looks at
 screenshots.
 
-We follow pull/34462's shape rather than pull/25476's: structuring the tool
-message in place (``content=[{"type": "image_url", ...}]``) is enough for
-some providers but **not** for others.  Measured against the NetEase gateway
-on 2026-08-13 with an image whose watermark text is unguessable:
+Defect 2 — list-shaped text results are dropped entirely
+---------------------------------------------------------
+A ``tool_result`` carrying **text** blocks is translated to a ``role:"tool"``
+message whose ``content`` is a *list* of ``{"type": "text"}`` parts.  That is
+legal OpenAI schema, but several providers only read a plain string there and
+treat the list as an empty result.  Measured on the NetEase gateway
+(2026-08-13), asking the model to echo a token returned by a tool:
+
+===================================  ==========  =================
+``role:"tool"`` content shape        qwen3.8-max  claude-sonnet-4-6
+===================================  ==========  =================
+``"TOKEN"``                          sees it      sees it
+``[{"type":"text","text":"TOKEN"}]`` sees it      **blind**
+two ``text`` parts                   sees it      **blind**
+===================================  ==========  =================
+
+This is what a cckit ``Task`` sub-agent returns: its description plus a
+trailing ``agentId``/``<usage>`` part — two text blocks.  The sub-agent runs
+fine and returns a full answer, the main agent reports "the sub-agent didn't
+return output", retries, and eventually tells the user the feature is
+broken.  Flattening pure-text parts into one string fixes it, and matches
+what the single-text-block branch upstream already produces.
+
+Only *pure text* lists are joined; anything carrying an image keeps its list
+shape (it has to — see the relocation below).
+
+Why images move to a ``user`` message
+--------------------------------------
+For defect 1 we follow pull/34462's shape rather than pull/25476's:
+structuring the tool message in place (``content=[{"type": "image_url",
+…}]``) is enough for some providers but **not** for others.  Same gateway,
+same day, with an image whose watermark text is unguessable:
 
 ===========================================  ==========  =================
 tool_result shape                            qwen3.8-max  claude-sonnet-4-6
@@ -40,13 +72,6 @@ bare data-URI string (the bug)               blind        blind
 ``[{"type": "image_url", …}]`` in ``tool``   **sees it**  blind
 image moved to a following ``user`` message  **sees it**  **sees it**
 ===========================================  ==========  =================
-
-Worse than blind, a model that gets the in-``tool`` form reports the tool as
-having returned nothing — it goes on to retry ``Read``, call the vision
-sub-agent again, and finally tell the user it cannot see images, even though
-the sub-agent did return a full description.  Only the relocated form works
-across providers, which is why the placeholder + user-message dance below is
-not gratuitous.
 
 Upstream status (checked 2026-08-13, still unfixed on 1.96.2)
 ------------------------------------------------------------
@@ -60,8 +85,9 @@ Upstream status (checked 2026-08-13, still unfixed on 1.96.2)
   them entirely); still open against ``litellm_internal_staging``.  This is
   the behaviour reproduced here.
 
-Should upstream land pull/34462, this patch becomes redundant and can be
-deleted outright.
+Defect 2 has no upstream ticket that we could find; the list shape is valid
+per the OpenAI schema, so it is arguably a provider-side limitation rather
+than a LiteLLM bug.  Flattening is safe either way.
 
 Note this fixes the **chat/completions** adapter path only.  The
 Responses-API path (``responses/`` prefixed models) drops tool images
@@ -112,6 +138,36 @@ def _extract_image_url(msg: Any) -> str | None:
                 return url
 
     return None
+
+
+def _flatten_text_only_content(msg: Any) -> bool:
+    """Join a ``role:"tool"`` message whose content is only text parts.
+
+    Some providers (claude-sonnet-4-6 behind the NetEase gateway, measured
+    2026-08-13) read ``role:"tool"`` content only when it is a plain string
+    and report an empty tool result for the list form.  A cckit ``Task``
+    sub-agent always hits this: it returns its answer plus a trailing
+    ``agentId``/``<usage>`` part, i.e. two text blocks.
+
+    Returns ``True`` when the message was flattened.  Lists holding anything
+    other than text (notably images) are left alone.
+    """
+    if not isinstance(msg, dict) or msg.get("role") != "tool":
+        return False
+
+    content = msg.get("content")
+    if not isinstance(content, list) or not content:
+        return False
+
+    texts: list[str] = []
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") != "text":
+            return False
+        text = part.get("text")
+        texts.append(text if isinstance(text, str) else "")
+
+    msg["content"] = "\n\n".join(texts)
+    return True
 
 
 def _relocate_tool_result_images(messages: list) -> int:
@@ -179,16 +235,23 @@ def apply_tool_result_image_patch() -> None:
     def _patched_translate(self: Any, messages: list, model: str | None = None) -> list:
         result = _original(self, messages, model=model)
         # Best-effort: a defect here would break every request, so never let
-        # the relocation itself raise on the LLM critical path.
+        # these repairs raise on the LLM critical path.
         try:
+            # Relocate first: it replaces an image tool message's content with
+            # a plain string, so nothing is left for the flattener to touch.
             moved = _relocate_tool_result_images(result)
             if moved:
                 logger.debug(
                     "Relocated %d tool_result image(s) into a following user message",
                     moved,
                 )
+            flattened = sum(1 for m in result if _flatten_text_only_content(m))
+            if flattened:
+                logger.debug(
+                    "Flattened %d text-only tool_result(s) to a plain string", flattened,
+                )
         except Exception:
-            logger.debug("tool_result image relocation raised", exc_info=True)
+            logger.debug("tool_result repair raised", exc_info=True)
         return result
 
     LiteLLMAnthropicMessagesAdapter.translate_anthropic_messages_to_openai = (
