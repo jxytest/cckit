@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Claude Agent Builder — build multi-agent systems on Claude CLI"
 requires-python = ">=3.12"
 dependencies = [
-    "claude-agent-sdk==0.2.130",
+    "claude-agent-sdk==0.2.151",
     # Pinned: the bridge monkey-patches LiteLLM adapter internals
     # (cckit/_engine/_patches/). Those patches bind to private methods whose
     # signatures drift between releases — 1.96.2, for one, adds
