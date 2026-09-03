@@ -47,7 +47,8 @@ def build_options(
     """
     from claude_agent_sdk import ClaudeAgentOptions  # noqa: WPS433
 
-    allowed_tools = _build_allowed_tools(agent)
+    tools = _build_tools(agent)
+    allowed_tools = _build_allowed_tools(agent, tools)
     agents = _build_sub_agent_definitions(agent, ctx, prepared_model, resolve_model)
     mcp_servers = agent.mcp_servers
     _warn_on_unregistered_mcp_servers(agent, allowed_tools, mcp_servers)
@@ -99,8 +100,9 @@ def build_options(
         include_partial_messages=ctx.include_partial_messages,
     )
 
-    if allowed_tools and allowed_tools != []:
-        opts.tools = allowed_tools
+    if tools and tools != []:
+        opts.tools = tools
+    if allowed_tools:
         opts.allowed_tools = allowed_tools
 
     # Set optional fields only when non-empty (SDK may reject empty dicts)
@@ -139,14 +141,30 @@ def build_options(
 # ----------------------------------------------------------------------
 
 
-def _build_allowed_tools(agent: Agent) -> list[str]:
-    """Agent tools plus the implicit tools its capabilities require."""
-    allowed_tools = list(agent.tools)
-    if agent.sub_agents and "Agent" not in allowed_tools:
-        allowed_tools.append("Agent")
-    if agent.skills and "Skill" not in allowed_tools:
-        allowed_tools.append("Skill")
-    return allowed_tools
+def _build_tools(agent: Agent) -> list[str]:
+    """Agent's visible tool set: declared tools plus the implicit tools its
+    capabilities require (``Agent`` for delegation, ``Skill`` for skills)."""
+    tools = list(agent.tools)
+    if agent.sub_agents and "Agent" not in tools:
+        tools.append("Agent")
+    if agent.skills and "Skill" not in tools:
+        tools.append("Skill")
+    return tools
+
+
+def _build_allowed_tools(agent: Agent, tools: list[str]) -> list[str]:
+    """Permission allow-list = visible tools ∪ ``agent.allowed_tools`` (deduped).
+
+    ``agent.allowed_tools`` lets a top-level agent auto-approve extra tool names
+    (e.g. a sub-agent's ``mcp__<server>__<tool>``) without exposing them to the
+    top-level model. Empty → identical to ``tools`` (backward compatible with
+    the pre-split behaviour where ``opts.allowed_tools == opts.tools``).
+    """
+    allowed = list(tools)
+    for name in agent.allowed_tools:
+        if name not in allowed:
+            allowed.append(name)
+    return allowed
 
 
 def _build_sub_agent_definitions(

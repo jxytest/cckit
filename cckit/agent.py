@@ -50,6 +50,16 @@ class Agent:
         - A callable ``(ctx: RunContext) -> str`` (dynamic prompt)
     tools:
         List of tool names the agent can use (e.g. ``["Bash", "Read", "Write"]``).
+    allowed_tools:
+        Extra tool names to append to the permission allow-list (auto-approved
+        without prompting), WITHOUT exposing them to this agent's visible tool
+        set.  This is how you let a sub-agent use its own MCP tools under
+        ``dontAsk``/sandbox mode — register the server on the top-level agent,
+        list the sub-agent's ``mcp__<server>__<tool>`` names here, and the
+        sub-agent (or the orchestrator's delegation) can call them without the
+        top-level model seeing them directly.
+        Defaults to ``None`` = the allow-list is identical to ``tools``
+        (backward compatible with pre-split behavior).
     sub_agents:
         List of ``Agent`` instances that this agent can delegate to.
     skills:
@@ -150,6 +160,7 @@ class Agent:
         description: str = "",
         instruction: str | InstructionFn = "",
         tools: list[str] | None = None,
+        allowed_tools: list[str] | None = None,
         disallowed_tools: list[str] | None = None,
         sub_agents: list[Agent] | None = None,
         skills: list[str] | None = None,
@@ -190,6 +201,7 @@ class Agent:
         self.name = name
         self.description = description
         self.tools = tools or []
+        self.allowed_tools = allowed_tools or []
         self.disallowed_tools = disallowed_tools or []
         self.sub_agents = sub_agents or []
         self.skills = skills or []
