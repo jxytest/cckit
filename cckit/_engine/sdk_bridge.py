@@ -19,6 +19,93 @@ from cckit.exceptions import AgentExecutionError
 
 logger = logging.getLogger(__name__)
 
+_RESULT_ERROR_SUBTYPES: dict[str, str] = {
+    "error_max_turns": "max_turns",
+    "error_max_budget_usd": "max_budget",
+    "error_during_execution": "agent_error",
+}
+
+_TERMINAL_REASONS: dict[str, str] = {
+    "max_turns": "max_turns",
+    "max_budget": "max_budget",
+    "api_error": "api_error",
+}
+
+
+def _classify_sdk_error(exc: BaseException) -> str:
+    """Return a stable code for an SDK failure without parsing its message.
+
+    The SDK's ``ResultError`` (claude-agent-sdk >= 0.2.151) exposes
+    ``subtype`` / ``terminal_reason`` / ``api_error_status``; older SDK
+    versions only expose the plain ``ProcessError`` message, so every
+    attribute is read defensively.
+    """
+    subtype = getattr(exc, "subtype", None)
+    if isinstance(subtype, str):
+        code = _RESULT_ERROR_SUBTYPES.get(subtype)
+        if code:
+            return code
+
+    reason = getattr(exc, "terminal_reason", None)
+    if isinstance(reason, str):
+        code = _TERMINAL_REASONS.get(reason)
+        if code:
+            return code
+        if reason:
+            return reason
+
+    if getattr(exc, "api_error_status", None) is not None:
+        return "api_error"
+
+    if isinstance(subtype, str) and subtype.startswith("error_"):
+        return subtype.removeprefix("error_")
+
+    return "agent_execution_failed"
+
+
+def _sdk_error_details(exc: BaseException, state: RunState) -> dict[str, Any]:
+    """Collect structured diagnostics from the SDK exception and run state.
+
+    Kept separate from ``detail`` on purpose: ``detail`` is the legacy
+    free-form string appended to ``str(exc)``; these fields are for callers
+    that want to branch or persist structured data.
+    """
+    details: dict[str, Any] = {}
+
+    for attr in ("subtype", "terminal_reason", "api_error_status", "session_id"):
+        value = getattr(exc, attr, None)
+        if value is not None:
+            details[attr] = value
+
+    exit_code = getattr(exc, "exit_code", None)
+    if exit_code is not None:
+        details["exit_code"] = exit_code
+
+    errors = getattr(exc, "errors", None)
+    if isinstance(errors, str):
+        details["errors"] = [errors[:500]]
+    elif errors:
+        details["errors"] = [str(item)[:500] for item in errors]
+
+    final_message = state.final_message
+    if final_message is not None:
+        for attr in (
+            "num_turns",
+            "stop_reason",
+            "subtype",
+            "terminal_reason",
+            "api_error_status",
+            "session_id",
+        ):
+            value = getattr(final_message, attr, None)
+            if value is not None:
+                details.setdefault(attr, value)
+
+    if state.session_id:
+        details.setdefault("session_id", state.session_id)
+
+    return details
+
 
 def _patch_log_cli_command() -> None:
     """Monkey-patch SubprocessCLITransport to log the real CLI command once.
@@ -84,6 +171,7 @@ async def run_sdk_query(
         raise AgentExecutionError(
             "claude-agent-sdk is not installed",
             detail=str(exc),
+            code="sdk_not_installed",
         ) from exc
 
     _patch_log_cli_command()
@@ -100,4 +188,6 @@ async def run_sdk_query(
         raise AgentExecutionError(
             f"SDK query failed: {exc}",
             detail=detail,
+            code=_classify_sdk_error(exc),
+            details=_sdk_error_details(exc, state),
         ) from exc

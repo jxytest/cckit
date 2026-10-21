@@ -6,12 +6,38 @@ narrowly.
 
 from __future__ import annotations
 
+from typing import Any
+
 
 class CckitError(Exception):
-    """Root exception for the cckit package."""
+    """Root exception for the cckit package.
 
-    def __init__(self, message: str = "", *, detail: str = "") -> None:
+    Attributes
+    ----------
+    detail:
+        Legacy free-form technical detail.  ``str(exc)`` appends it when it
+        is not already part of the message, so existing log output is
+        unchanged.
+    code:
+        Stable machine-readable failure code (for example ``"max_turns"``).
+        Callers should branch on this instead of matching message text.
+        ``None`` when the exception was not classified.
+    details:
+        Structured metadata about the failure (session id, turn count, SDK
+        subtype, ...).  Empty when no metadata is available.
+    """
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        detail: str = "",
+        code: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
         self.detail = detail
+        self.code = code
+        self.details: dict[str, Any] = details or {}
         super().__init__(message)
 
     def __str__(self) -> str:

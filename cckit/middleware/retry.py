@@ -20,6 +20,11 @@ class RetryMiddleware(Middleware):
 
     Only retries on transient errors (connection, timeout).  Permanent errors
     (invalid API key, model not found) are raised immediately.
+
+    ``retry_terminal_errors=True`` preserves the historical behaviour of
+    retrying every non-permanent error.  Set it to ``False`` to stop
+    immediately on deterministic guardrails such as ``max_turns`` /
+    ``max_budget``.
     """
 
     # Exception substrings that indicate a *permanent* failure — never retry.
@@ -29,6 +34,9 @@ class RetryMiddleware(Middleware):
         "permission",
         "not_found",
     )
+
+    # Deterministic SDK guardrails: retrying cannot change the outcome.
+    _TERMINAL_CODES: frozenset[str] = frozenset({"max_turns", "max_budget"})
 
     # Patterns that indicate a *rate-limit / overload* failure — transient but
     # benefiting from a longer backoff than a generic connection blip.
@@ -52,6 +60,7 @@ class RetryMiddleware(Middleware):
         base_delay: float = 1.0,
         max_delay: float = 30.0,
         rate_limit_base_delay: float = 5.0,
+        retry_terminal_errors: bool = True,
     ) -> None:
         self.max_retries = max_retries
         self.base_delay = base_delay
@@ -59,6 +68,9 @@ class RetryMiddleware(Middleware):
         # Longer initial backoff for rate-limit errors (providers typically
         # need seconds, not sub-second, to clear a 429).
         self.rate_limit_base_delay = rate_limit_base_delay
+        # Defaults to True to preserve the historical behaviour.  Set to
+        # False to fail fast on deterministic guardrails such as max_turns.
+        self.retry_terminal_errors = retry_terminal_errors
 
     async def wrap(
         self,
@@ -79,8 +91,15 @@ class RetryMiddleware(Middleware):
                 last_exc = exc
                 err_lower = str(exc).lower()
 
-                # Don't retry permanent errors
+                # Don't retry permanent errors.
                 if any(marker in err_lower for marker in self._PERMANENT_MARKERS):
+                    raise
+
+                # Optional: deterministic guardrails cannot succeed on retry.
+                if (
+                    not self.retry_terminal_errors
+                    and getattr(exc, "code", None) in self._TERMINAL_CODES
+                ):
                     raise
 
                 if attempt < self.max_retries - 1:
@@ -106,4 +125,6 @@ class RetryMiddleware(Middleware):
         raise AgentExecutionError(
             f"SDK query failed after {self.max_retries} attempts",
             detail=str(last_exc),
+            code=getattr(last_exc, "code", None),
+            details=getattr(last_exc, "details", None),
         ) from last_exc

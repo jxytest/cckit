@@ -436,7 +436,13 @@ class TaskStatus(StrEnum):
 
 
 class AgentResult(CustomModel):
-    """Final result returned after agent execution completes."""
+    """Final result returned after agent execution completes.
+
+    ``error_code`` is a stable machine-readable classification for failures
+    (for example ``"max_turns"``); ``error_details`` carries structured
+    diagnostics such as the SDK result subtype or session id.  Both are
+    additive fields with defaults, so existing consumers are unaffected.
+    """
 
     task_id: str
     agent_type: str
@@ -452,6 +458,8 @@ class AgentResult(CustomModel):
     structured_output: Any = None
     final_message: SDKResultMessage | None = Field(default=None, exclude=True)
     extra: dict[str, Any] = Field(default_factory=dict)
+    error_code: str | None = None
+    error_details: dict[str, Any] | None = Field(default=None, exclude=True)
 
     def to_summary_dict(self) -> dict[str, Any]:
         """Return a dict suitable for persisting execution results to a database.

@@ -158,6 +158,7 @@ class Runner:
             status=TaskStatus.FAILED,
             is_error=True,
             error_message="Stream completed without producing a result",
+            error_code="missing_result",
         )
 
     def run_stream(
@@ -233,6 +234,8 @@ class Runner:
                     status=TaskStatus.FAILED,
                     is_error=True,
                     error_message=msg,
+                    error_code="validation_error",
+                    error_details={"missing": missing},
                     duration_seconds=round(time.monotonic() - start, 2),
                 )
                 logger.error("Agent %s failed validation: %s", agent.name, msg)
@@ -349,6 +352,8 @@ class Runner:
                 status=TaskStatus.FAILED,
                 is_error=True,
                 error_message=str(exc),
+                error_code=getattr(exc, "code", None),
+                error_details=getattr(exc, "details", None) or None,
                 duration_seconds=round(duration, 2),
             )
             logger.exception("Agent %s failed: %s", agent.name, exc)
@@ -575,6 +580,7 @@ class Runner:
                 status=TaskStatus.FAILED,
                 is_error=True,
                 error_message="SDK stream completed without a ResultMessage",
+                error_code="missing_result",
                 duration_seconds=round(duration, 2),
                 session_id=state.session_id,
             )
