@@ -98,6 +98,7 @@ def build_options(
         extra_args={"debug-to-stderr": None},
         user=ctx.user,
         include_partial_messages=ctx.include_partial_messages,
+        max_buffer_size=16 * 1024 * 1024
     )
 
     if tools and tools != []:
